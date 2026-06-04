@@ -23,14 +23,14 @@ common per-chain `diagnostics()` schema.
 From source (PyTorch and Pyro are pulled in as dependencies):
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/riemann-mcmc.git
+pip install git+https://github.com/Ulfgard/muMCMC.git
 ```
 
 or, for development:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/riemann-mcmc.git
-cd riemann-mcmc
+git clone https://github.com/Ulfgard/muMCMC.git
+cd muMCMC
 pip install -e ".[test]"
 pytest
 ```
@@ -45,7 +45,7 @@ coordinates. The prior log-prob and prior metric are added by the `space`.
 
 ```python
 import torch
-from riemann_mcmc import RMHMC, UnconstrainedSpace
+from muMCMC import RMHMC, UnconstrainedSpace
 from pyro.distributions import Normal
 
 torch.set_default_dtype(torch.float64)   # float64 recommended for the metric solves
@@ -72,7 +72,7 @@ print(sampler.diagnostics()["accept_rate"])  # per-chain tensor, shape (4,)
 `NUTS` takes only the scalar likelihood potential (no metric):
 
 ```python
-from riemann_mcmc import NUTS
+from muMCMC import NUTS
 
 def logp(theta):
     return 0.5 * (theta ** 2).sum(-1)
@@ -101,7 +101,7 @@ inverse mass matrix, divergence indices) remains available via
 ## Layout
 
 ```
-src/riemann_mcmc/
+src/muMCMC/
     BaseSampler.py   # general base + own batched driver; PyroSampler subclass
     RMHMC.py         # Riemannian Manifold HMC (integrator + sampler)
     NUTS.py          # Pyro NUTS with constrained-space reparameterization

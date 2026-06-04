@@ -10,7 +10,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from riemann_mcmc import (
+from muMCMC import (
     RMHMC,
     NUTS,
     UnconstrainedSpace,

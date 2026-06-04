@@ -1,4 +1,4 @@
-"""riemann_mcmc -- batched Riemannian Manifold HMC and NUTS over constrained spaces.
+"""muMCMC -- batched Riemannian Manifold HMC and NUTS over constrained spaces.
 
 The library samples in an unconstrained space (via a ``space`` object that owns
 the transform, prior, and free/fixed split) while the user specifies the model
