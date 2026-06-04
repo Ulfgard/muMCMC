@@ -1,0 +1,114 @@
+# muMCMC
+
+A minimal library implementing HMC variants using pytorch. Samplers are batched
+and can thus handle parallel chains naturally.
+
+Currently implemented are  **Riemannian Manifold HMC** and **NUTS** samplers over constrained
+parameter spaces, built on PyTorch and Pyro.
+
+You write your model in **constrained** coordinates; the sampler works in an
+unconstrained space via a `space` object that owns the transform, the prior,
+and the free/fixed parameter split. `RMHMC` is a single-threaded,
+GPU-batched Riemannian Manifold HMC with an implicit-midpoint integrator and
+derivative-free step-size adaptation. `NUTS` wraps Pyro's NUTS with the same
+constrained-space reparameterization. Both share one `run_mcmc` driver and a
+common per-chain `diagnostics()` schema.
+
+> **Status:** alpha. The API is still moving. Parallel tempering is on the
+> roadmap (the batched driver and per-chain state permutation are already in
+> place for it).
+
+## Installation
+
+From source (PyTorch and Pyro are pulled in as dependencies):
+
+```bash
+pip install git+https://github.com/YOUR_USERNAME/riemann-mcmc.git
+```
+
+or, for development:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/riemann-mcmc.git
+cd riemann-mcmc
+pip install -e ".[test]"
+pytest
+```
+
+## Quickstart
+
+### RMHMC
+
+`RMHMC` needs a model returning the likelihood potential `U = -log p(data | theta)`
+**and** a symmetric positive-definite metric `G`, both in constrained
+coordinates. The prior log-prob and prior metric are added by the `space`.
+
+```python
+import torch
+from riemann_mcmc import RMHMC, UnconstrainedSpace
+from pyro.distributions import Normal
+
+torch.set_default_dtype(torch.float64)   # float64 recommended for the metric solves
+
+names = ["x", "y"]
+space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+
+def model(theta):
+    U = 0.5 * (theta ** 2).sum(-1)                                   # -log likelihood
+    G = torch.eye(2) + 0.3 * theta[..., :, None] * theta[..., None, :]  # SPD metric
+    return U, G
+
+sampler = RMHMC(model, space, step_size=0.3, num_steps=8)
+samples = sampler.run_mcmc(
+    torch.zeros(2), num_samples=1000, num_warmup_steps=500, num_chains=4,
+)
+
+print(samples["x"].shape)                  # (num_chains, num_samples) = (4, 1000)
+print(sampler.diagnostics()["accept_rate"])  # per-chain tensor, shape (4,)
+```
+
+### NUTS
+
+`NUTS` takes only the scalar likelihood potential (no metric):
+
+```python
+from riemann_mcmc import NUTS
+
+def logp(theta):
+    return 0.5 * (theta ** 2).sum(-1)
+
+nuts = NUTS(logp, space)
+samples = nuts.run_mcmc(
+    torch.zeros(2), num_samples=1000, num_warmup_steps=500, num_chains=1,
+)
+```
+
+## Diagnostics
+
+Both samplers expose a common per-chain schema as `(num_chains,)` tensors:
+
+| key               | meaning                              |
+| ----------------- | ------------------------------------ |
+| `accept_rate`     | post-warmup acceptance rate          |
+| `num_divergences` | post-warmup divergence count         |
+| `step_size`       | final (adapted) step size            |
+
+`RMHMC.diagnostics()` adds integrator-specific extras (`delta_Hs`,
+`residuals`, `fp_iters`); the full Pyro detail for `NUTS` (r-hat, n-eff,
+inverse mass matrix, divergence indices) remains available via
+`sampler.mcmc.diagnostics()`.
+
+## Layout
+
+```
+src/riemann_mcmc/
+    BaseSampler.py   # general base + own batched driver; PyroSampler subclass
+    RMHMC.py         # Riemannian Manifold HMC (integrator + sampler)
+    NUTS.py          # Pyro NUTS with constrained-space reparameterization
+    spaces.py        # transforms, prior/metric pull-back, free/fixed split
+    adapters.py      # dual-averaging + derivative-free (REINFORCE) optimizer
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "muMCMC"
+dynamic = ["version"]
+description = "Minimal MCMC library, focussing on HMC, built on PyTorch and Pyro."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ulfgard", email = "ulfgardleo@gmail.com" }]
+keywords = ["mcmc", "hmc", "rmhmc", "nuts", "bayesian", "pytorch", "pyro", "riemannian"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "torch>=2.0",
+    "pyro-ppl>=1.9",
+    "tqdm>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/Ulfgard/muMCMC"
+Repository = "https://github.com/Ulfgard/riemann-mcmc"
+Issues = "https://github.com/Ulfgard/riemann-mcmc/issues"
+
+# Single source of truth for the version: src/muMCMC/__init__.py
+[tool.hatch.version]
+path = "src/riemann_mcmc/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/riemann_mcmc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
