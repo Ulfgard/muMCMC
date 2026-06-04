@@ -167,14 +167,21 @@ class REINFORCEAdapter:
     ema_decay : float
         Decay factor of the EMA baseline used for variance reduction.
         Default 0.2.
+    gamma : float
+        Step-scale of the underlying :class:`DualAveraging` (the learning
+        rate; the update is ``-sqrt(t)/gamma * g_avg``, so *larger* gamma
+        means gentler steps).  Default 0.05.  The default is tuned for the
+        bounded diagnostics step-size adaptation feeds it; a steeper or
+        unbounded objective may need a larger gamma to stay stable.
     """
 
-    def __init__(self, n: int, sigma: float = 0.1, ema_decay: float = 0.2):
+    def __init__(self, n: int, sigma: float = 0.1, ema_decay: float = 0.2,
+                 gamma: float = 0.05):
         self.n           = n
         self.sigma       = sigma
         self.ema_decay   = ema_decay
         self.prox_center = torch.zeros(n)   # (N,) log initial step; set externally
-        self._dual       = DualAveraging(gamma=0.05)
+        self._dual       = DualAveraging(gamma=gamma)
         self._g          = None             # EMA baseline (N,), None until first step
 
     def reset(self):
