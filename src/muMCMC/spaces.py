@@ -10,10 +10,6 @@ None when there's no contribution to add (uniform priors, or
 unconstrained spaces without an explicit prior metric).  Mirrors
 `prior_log_prob_vector` on the metric side.
 
-Adds `ComposedSpace` which wraps an inner space and a phi diffeomorphism
-to handle two-stage transformations like  y -> y' -> w  for box-with-phi
-sampling.
-
 Also hosts `TransformedMetric` (used by RMHMC and assembled in
 `BaseSampler.evaluate_model`).  It's a space-geometry object —
 encapsulates a position-dependent inverse metric without forming dense
