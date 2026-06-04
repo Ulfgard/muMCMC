@@ -174,71 +174,45 @@ class TransformedMetric:
  
     where J = ∂θ/∂z is the Jacobian of the map from unconstrained to
     constrained coordinates. L is the lower-triangular Cholesky factor of
-    either G_c or G_c⁻¹, controlled by `metric_cholesky`:
- 
-        metric_cholesky=False:  G_c⁻¹ = L Lᵀ
-            G_u⁻¹ = J⁻¹ L Lᵀ J⁻ᵀ
- 
-        metric_cholesky=True (default):  G_c = L Lᵀ  ⟹  G_c⁻¹ = L⁻ᵀ L⁻¹
+    the constrained-space metric G_c:
+
+        G_c = L Lᵀ  ⟹  G_c⁻¹ = L⁻ᵀ L⁻¹
             G_u⁻¹ = J⁻¹ L⁻ᵀ L⁻¹ J⁻ᵀ
- 
+
     The Jacobian J is never formed explicitly. All operations are expressed
     through the jacobian-vector product interface of z_transform, which may
     implement these efficiently (e.g. diagonally, via QR, etc.).
- 
+
     Parameters
     ----------
     z_transform : any object implementing jvp, vjp, jinvvp, vjinvp,
                   jacobian_log_det
         Represents the map from unconstrained z to constrained θ.
     L : Tensor [d, d]
-        Lower-triangular Cholesky factor with positive diagonal.
- 
-    Note
-    ----
-    BaseSampler always constructs this with ``metric_cholesky=True`` (the
-    user supplies G via ``model_fn``; BaseSampler Choleskys G_lik+G_prior).
-    The ``metric_cholesky=False`` branch is retained for callers that want
-    to supply the inverse-metric factor directly.
+        Lower-triangular Cholesky factor of G_c, with positive diagonal.
+        BaseSampler constructs this by Cholesky-factoring G_lik+G_prior.
     """
-    def __init__(self, z_transform, L: torch.Tensor, metric_cholesky: bool = True):
+    def __init__(self, z_transform, L: torch.Tensor):
         self.z_transform     = z_transform
         self.L               = L
-        self.metric_cholesky = metric_cholesky
         # L is (..., d, d); reduce the diagonal over the last axis only.
         self.log_det_L       = L.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)
  
     def Gc_inv_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """Compute G_c⁻¹ v, using whichever factorisation L represents."""
-        if self.metric_cholesky:
-            # G_c⁻¹ = L⁻ᵀ L⁻¹  ⟹  two triangular solves
-            return _solve_triangular_vec(
-                self.L.transpose(-2, -1),
-                _solve_triangular_vec(self.L, v, upper=False),
-                upper=True,
-            )
-        else:
-            # G_c⁻¹ = L Lᵀ  ⟹  two matrix-vector products
-            w = (self.L.transpose(-2, -1) @ v[..., None])
-            return (self.L @ w)[..., 0]
- 
+        """Compute G_c⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
+        return _solve_triangular_vec(
+            self.L.transpose(-2, -1),
+            _solve_triangular_vec(self.L, v, upper=False),
+            upper=True,
+        )
+
     def sqrt_Gc_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """Compute G_c^{½} v (lower Cholesky factor applied to v)."""
-        if self.metric_cholesky:
-            # G_c = L Lᵀ, square root is L
-            return (self.L @ v[..., None])[..., 0]
-        else:
-            # G_c⁻¹ = L Lᵀ ⟹ G_c = L⁻ᵀ L⁻¹, square root is L⁻ᵀ
-            return _solve_triangular_vec(self.L.transpose(-2, -1), v, upper=True)
- 
+        """Compute G_c^{½} v = L v (lower Cholesky factor applied to v)."""
+        return (self.L @ v[..., None])[..., 0]
+
     def inv_sqrt_Gc_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """Compute G_c^{-½} v (inverse of the Cholesky factor applied to v)."""
-        if self.metric_cholesky:
-            # G_c^{½} = L  ⟹  G_c^{-½} = L⁻¹  ⟹  one triangular solve
-            return _solve_triangular_vec(self.L, v, upper=False)
-        else:
-            # G_c⁻¹ = L Lᵀ ⟹ G_c^{½} = L⁻ᵀ  ⟹  G_c^{-½} = Lᵀ
-            return (self.L.transpose(-2, -1) @ v[..., None])[..., 0]
+        """Compute G_c^{-½} v = L⁻¹ v via one triangular solve."""
+        return _solve_triangular_vec(self.L, v, upper=False)
  
     def inv_metric_times_vec(self, v: torch.Tensor) -> torch.Tensor:
         """
@@ -261,11 +235,8 @@ class TransformedMetric:
             3.  w = Jᵀ w
         """
         w = self.z_transform.jvp(v)
-        # G_c w: reverse of G_c⁻¹, i.e. L Lᵀ w for metric_cholesky=True
-        if self.metric_cholesky:
-            w = (self.L @ (self.L.transpose(-2, -1) @ w[..., None]))[..., 0]
-        else:
-            w = self.Gc_inv_times_vec(w)   # G_c⁻¹ = L Lᵀ, so G_c = (L Lᵀ)⁻¹ — use solves
+        # G_c w = L Lᵀ w
+        w = (self.L @ (self.L.transpose(-2, -1) @ w[..., None]))[..., 0]
         return self.z_transform.vjp(w)
  
     def sqrt_metric_times_vec(self, v: torch.Tensor) -> torch.Tensor:
@@ -301,10 +272,9 @@ class TransformedMetric:
  
     def log_det_metric(self) -> torch.Tensor:
         """
-        log det G_u = 2 log|det J| + log det G_c.
+        log det G_u = 2 log|det J| + log det G_c,  with log det G_c = 2 log|det L|.
         """
-        sign = 1.0 if self.metric_cholesky else -1.0
-        return 2.0 * self.z_transform.jacobian_log_det + sign * 2.0 * self.log_det_L
+        return 2.0 * self.z_transform.jacobian_log_det + 2.0 * self.log_det_L
 
     def select(self, mask: torch.Tensor, other: "TransformedMetric") -> "TransformedMetric":
         """Per-chain select between two batched metrics: take this metric's
@@ -318,12 +288,10 @@ class TransformedMetric:
         ``log_det_L`` is recomputed by the constructor from the mixed ``L``, so
         it stays consistent.
         """
-        assert self.metric_cholesky == other.metric_cholesky, \
-            "select() requires matching metric_cholesky"
         m = mask.reshape(mask.shape + (1,) * (self.L.dim() - mask.dim()))
         L = torch.where(m, self.L, other.L)
         z = self.z_transform.where(mask, other.z_transform)
-        return TransformedMetric(z, L, metric_cholesky=self.metric_cholesky)
+        return TransformedMetric(z, L)
 
     def reorder(self, perm: torch.Tensor) -> "TransformedMetric":
         """Permute chains along the leading batch axis: row ``i`` of the result
@@ -334,7 +302,7 @@ class TransformedMetric:
         Equivalent per chain to the metric evaluated at the permuted points.
         """
         z = self.z_transform.reorder(perm)
-        return TransformedMetric(z, self.L[perm], metric_cholesky=self.metric_cholesky)
+        return TransformedMetric(z, self.L[perm])
  
  
 # ====================================================================== #
@@ -492,7 +460,12 @@ class UnconstrainedSpace:
             raise ValueError("Unconstrained space without priors cannot be sampled from")
         samples = {}
         for yi in self._free_names:
-            samples[yi] = self.priors[yi].sample([n_samples])[..., 0]
+            # Each name is a single scalar coordinate (the space stacks one
+            # column per name), so a per-name prior is univariate and one draw
+            # is (n_samples,).  reshape both normalises a trailing singleton
+            # (priors built as e.g. Normal(zeros(1), ones(1))) and rejects a
+            # genuinely multivariate prior, which the space cannot represent.
+            samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
         return self.add_fixed(samples)
 
     def remove_fixed(self, samples):

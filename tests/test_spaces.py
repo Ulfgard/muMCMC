@@ -188,28 +188,32 @@ def test_sample_without_priors_raises():
 
 
 def test_sample_shapes_and_fixed_value():
-    # sample() indexes prior draws with [..., 0], so it expects priors that
-    # carry a trailing singleton dim (a 1-d Normal here, not a scalar one).
-    priors = {n: Normal(torch.zeros(1), torch.ones(1)) for n in NAMES}
-    s = UnconstrainedSpace(NAMES, priors=priors, fixed={"c": 3.0})
+    # Scalar priors (Normal(0.0, 1.0)) are the convention used elsewhere
+    # (e.g. test_samplers.py); each free name yields an (n_samples,) column.
+    s = UnconstrainedSpace(NAMES, priors=_priors(), fixed={"c": 3.0})
     samples = s.sample(8)
     assert set(samples) == {"a", "b", "c"}
     assert samples["a"].shape == (8,)
+    assert samples["b"].shape == (8,)
     assert torch.allclose(samples["c"], torch.full((8,), 3.0), atol=ATOL)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: sample() indexes prior draws with [..., 0], so a *scalar* prior "
-           "(Normal(0.0, 1.0)) -- the convention used elsewhere, e.g. in "
-           "test_samplers.py -- collapses each draw to a 0-d scalar instead of "
-           "an (n_samples,) tensor. Remove the xfail once sample() is robust to "
-           "scalar priors.",
-)
-def test_sample_with_scalar_prior_keeps_batch_dim():
-    s = UnconstrainedSpace(NAMES, priors=_priors())   # scalar Normal(0.0, 1.0)
+def test_sample_tolerates_trailing_singleton_priors():
+    # Priors built with a trailing singleton dim (Normal(zeros(1), ones(1)))
+    # must also yield (n_samples,) columns, not (n_samples, 1).
+    priors = {n: Normal(torch.zeros(1), torch.ones(1)) for n in NAMES}
+    s = UnconstrainedSpace(NAMES, priors=priors)
     samples = s.sample(8)
     assert samples["a"].shape == (8,)
+
+
+def test_sample_rejects_multivariate_prior():
+    # A name maps to a single scalar coordinate, so a multivariate prior
+    # cannot be reshaped to (n_samples,) and must fail loudly.
+    priors = {n: Normal(torch.zeros(2), torch.ones(2)) for n in NAMES}
+    s = UnconstrainedSpace(NAMES, priors=priors)
+    with pytest.raises(RuntimeError):
+        s.sample(8)
 
 
 def test_prior_metric_default_none():

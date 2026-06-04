@@ -57,7 +57,7 @@ def _matvec(M, v):
 
 
 # --------------------------------------------------------------------------- #
-#  Cholesky branch (metric_cholesky=True) -- the branch BaseSampler uses       #
+#  Matrix-free products vs. a dense Jᵀ G_c J reference                         #
 # --------------------------------------------------------------------------- #
 
 def test_inv_metric_times_vec_matches_dense():
@@ -65,7 +65,7 @@ def test_inv_metric_times_vec_matches_dense():
     n, d = 4, 3
     G_c, L = _rand_spd(n, d)
     diag_J = torch.rand(n, d) + 0.5
-    tm = TransformedMetric(_diag_transform(diag_J), L)   # metric_cholesky=True
+    tm = TransformedMetric(_diag_transform(diag_J), L)
 
     v = torch.randn(n, d)
     G_u = _dense_Gu(diag_J, G_c)
@@ -158,63 +158,6 @@ def test_sample_momentum_shape():
 
 
 # --------------------------------------------------------------------------- #
-#  Inverse-factor branch (metric_cholesky=False)                              #
-# --------------------------------------------------------------------------- #
-#  Here L is the Cholesky factor of G_c^{-1} (so G_c^{-1} = L Lᵀ).  The
-#  documented, BaseSampler-independent contract is the same: the products must
-#  match the dense G_u they stand for.
-
-def _false_branch(n, d):
-    """Returns (tm, dense G_u) for the inverse-factor branch."""
-    _, L = _rand_spd(n, d)                 # L = chol(G_c^{-1})
-    G_c_inv = L @ L.transpose(-2, -1)
-    G_c = torch.linalg.inv(G_c_inv)
-    diag_J = torch.rand(n, d) + 0.5
-    tm = TransformedMetric(_diag_transform(diag_J), L, metric_cholesky=False)
-    return tm, _dense_Gu(diag_J, G_c), diag_J
-
-
-def test_false_branch_inv_metric_matches_dense():
-    torch.manual_seed(8)
-    n, d = 4, 3
-    tm, G_u, _ = _false_branch(n, d)
-    v = torch.randn(n, d)
-    G_u_inv = torch.linalg.inv(G_u)
-    assert torch.allclose(tm.inv_metric_times_vec(v), _matvec(G_u_inv, v), atol=ATOL)
-
-
-def test_false_branch_sqrt_round_trips():
-    torch.manual_seed(9)
-    n, d = 4, 3
-    tm, _, _ = _false_branch(n, d)
-    v = torch.randn(n, d)
-    assert torch.allclose(tm.inv_sqrt_metric_times_vec(tm.sqrt_metric_times_vec(v)),
-                          v, atol=ATOL)
-
-
-def test_false_branch_log_det_matches_dense():
-    torch.manual_seed(10)
-    n, d = 4, 3
-    tm, G_u, _ = _false_branch(n, d)
-    assert torch.allclose(tm.log_det_metric(), torch.logdet(G_u), atol=ATOL)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: metric_times_vec(metric_cholesky=False) calls Gc_inv_times_vec, "
-           "applying G_c^-1 instead of G_c in the inverse-factor branch. "
-           "BaseSampler only uses metric_cholesky=True, so this is latent. "
-           "Remove the xfail once the branch is fixed.",
-)
-def test_false_branch_metric_times_vec_matches_dense():
-    torch.manual_seed(11)
-    n, d = 4, 3
-    tm, G_u, _ = _false_branch(n, d)
-    v = torch.randn(n, d)
-    assert torch.allclose(tm.metric_times_vec(v), _matvec(G_u, v), atol=ATOL)
-
-
-# --------------------------------------------------------------------------- #
 #  Per-chain select / reorder                                                 #
 # --------------------------------------------------------------------------- #
 
@@ -236,15 +179,6 @@ def test_select_picks_per_chain_metric():
     # log_det recomputed consistently from the mixed L
     assert torch.allclose(c.log_det_metric()[0], ta.log_det_metric()[0], atol=ATOL)
     assert torch.allclose(c.log_det_metric()[1], tb.log_det_metric()[1], atol=ATOL)
-
-
-def test_select_requires_matching_metric_cholesky():
-    n, d = 2, 3
-    _, L = _rand_spd(n, d)
-    ta = TransformedMetric(_diag_transform(torch.ones(n, d)), L, metric_cholesky=True)
-    tb = TransformedMetric(_diag_transform(torch.ones(n, d)), L, metric_cholesky=False)
-    with pytest.raises(AssertionError):
-        ta.select(torch.tensor([True, False]), tb)
 
 
 def test_reorder_permutes_chains():
