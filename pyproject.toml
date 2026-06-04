@@ -32,15 +32,15 @@ test = ["pytest>=7.0"]
 
 [project.urls]
 Homepage = "https://github.com/Ulfgard/muMCMC"
-Repository = "https://github.com/Ulfgard/riemann-mcmc"
-Issues = "https://github.com/Ulfgard/riemann-mcmc/issues"
+Repository = "https://github.com/Ulfgard/muMCMC"
+Issues = "https://github.com/Ulfgard/muMCMC/issues"
 
 # Single source of truth for the version: src/muMCMC/__init__.py
 [tool.hatch.version]
-path = "src/riemann_mcmc/__init__.py"
+path = "src/muMCMC/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/riemann_mcmc"]
+packages = ["src/muMCMC"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
