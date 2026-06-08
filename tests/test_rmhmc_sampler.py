@@ -231,3 +231,29 @@ def test_logging_empty_before_steps_then_populated():
     assert s.logging() == {}                              # _step == 0
     s.step(state)
     assert set(s.logging()) == {"eps", "|dH|", "|r|", "acc. prob"}
+
+
+# ========================================================================== #
+#  memory leak: endpoint evals must not pin an autograd graph                #
+# ========================================================================== #
+
+def test_endpoint_state_carries_no_autograd_graph():
+    """A model whose U/G carry an autograd graph must not leak that graph into
+    the sampler: endpoint U/metric, momentum, and the accumulated delta_H
+    diagnostics must all be detached so the per-step graph is freed each step
+    instead of accumulating over the run (CUDA OOM regression)."""
+    scale = torch.tensor(1.5, requires_grad=True)
+
+    def model_grad(theta):
+        U, G = model_qdep(theta)
+        return scale * U, scale * G
+
+    s = make_sampler(model_grad, adapt=False, num_steps=2)
+    state = s.init(torch.zeros(2, D))
+    for _ in range(3):
+        state = s.step(state)
+
+    assert all(not t.requires_grad for t in s._delta_Hs)
+    assert not state.U.requires_grad
+    assert not state.metric.L.requires_grad
+    assert not state.p.requires_grad

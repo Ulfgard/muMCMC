@@ -196,7 +196,14 @@ class RMHMCState:
         """Fill ``U`` and ``metric`` by evaluating the model at ``q`` if they
         are not already present; a no-op on an already-complete state."""
         if self.U is None or self.metric is None:
-            self.U, self.metric = evaluate_model(self.q)
+            # Endpoint evaluations only feed energies/diagnostics and are never
+            # backpropagated (the integrator takes its gradient at midpoints in
+            # ``_midpoint_map``'s own ``enable_grad`` block).  Evaluating under
+            # ``no_grad`` keeps a model whose U/G carry an autograd graph from
+            # pinning that graph via ``delta_H`` in the diagnostics list, which
+            # would otherwise accumulate CUDA memory across the whole run.
+            with torch.no_grad():
+                self.U, self.metric = evaluate_model(self.q)
         return self
 
     def reorder(self, perm):
@@ -427,7 +434,7 @@ class RMHMC(BaseSampler):
 
     def _bookkeep(self, accepted, delta_H, is_divergent, max_residual, fp_iters):
         # update running statistics (all per-chain, shape (N,))
-        self._delta_Hs.append(delta_H)
+        self._delta_Hs.append(delta_H.detach())
         self._residuals.append(max_residual)
         self._fp_iters.append(fp_iters)
         self._accepted += accepted
