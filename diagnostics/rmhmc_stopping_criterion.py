@@ -69,17 +69,24 @@ def model_const(lambdas):
     return model_fn
 
 
-def model_posdep(lambdas, alpha=0.1):
-    """Same potential, but a genuinely position-dependent SPD metric:
-    G(z) = diag(lambda) + alpha * (z z^T) elementwise-scaled by sqrt(lambda)
-    so the rank-1 part stays commensurate with each coordinate's scale.
+def model_posdep(lambdas, alpha=0.5):
+    """Same potential, but a genuinely position-dependent SPD metric whose
+    q-dependence is BOUNDED so the metric stays well-conditioned no matter how
+    far the wide directions wander:
+
+        v_i = sqrt(lambda_i) * tanh(z_i / std_i)      (|v_i| < sqrt(lambda_i))
+        G(z) = diag(lambda) + alpha * v v^T            (always SPD)
+
+    The tanh argument is normalised by each coordinate's posterior std so the
+    coupling is O(1) per direction and never drives G non-PD.
     """
     Lam = torch.diag(lambdas)
     s = lambdas.sqrt()
+    std = lambdas.rsqrt()
 
     def model_fn(theta):
         U = 0.5 * (lambdas * theta**2).sum(-1)
-        v = (s * theta)
+        v = s * torch.tanh(theta / std)
         rank1 = alpha * v[..., :, None] * v[..., None, :]
         G = Lam.expand(*theta.shape[:-1], *Lam.shape) + rank1
         return U, G
@@ -234,20 +241,31 @@ if __name__ == "__main__":
     d = 5
     dynamic_range = 1e6
     lambdas = make_lambdas(d, dynamic_range)
-    common = dict(num_steps=10, eps=0.3, n_chains=4,
-                  n_samples=2000, n_warmup=200)
+    common = dict(num_steps=10, eps=0.2, n_chains=4,
+                  n_samples=1500, n_warmup=200)
 
     print("Metric eigenvalues (lambda):", [f"{float(x):.1e}" for x in lambdas])
     print("Low lambda = low sensitivity = wide posterior = the suspect directions.")
 
-    # Control: constant metric (integrator exact in infinite precision)
-    run_case("CONSTANT metric, loose tol", model_const(lambdas),
-             lambdas, tol=1e-4, **common)
-    run_case("CONSTANT metric, tight tol", model_const(lambdas),
-             lambdas, tol=1e-12, **common)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", choices=["const", "posdep", "all"], default="all")
+    args = ap.parse_args()
 
-    # Position-dependent metric
-    run_case("POS-DEP metric, loose tol", model_posdep(lambdas),
-             lambdas, tol=1e-4, **common)
-    run_case("POS-DEP metric, tight tol", model_posdep(lambdas),
-             lambdas, tol=1e-12, **common)
+    if args.only in ("const", "all"):
+        # Control: constant metric (integrator exact in infinite precision)
+        run_case("CONSTANT metric, loose tol", model_const(lambdas),
+                 lambdas, tol=1e-4, **common)
+        run_case("CONSTANT metric, tight tol", model_const(lambdas),
+                 lambdas, tol=1e-12, **common)
+
+    if args.only in ("posdep", "all"):
+        # Position-dependent metric: same tol sweep.  If ESS falls off for the
+        # low-lambda rows at loose tol and tight tol flattens it, the metric-
+        # blind |r|_max criterion is implicated.
+        run_case("POS-DEP metric, loose tol", model_posdep(lambdas),
+                 lambdas, tol=1e-4, **common)
+        run_case("POS-DEP metric, mid tol", model_posdep(lambdas),
+                 lambdas, tol=1e-8, **common)
+        run_case("POS-DEP metric, tight tol", model_posdep(lambdas),
+                 lambdas, tol=1e-12, **common)
