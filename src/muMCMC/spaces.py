@@ -493,9 +493,13 @@ class UnconstrainedSpace:
 
 
 class UniformBoxSpace:
-    def __init__(self, limits, names, device):
+    # Maximum resampling rounds for the rejection sampler in ``sample`` when
+    # per-name priors are supplied (see ``sample``).
+    _MAX_REJECTION_ROUNDS = 100
+
+    def __init__(self, limits, names, device, priors=None):
         self.names = names
-        self.priors = {}
+        self.priors = priors if priors is not None else {}
         self.fixed = {}
 
         self.l = []
@@ -548,14 +552,19 @@ class UniformBoxSpace:
         return transforms.box(z_vec, self.l, self.u)
 
     def prior_log_prob(self, y):
-        # Uniform on the box: constant inside, undefined outside; HMC
-        # cannot reach outside through the unconstraining transform, so
-        # the constant is irrelevant for sampling.
+        # Returns the unnormalized log probability.  With no prior given,
+        # returns zero -- the uniform prior on the box.
         first = next(iter(y.values()))
-        return torch.zeros(first.shape, device=first.device, dtype=first.dtype)
+        result = torch.zeros(first.shape, device=first.device, dtype=first.dtype)
+        for yi in self.free_names:
+            if yi in self.priors:
+                result = result + self.priors[yi].log_prob(y[yi]).squeeze(-1)
+        return result
 
     def prior_log_prob_vector(self, theta_free):
-        return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
+        if not self.priors:
+            return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
+        return self.prior_log_prob(self.from_vector(theta_free))
 
     def prior_metric(self, theta_full):
         """Uniform-on-box has zero prior metric contribution."""
@@ -595,10 +604,40 @@ class UniformBoxSpace:
         return metric
 
     def sample(self, n_samples):
-        # Uniform sample within the box.
-        u = torch.rand(n_samples, self.d, device=self.l.device, dtype=self.l.dtype)
-        theta = self.l + u * (self.u - self.l)
-        samples = {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
+        if not self.priors:
+            # Uniform sample within the box.
+            u = torch.rand(n_samples, self.d, device=self.l.device, dtype=self.l.dtype)
+            theta = self.l + u * (self.u - self.l)
+            samples = {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
+            return self.add_fixed(samples)
+
+        # Per-coord rejection sampling: draw from the prior and resample
+        # anything outside its [l, u] so every draw lies in the box.  Coords
+        # are independent (one scalar column per name).
+        dev, dt = self.l.device, self.l.dtype
+        samples = {}
+        for i, yi in enumerate(self.free_names):
+            l_i, u_i = self.l[i], self.u[i]
+            prior = self.priors.get(yi)
+            if prior is None:                       # no prior -> uniform on its interval
+                samples[yi] = l_i + torch.rand(n_samples, device=dev, dtype=dt) * (u_i - l_i)
+                continue
+            out    = torch.empty(n_samples, device=dev, dtype=dt)
+            filled = torch.zeros(n_samples, dtype=torch.bool, device=dev)
+            for _ in range(self._MAX_REJECTION_ROUNDS):
+                idx = torch.nonzero(~filled, as_tuple=False).squeeze(-1)
+                if idx.numel() == 0:
+                    break
+                cand = prior.sample([idx.numel()]).reshape(-1).to(device=dev, dtype=dt)
+                ok = (cand > l_i) & (cand < u_i)
+                out[idx[ok]] = cand[ok]
+                filled[idx[ok]] = True
+            if not bool(filled.all()):
+                raise RuntimeError(
+                    f"rejection sampling for '{yi}' did not fill all draws; the "
+                    f"prior places too little mass inside [{float(l_i)}, {float(u_i)}]."
+                )
+            samples[yi] = out
         return self.add_fixed(samples)
 
     def remove_fixed(self, samples):

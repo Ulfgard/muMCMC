@@ -340,3 +340,78 @@ def test_box_add_remove_fixed():
     assert torch.allclose(full["y"], torch.full((2,), 5.0), atol=ATOL)
     assert "y" not in free                   # purity
     assert set(s.remove_fixed(full)) == {"x"}
+
+
+# -------------------------------------------------------------------------- #
+#  UniformBoxSpace with per-name priors (truncated to the box)               #
+# -------------------------------------------------------------------------- #
+
+def test_box_prior_log_prob_uses_user_density():
+    # With priors set, prior_log_prob sums the user's densities over free
+    # coords, evaluated as-is (unnormalized truncated is fine).
+    priors = {"x": Normal(0.0, 1.0), "y": Normal(2.0, 3.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    y = {"x": torch.tensor([0.1, -0.2]), "y": torch.tensor([3.0, 4.0])}
+    expected = (Normal(0.0, 1.0).log_prob(y["x"]).squeeze(-1)
+                + Normal(2.0, 3.0).log_prob(y["y"]).squeeze(-1))
+    assert torch.allclose(s.prior_log_prob(y), expected, atol=ATOL)
+
+
+def test_box_prior_log_prob_vector_matches_dict_form():
+    priors = {"x": Normal(0.0, 1.0), "y": Normal(2.0, 3.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    theta_free = torch.tensor([[0.2, 5.0], [-0.5, 1.0], [0.9, 9.0]])
+    vec = s.prior_log_prob_vector(theta_free)
+    dct = s.prior_log_prob(s.from_vector(theta_free))
+    assert vec.shape == (3,)
+    assert torch.allclose(vec, dct, atol=ATOL)
+
+
+def test_box_prior_skips_fixed_names():
+    # A degenerate (fixed) coord contributes nothing even if a prior is given.
+    priors = {"x": Normal(0.0, 1.0), "y": Normal(2.0, 3.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (5.0, 5.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    assert s.free_names == ["x"]
+    y = {"x": torch.tensor([0.1, -0.2])}
+    expected = Normal(0.0, 1.0).log_prob(y["x"]).squeeze(-1)
+    assert torch.allclose(s.prior_log_prob(y), expected, atol=ATOL)
+
+
+def test_box_sample_with_prior_stays_inside_box():
+    torch.manual_seed(0)
+    priors = {"x": Normal(0.0, 1.0), "y": Normal(2.0, 3.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    samples = s.sample(256)
+    assert samples["x"].shape == (256,)
+    assert torch.all(samples["x"] > -1.0) and torch.all(samples["x"] < 1.0)
+    assert torch.all(samples["y"] > 0.0) and torch.all(samples["y"] < 10.0)
+
+
+def test_box_sample_mixed_prior_and_uniform_coord():
+    # A free name without a prior falls back to uniform on its interval.
+    torch.manual_seed(0)
+    priors = {"x": Normal(0.0, 1.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    samples = s.sample(128)
+    assert torch.all(samples["x"] > -1.0) and torch.all(samples["x"] < 1.0)
+    assert torch.all(samples["y"] > 0.0) and torch.all(samples["y"] < 10.0)
+
+
+def test_box_sample_raises_when_prior_misses_box():
+    # Prior with negligible mass inside the box -> rejection cannot fill.
+    priors = {"x": Normal(1000.0, 1.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0)}, ["x"], device="cpu", priors=priors)
+    with pytest.raises(RuntimeError):
+        s.sample(16)
+
+
+def test_box_without_priors_unchanged():
+    # No priors -> uniform behaviour preserved (prior_log_prob is zero).
+    s = _box()
+    y = {"x": torch.tensor([0.1, -0.2]), "y": torch.tensor([3.0, 4.0])}
+    assert torch.allclose(s.prior_log_prob(y), torch.zeros(2), atol=ATOL)
