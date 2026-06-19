@@ -499,11 +499,6 @@ class UniformBoxSpace:
 
     def __init__(self, limits, names, device, priors=None):
         self.names = names
-        # None/{} -> uniform on the box.  Otherwise a per-name distribution,
-        # evaluated as-is: an unnormalized truncated density is fine (the
-        # truncation constant is irrelevant for sampling).  If the user wants a
-        # properly normalized truncated prior they supply that distribution and
-        # are responsible for keeping ``prior_log_prob`` and ``sample`` aligned.
         self.priors = priors if priors is not None else {}
         self.fixed = {}
 
@@ -557,10 +552,8 @@ class UniformBoxSpace:
         return transforms.box(z_vec, self.l, self.u)
 
     def prior_log_prob(self, y):
-        # Empty priors -> uniform on the box: constant inside, undefined
-        # outside; HMC cannot reach outside through the unconstraining
-        # transform, so the constant is irrelevant for sampling.  With priors
-        # set, sum the user's densities over free coords, evaluated as given.
+        # Returns the unnormalized log probability.  With no prior given,
+        # returns zero -- the uniform prior on the box.
         first = next(iter(y.values()))
         result = torch.zeros(first.shape, device=first.device, dtype=first.dtype)
         for yi in self.free_names:
