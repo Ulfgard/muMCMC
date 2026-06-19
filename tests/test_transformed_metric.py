@@ -249,10 +249,11 @@ def test_push_forward_projects_out_trailing_fixed():
 
 def test_push_forward_box_matches_dense_pullback():
     # Box transform: J is diagonal = box jacobian; check inv-metric vs dense.
+    # Disable the metric Jacobian floor so this is an *exact* pull-back check.
     torch.manual_seed(17)
     n, d = 4, 2
     limits = {"x": (-1.0, 1.0), "y": (0.0, 4.0)}
-    s = UniformBoxSpace(limits, ["x", "y"], device="cpu")
+    s = UniformBoxSpace(limits, ["x", "y"], device="cpu", min_jacobian_factor=None)
     theta = torch.stack([
         torch.empty(n).uniform_(-0.9, 0.9),
         torch.empty(n).uniform_(0.1, 3.9),
@@ -267,3 +268,50 @@ def test_push_forward_box_matches_dense_pullback():
     v = torch.randn(n, d)
     G_u_inv = torch.linalg.inv(G_u)
     assert torch.allclose(tm.inv_metric_times_vec(v), _matvec(G_u_inv, v), atol=ATOL)
+
+
+def test_box_floored_metric_bounds_inverse_near_bound():
+    # As theta -> a bound, the unfloored inverse metric blows up; the floor
+    # (on by default) keeps it bounded.  diag_J >= factor * (u-l)/2, so the
+    # per-coord inverse-metric entry is capped at ~1/(factor*(u-l)/2)^2.
+    n, d = 3, 2
+    limits = {"x": (-1.0, 1.0), "y": (0.0, 4.0)}
+    factor = 1e-3
+    s = UniformBoxSpace(limits, ["x", "y"], device="cpu", min_jacobian_factor=factor)
+    # Points extremely close to the upper bound (z large -> diag_J -> 0).
+    theta = torch.tensor([[0.999999, 3.999996]]).expand(n, d).contiguous()
+    G = torch.eye(d).expand(n, d, d).contiguous()   # G_c = I
+    tm = s.push_forward_metric(theta, G)
+    out = tm.inv_metric_times_vec(torch.ones(n, d))
+    assert torch.isfinite(out).all()
+    scale = torch.tensor([1.0, 2.0])                # (u-l)/2
+    cap = 1.0 / (factor * scale) ** 2
+    # With G_c = I the inverse metric is diag(1/diag_J^2); floored below the cap.
+    assert torch.all(out <= cap * (1.0 + 1e-6))
+
+
+def test_box_floored_metric_matches_unfloored_far_from_bound():
+    # Well inside the box the floor is inactive: floored ~ exact pull-back.
+    torch.manual_seed(18)
+    n, d = 4, 2
+    limits = {"x": (-1.0, 1.0), "y": (0.0, 4.0)}
+    theta = torch.stack([
+        torch.empty(n).uniform_(-0.3, 0.3),
+        torch.empty(n).uniform_(1.5, 2.5),
+    ], dim=-1)
+    G, _ = _rand_spd(n, d)
+    s_on  = UniformBoxSpace(limits, ["x", "y"], device="cpu")  # default floor on
+    s_off = UniformBoxSpace(limits, ["x", "y"], device="cpu", min_jacobian_factor=None)
+    v = torch.randn(n, d)
+    on  = s_on.push_forward_metric(theta, G).inv_metric_times_vec(v)
+    off = s_off.push_forward_metric(theta, G).inv_metric_times_vec(v)
+    # Floor is smooth (softplus), so it is only ~inactive, not exactly off,
+    # leaving a sub-percent residual well inside the box.
+    assert torch.allclose(on, off, rtol=1e-2, atol=1e-4)
+
+
+def test_box_min_jacobian_factor_validates():
+    limits = {"x": (-1.0, 1.0)}
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            UniformBoxSpace(limits, ["x"], device="cpu", min_jacobian_factor=bad)

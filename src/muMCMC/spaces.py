@@ -20,6 +20,7 @@ the space's transforms expose.
 from functools import cached_property
 
 import torch
+import torch.nn.functional as F
 
 
 class ElementwiseTransform:
@@ -150,6 +151,33 @@ class transforms:
         half_range = (u - l) / 2.0
         p = torch.atanh((p_prime - center) / half_range)
         return transforms._box(p, p_prime, l, u).inv
+
+    @staticmethod
+    def box_floored_metric(z_transform: ElementwiseTransform, l, u, factor) -> ElementwiseTransform:
+        """A box (tanh) z->theta transform regularized for *metric* use only.
+
+        The box Jacobian (u-l)/2 * sech^2(z) vanishes as z drives theta to a
+        bound, so the pulled-back metric correctly vanishes but its inverse (and
+        sampled momenta) blow up numerically.  This softly floors the Jacobian
+        at ``factor * (u-l)/2`` (a fraction of its maximum) in log space:
+            log|J'| = log(floor) + softplus(log|J| - log(floor))
+        so |J'| >= floor everywhere and |J'| -> |J| well above the floor.  The
+        base/mapped points are untouched.  This is the tanh-specific companion
+        of ``box``; it must not be used for the change-of-variables Jacobian,
+        which has to stay exact.
+        """
+        l, u = torch.atleast_1d(l), torch.atleast_1d(u)
+        scale = (u - l) / 2.0
+        z = z_transform.p
+        log_diag_J = torch.log(scale) - 2.0 * torch.log(torch.cosh(z))
+        log_floor = torch.log(factor * scale)
+        log_diag_J = log_floor + F.softplus(log_diag_J - log_floor)
+        return ElementwiseTransform(
+            p             = z,
+            p_prime       = z_transform.mapped_point,
+            diag_J        = torch.exp(log_diag_J),
+            log_abs_det_J = log_diag_J.sum(dim=-1),
+        )
 
 
 # ====================================================================== #
@@ -497,10 +525,25 @@ class UniformBoxSpace:
     # per-name priors are supplied (see ``sample``).
     _MAX_REJECTION_ROUNDS = 100
 
-    def __init__(self, limits, names, device, priors=None, *, prior_metric_fn=None):
+    # Default floor on the box transform's Jacobian used by the pulled-back
+    # metric, as a fraction of its maximum (u-l)/2 (see ``push_forward_metric``).
+    DEFAULT_MIN_JACOBIAN_FACTOR = 1.e-3
+
+    def __init__(self, limits, names, device, priors=None, *, prior_metric_fn=None,
+                 min_jacobian_factor=DEFAULT_MIN_JACOBIAN_FACTOR):
         self.names = names
         self.priors = priors if priors is not None else {}
         self.prior_metric_fn = prior_metric_fn
+        # The box transform's Jacobian diag_J = (u-l)/2 * sech^2(z) vanishes as
+        # a coordinate approaches a bound; the pulled-back metric then correctly
+        # vanishes, but its inverse (and sampled momenta) blow up numerically.
+        # When set, ``push_forward_metric`` softly floors |diag_J| at
+        # min_jacobian_factor * (u-l)/2 so the inverse metric stays bounded.
+        # None disables it (exact, unregularized pull-back).  Only the metric is
+        # affected; the change-of-variables Jacobian in the potential is exact.
+        if min_jacobian_factor is not None and not (0.0 < min_jacobian_factor <= 1.0):
+            raise ValueError("min_jacobian_factor must be in (0, 1] or None")
+        self.min_jacobian_factor = min_jacobian_factor
         self.fixed = {}
 
         self.l = []
@@ -587,6 +630,12 @@ class UniformBoxSpace:
         #if map is not provided, compute the transformation z->theta by first computing theta->z and then inverting
         if theta_map is None:
             theta_map = self.map_to_unconstrained_vector(theta).inv
+        # Regularize the Jacobian used by the metric (only) so the inverse
+        # metric stays bounded near a bound; the change-of-variables Jacobian in
+        # the potential already consumed the exact theta_map upstream.
+        if self.min_jacobian_factor is not None:
+            theta_map = transforms.box_floored_metric(
+                theta_map, self.l, self.u, self.min_jacobian_factor)
         # NOTE (batched robustness, deferred): see UnconstrainedSpace.push_forward_metric
         # -- batched cholesky aborts the whole batch on any non-PD chain; the
         # cholesky_ex + indexed-exception + active-set-removal refactor is the
