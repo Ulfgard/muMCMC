@@ -153,7 +153,7 @@ class transforms:
         return transforms._box(p, p_prime, l, u).inv
 
     @staticmethod
-    def box_floored_metric(z_transform: ElementwiseTransform, l, u, factor) -> ElementwiseTransform:
+    def _box_floored_metric(z_transform: ElementwiseTransform, l, u, factor) -> ElementwiseTransform:
         """A box (tanh) z->theta transform regularized for *metric* use only.
 
         The box Jacobian (u-l)/2 * sech^2(z) vanishes as z drives theta to a
@@ -634,7 +634,7 @@ class UniformBoxSpace:
         # metric stays bounded near a bound; the change-of-variables Jacobian in
         # the potential already consumed the exact theta_map upstream.
         if self.min_jacobian_factor is not None:
-            theta_map = transforms.box_floored_metric(
+            theta_map = transforms._box_floored_metric(
                 theta_map, self.l, self.u, self.min_jacobian_factor)
         # NOTE (batched robustness, deferred): see UnconstrainedSpace.push_forward_metric
         # -- batched cholesky aborts the whole batch on any non-PD chain; the
