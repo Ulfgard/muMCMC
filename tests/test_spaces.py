@@ -291,9 +291,18 @@ def test_box_prior_log_prob_is_zero():
     assert torch.allclose(v, torch.zeros(7), atol=ATOL)
 
 
-def test_box_prior_metric_is_none():
+def test_box_prior_metric_default_none():
     s = _box()
     assert s.prior_metric(torch.randn(3, 2)) is None
+
+
+def test_box_prior_metric_fn_is_used():
+    def metric_fn(theta_full):
+        return torch.eye(2).expand(theta_full.shape[0], 2, 2)
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", prior_metric_fn=metric_fn)
+    G = s.prior_metric(torch.randn(3, 2))
+    assert G.shape == (3, 2, 2)
 
 
 def test_box_sample_inside_box():
