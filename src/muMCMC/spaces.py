@@ -497,9 +497,10 @@ class UniformBoxSpace:
     # per-name priors are supplied (see ``sample``).
     _MAX_REJECTION_ROUNDS = 100
 
-    def __init__(self, limits, names, device, priors=None):
+    def __init__(self, limits, names, device, priors=None, *, prior_metric_fn=None):
         self.names = names
         self.priors = priors if priors is not None else {}
+        self.prior_metric_fn = prior_metric_fn
         self.fixed = {}
 
         self.l = []
@@ -567,8 +568,10 @@ class UniformBoxSpace:
         return self.prior_log_prob(self.from_vector(theta_free))
 
     def prior_metric(self, theta_full):
-        """Uniform-on-box has zero prior metric contribution."""
-        return None
+        """Constrained-space prior metric, or None when not configured."""
+        if self.prior_metric_fn is None:
+            return None
+        return self.prior_metric_fn(theta_full)
         
     def push_forward_metric(self, theta, G, theta_map=None, G_is_lower_cholesky=False):
         """computes the push forward of a metric computed at constrained point theta from constrained to free unconstrained space.
