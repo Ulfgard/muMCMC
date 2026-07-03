@@ -27,6 +27,8 @@ from muMCMC.RMHMC import (
     _hamiltonian,
     _midpoint_map,
     _implicit_midpoint_step,
+    _PicardUpdate,
+    _AndersonUpdate
 )
 from muMCMC.spaces import UnconstrainedSpace
 
@@ -264,3 +266,140 @@ def test_quadratic_hamiltonian_conserved_over_many_steps():
         q, p, _, residual = _implicit_midpoint_step(q, p, eps, ev, 300, 1e-12)
         assert float(residual) < 1e-9
     assert abs(float(_H_at(ev, q, p) - H0)) < 1e-7      # no drift over the run
+
+
+# ========================================================================== #
+#  5. Anderson solver: same fixed point, fewer iterations                    #
+# ========================================================================== #
+
+def test_anderson_reaches_same_endpoint_as_picard():
+    # Both solvers attack the identical fixed-point equation, so the converged
+    # endpoint must agree to the solver tolerance -- only the path (and the
+    # iteration count) differs.
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(4, seed=11)
+    eps = torch.full((4,), 0.3)
+
+    qp, pp, _, rp = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
+                                            _PicardUpdate())
+    qa, pa, _, ra = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
+                                            _AndersonUpdate(6))
+
+    assert torch.all(rp < 1e-11) and torch.all(ra < 1e-11)   # both converged
+    assert torch.allclose(qa, qp, atol=1e-9)
+    assert torch.allclose(pa, pp, atol=1e-9)
+
+
+def test_anderson_endpoint_satisfies_implicit_midpoint_equations():
+    # The Anderson endpoint is a genuine fixed point of the midpoint map, not
+    # just close to Picard's.
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(3, seed=12)
+    eps = torch.full((3,), 0.25)
+    q1, p1, _, residual = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
+                                                  _AndersonUpdate())
+    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    assert torch.allclose(q1, F_q, atol=1e-8)
+    assert torch.allclose(p1, F_p, atol=1e-8)
+    assert torch.all(residual < 1e-8)
+
+
+def test_anderson_is_time_reversible():
+    # The endpoint is solver-independent, so Anderson inherits the integrator's
+    # time-reversibility.
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(3, seed=13)
+    for eps_val in (0.1, 0.3, 0.5):
+        eps = torch.full((3,), eps_val)
+        q1, p1, _, _ = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
+                                               _AndersonUpdate())
+        q2, p2, _, _ = _implicit_midpoint_step(q1, -p1, eps, ev, 200, 1e-12,
+                                               _AndersonUpdate())
+        assert torch.allclose(q2, q, atol=1e-9)
+        assert torch.allclose(p2, -p, atol=1e-9)
+
+
+def test_anderson_solves_linear_map_faster_than_picard():
+    # Constant metric + quadratic potential => the midpoint map is affine, where
+    # Anderson(m>=1) reaches the fixed point in far fewer iterations than the
+    # linearly-convergent Picard iteration.
+    ev = make_eval(model_gauss_const)
+    torch.manual_seed(14)
+    q = torch.randn(1, D)
+    _, metric = ev(q)
+    p = metric.sample_momentum()
+    eps = torch.full((1,), 0.6)
+
+    _, _, it_p, r_p = _implicit_midpoint_step(q, p, eps, ev, 100, 1e-10,
+                                              _PicardUpdate())
+    _, _, it_a, r_a = _implicit_midpoint_step(q, p, eps, ev, 100, 1e-10,
+                                              _AndersonUpdate(D))
+    assert float(r_p) < 1e-9 and float(r_a) < 1e-9          # both converge
+    assert int(it_a) < int(it_p)                            # Anderson is faster
+
+
+def test_anderson_default_history_is_dim_q():
+    # A None history resolves to dim(q) when the working updater is built...
+    assert _AndersonUpdate(history=None).new(D).history == D
+    # ...and the resulting solve still converges.
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(2, seed=15)
+    eps = torch.full((2,), 0.3)
+    _, _, _, residual = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
+                                                _AndersonUpdate(history=None))
+    assert torch.all(residual < 1e-10)
+
+
+# ========================================================================== #
+#  6. Damping (under-relaxation): stabilises the near-imaginary spectrum     #
+# ========================================================================== #
+
+# Build a solver of the given kind at damping beta, for parametrised tests.
+_damped = {
+    "picard":   lambda beta: _PicardUpdate(beta),
+    "anderson": lambda beta: _AndersonUpdate(beta=beta)
+}
+
+
+@pytest.mark.parametrize("solver", ["picard", "anderson"])
+def test_damping_rescues_a_step_size_where_undamped_diverges(solver):
+    # Constant metric + quadratic potential => the iteration Jacobian is (to
+    # leading order) block off-diagonal with purely imaginary eigenvalues
+    # ±i(eps/2)sqrt(eig(G^-1 H)).  Here lambda_max(B_CONST^-1 A_QUAD) ~ 1.58, so
+    # the undamped (beta=1) iteration has spectral radius > 1 for eps=1.8 and
+    # cannot converge, while under-relaxation (beta=0.5) pulls it back inside
+    # the unit circle.  Same eps, same solver -- only beta differs.
+    make = _damped[solver]
+    ev = make_eval(model_gauss_const)
+    torch.manual_seed(20)
+    q = torch.randn(1, D)
+    _, metric = ev(q)
+    p = metric.sample_momentum()
+    eps = torch.full((1,), 1.8)
+
+    _, _, _, res_undamped = _implicit_midpoint_step(
+        q, p, eps, ev, 100, 1e-9, make(1.0))
+    q1, p1, _, res_damped = _implicit_midpoint_step(
+        q, p, eps, ev, 100, 1e-9, make(0.5))
+
+    assert float(res_undamped) > 1e-9                 # beta=1: does not converge
+    assert float(res_damped) < 1e-9                   # beta<1: converges
+    # ...and to a genuine fixed point of the (beta-independent) midpoint map.
+    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    assert torch.allclose(q1, F_q, atol=1e-8)
+    assert torch.allclose(p1, F_p, atol=1e-8)
+
+
+@pytest.mark.parametrize("solver", ["picard", "anderson"])
+def test_damping_reaches_same_endpoint_as_undamped(solver):
+    # Where both converge, beta only rescales the path: the fixed point is
+    # beta-independent, so the endpoints must agree.
+    make = _damped[solver]
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(3, seed=21)
+    eps = torch.full((3,), 0.3)
+    q1, p1, _, r1 = _implicit_midpoint_step(q, p, eps, ev, 300, 1e-12, make(1.0))
+    qb, pb, _, rb = _implicit_midpoint_step(q, p, eps, ev, 300, 1e-12, make(0.6))
+    assert torch.all(r1 < 1e-11) and torch.all(rb < 1e-11)
+    assert torch.allclose(qb, q1, atol=1e-9)
+    assert torch.allclose(pb, p1, atol=1e-9)

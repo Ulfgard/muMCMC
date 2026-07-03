@@ -67,6 +67,27 @@ print(samples["x"].shape)                  # (num_chains, num_samples) = (4, 100
 print(sampler.diagnostics()["accept_rate"])  # per-chain tensor, shape (4,)
 ```
 
+The implicit-midpoint step is solved per chain by a fixed-point iteration. Two
+solvers are available via `solver=`: `"picard"` (default) and `"anderson"`,
+which applies Anderson acceleration to the same equation and often converges in
+fewer iterations — hence fewer likelihood/metric evaluations — on stiff metrics.
+The endpoint is identical up to `fp_tol`, so acceptance and mixing are
+unchanged; only solver cost differs. Its history length defaults to `dim(q)`
+(the free-parameter dimension), whose per-iteration linear-algebra overhead is
+negligible next to a single model evaluation.
+
+`damping=` (β ∈ (0, 1], default `1.0`) under-relaxes either solver as
+`(1−β)·z + β·(solver step)`. Because the implicit-midpoint iteration has a
+near-imaginary eigenvalue spectrum, β < 1 can converge at step sizes where the
+undamped iteration diverges, at the cost of more iterations. It changes only
+stability, not the endpoint.
+
+```python
+sampler = RMHMC(model, space, step_size=0.3, num_steps=8,
+                solver="anderson",            # or anderson_history=<m>
+                damping=0.8)                  # β < 1 for extra stability
+```
+
 ### NUTS
 
 `NUTS` takes only the scalar likelihood potential (no metric):

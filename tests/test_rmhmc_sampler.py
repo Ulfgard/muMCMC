@@ -234,6 +234,52 @@ def test_logging_empty_before_steps_then_populated():
 
 
 # ========================================================================== #
+#  solver argument: picard vs anderson                                       #
+# ========================================================================== #
+
+def test_invalid_solver_raises():
+    with pytest.raises(ValueError, match="unknown solver"):
+        make_sampler(solver="newton")
+
+
+def test_invalid_anderson_history_raises():
+    with pytest.raises(ValueError, match="anderson_history"):
+        make_sampler(solver="anderson", anderson_history=0)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
+def test_invalid_damping_raises(bad):
+    with pytest.raises(ValueError, match="damping"):
+        make_sampler(damping=bad)
+
+
+def test_damping_default_matches_undamped_transition():
+    # damping=1.0 is the default, so an explicit 1.0 must reproduce it exactly.
+    def run(**kw):
+        torch.manual_seed(0)
+        s = make_sampler(model_qdep, adapt=False, num_steps=3, **kw)
+        return s.step(s.init(torch.zeros(4, D))).q
+
+    assert torch.allclose(run(), run(damping=1.0), atol=1e-12)
+
+
+def test_anderson_solver_runs_and_matches_picard_endpoint():
+    # With adaptation off and a shared seed, a full transition (num_steps
+    # leapfrogs + accept) must land in the same place under either solver,
+    # since both solve the same implicit-midpoint equations.
+    def run(solver):
+        torch.manual_seed(0)
+        s = make_sampler(model_qdep, adapt=False, num_steps=3, solver=solver)
+        state = s.init(torch.zeros(4, D))
+        state = s.step(state)
+        return state.q
+
+    q_picard = run("picard")
+    q_anderson = run("anderson")
+    assert torch.allclose(q_anderson, q_picard, atol=1e-7)
+
+
+# ========================================================================== #
 #  memory leak: endpoint evals must not pin an autograd graph                #
 # ========================================================================== #
 
