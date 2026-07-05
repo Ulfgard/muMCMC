@@ -200,7 +200,11 @@ def test_end_warmup_freezes_to_adapter_average_and_resets():
     assert torch.equal(s._accepted, torch.zeros(2, dtype=torch.long))
     assert torch.equal(s._num_divergences, torch.zeros(2, dtype=torch.long))
     assert s._step == 0
-    assert s._delta_Hs == [] and s._residuals == [] and s._fp_iters == []
+    # running diagnostic summaries are reset to zeros for the sampling phase
+    z = torch.zeros(2)
+    assert torch.equal(s._delta_H_abs_sum, z) and torch.equal(s._delta_H_abs_max, z)
+    assert torch.equal(s._residual_sum, z) and torch.equal(s._residual_max, z)
+    assert torch.equal(s._fp_iters_sum, z) and torch.equal(s._fp_iters_max, z)
 
 
 def test_end_warmup_without_adaptation_keeps_step_size():
@@ -299,7 +303,44 @@ def test_endpoint_state_carries_no_autograd_graph():
     for _ in range(3):
         state = s.step(state)
 
-    assert all(not t.requires_grad for t in s._delta_Hs)
+    assert not s._delta_H_last.requires_grad
+    assert not s._delta_H_abs_sum.requires_grad and not s._delta_H_abs_max.requires_grad
     assert not state.U.requires_grad
     assert not state.metric.L.requires_grad
     assert not state.p.requires_grad
+
+
+def test_diagnostics_footprint_is_constant_over_steps():
+    """The integrator diagnostics are folded into O(num_chains) running
+    summaries, so their memory footprint must not grow with the number of
+    transitions (regression against the old append-per-step lists that grew
+    unbounded and fragmented the heap)."""
+    N, num_steps = 3, 4
+    summaries = ["_delta_H_last", "_delta_H_abs_sum", "_delta_H_abs_max",
+                 "_residual_last", "_residual_sum", "_residual_max",
+                 "_fp_iters_sum", "_fp_iters_max"]
+
+    def footprint(sampler):
+        # every accumulator is a fixed (N,) tensor -- no lists, no per-step
+        # growth; count elements so a regression to lists would blow this up.
+        for name in summaries:
+            t = getattr(sampler, name)
+            assert isinstance(t, torch.Tensor) and t.shape == (N,)
+        return sum(getattr(sampler, name).numel() for name in summaries)
+
+    s = make_sampler(model_qdep, adapt=True, num_steps=num_steps)
+    state = s.init(torch.zeros(N, D))
+    state = s.step(state)
+    after_1 = footprint(s)
+    for _ in range(30):
+        state = s.step(state)
+    after_31 = footprint(s)
+
+    assert after_1 == after_31 == len(summaries) * N
+
+    # diagnostics() exposes the summaries as (num_chains,) tensors under the
+    # documented keys (no per-step history).
+    diag = s.diagnostics()
+    for key in ("delta_H_abs_mean", "delta_H_abs_max", "residual_mean",
+                "residual_max", "fp_iters_mean", "fp_iters_max"):
+        assert diag[key].shape == (N,)

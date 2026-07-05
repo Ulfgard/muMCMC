@@ -114,10 +114,12 @@ Both samplers expose a common per-chain schema as `(num_chains,)` tensors:
 | `num_divergences` | post-warmup divergence count         |
 | `step_size`       | final (adapted) step size            |
 
-`RMHMC.diagnostics()` adds integrator-specific extras (`delta_Hs`,
-`residuals`, `fp_iters`); the full Pyro detail for `NUTS` (r-hat, n-eff,
-inverse mass matrix, divergence indices) remains available via
-`sampler.mcmc.diagnostics()`.
+`RMHMC.diagnostics()` adds integrator-specific extras as running per-chain
+summaries (`(num_chains,)` tensors, not full per-step history, so the
+footprint is constant over a run): `delta_H_abs_mean` / `delta_H_abs_max`,
+`residual_mean` / `residual_max`, and `fp_iters_mean` / `fp_iters_max`. The
+full Pyro detail for `NUTS` (r-hat, n-eff, inverse mass matrix, divergence
+indices) remains available via `sampler.mcmc.diagnostics()`.
 
 ## Layout
 

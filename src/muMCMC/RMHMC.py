@@ -522,9 +522,12 @@ class RMHMC(BaseSampler):
         self._step = 0
         self._accepted = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
         self._num_divergences = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
-        self._delta_Hs = []          # list of (N,) tensors
-        self._residuals = []         # list of (N,) tensors
-        self._fp_iters = []          # list of lists-of-(N,)  (per leapfrog substep)
+        # Running per-chain integrator summaries (O(1) memory), folded in by
+        # _bookkeep each transition.  These replace the old unbounded per-step
+        # lists (one (N,) tensor -- plus, for fp_iters, num_steps of them --
+        # appended every transition), so the diagnostics footprint stays
+        # constant over an arbitrarily long run instead of growing with it.
+        self._reset_diagnostics()
 
         # arm adaptation; the driver flips it off via end_warmup()
         self._adapting = self._adapt_step_size
@@ -611,11 +614,45 @@ class RMHMC(BaseSampler):
         out.max_residual = torch.zeros(N, dtype=chosen_q.dtype, device=chosen_q.device)
         return out
 
+    def _reset_diagnostics(self):
+        """(Re)initialize the running per-chain integrator summaries to empty.
+
+        Called by ``init`` and ``end_warmup`` to start a phase.  Every summary
+        is an ``(N,)`` accumulator sized from ``step_size`` (already tensorized
+        per chain by then), so the diagnostics cost is O(num_chains), not
+        O(num_chains * num_steps) as the old append-per-step lists were.
+        """
+        N = self.step_size.shape[0]
+        dtype, device = self.step_size.dtype, self.step_size.device
+        z = torch.zeros(N, dtype=dtype, device=device)
+        self._delta_H_last     = z.clone()   # most recent delta_H          (logging |dH|)
+        self._delta_H_abs_sum  = z.clone()   # running sum of |delta_H|     (-> mean)
+        self._delta_H_abs_max  = z.clone()   # running max |delta_H|
+        self._residual_last    = z.clone()   # most recent max-residual     (logging |r|)
+        self._residual_sum     = z.clone()   # running sum of max-residual  (-> mean)
+        self._residual_max      = z.clone()  # running max max-residual
+        self._fp_iters_sum     = z.clone()   # running sum of per-transition mean iters (-> mean)
+        self._fp_iters_max     = z.clone()   # running max per-transition worst-substep iters
+
     def _bookkeep(self, accepted, delta_H, is_divergent, max_residual, fp_iters):
-        # update running statistics (all per-chain, shape (N,))
-        self._delta_Hs.append(delta_H.detach())
-        self._residuals.append(max_residual)
-        self._fp_iters.append(fp_iters)
+        # Fold this transition into the O(1) running per-chain summaries rather
+        # than appending to unbounded lists.  Everything folded in is detached
+        # (delta_H explicitly; max_residual and fp_iters carry no graph), so no
+        # per-step model graph is pinned across the run.
+        dH = delta_H.detach()                                         # (N,)
+        fp = torch.stack(fp_iters).to(self.step_size.dtype)           # (num_steps, N)
+        it_mean = fp.mean(0)                                          # (N,) per-substep mean
+        it_max  = fp.amax(0)                                          # (N,) worst substep
+
+        self._delta_H_last     = dH
+        self._delta_H_abs_sum += dH.abs()
+        self._delta_H_abs_max  = torch.maximum(self._delta_H_abs_max, dH.abs())
+        self._residual_last    = max_residual
+        self._residual_sum    += max_residual
+        self._residual_max     = torch.maximum(self._residual_max, max_residual)
+        self._fp_iters_sum    += it_mean
+        self._fp_iters_max     = torch.maximum(self._fp_iters_max, it_max)
+
         self._accepted += accepted
         self._step += 1
         # per-chain divergence count (post-warmup once reset at end_warmup,
@@ -625,7 +662,7 @@ class RMHMC(BaseSampler):
         # step-size adaptation (per chain), while the driver leaves us adapting
         if self._adapting:
             # mean fp iters per chain across the trajectory's midpoint steps
-            num_iters = torch.stack(fp_iters).to(self.step_size.dtype).mean(0)  # (N,)
+            num_iters = it_mean                                        # (N,), computed above
             eta = 1.e-3
 
             # f_t is the per-step cost the adapter minimises (lower = better
@@ -663,9 +700,7 @@ class RMHMC(BaseSampler):
         self._accepted = torch.zeros_like(self._accepted)
         self._num_divergences = torch.zeros_like(self._num_divergences)
         self._step = 0
-        self._delta_Hs = []
-        self._residuals = []
-        self._fp_iters = []
+        self._reset_diagnostics()
 
     def logging(self):
         if self._step == 0:
@@ -673,8 +708,8 @@ class RMHMC(BaseSampler):
         # Reduce per-chain stats to scalar summaries for the progress bar:
         # mean step size / accept prob, worst-chain |dH| and |r|.
         eps   = float(self.step_size.mean())
-        dH    = float(self._delta_Hs[-1].abs().max())
-        res   = float(self._residuals[-1].max())
+        dH    = float(self._delta_H_last.abs().max())
+        res   = float(self._residual_last.max())
         accpr = float((self._accepted / self._step).mean())
         return OrderedDict(
             [
@@ -688,16 +723,32 @@ class RMHMC(BaseSampler):
     def diagnostics(self):
         """Per-chain diagnostics.  The common schema -- ``accept_rate``,
         ``num_divergences``, ``step_size`` (each a ``(num_chains,)`` tensor) --
-        matches the Pyro path; ``delta_Hs`` / ``residuals`` / ``fp_iters`` are
-        RMHMC-specific integrator extras."""
+        matches the Pyro path.
+
+        The RMHMC-specific integrator extras are running per-chain *summaries*
+        (each an ``(num_chains,)`` tensor), not the full per-step history: the
+        history grew without bound over a run (and its churn of many tiny
+        tensors fragmented the heap), so it is folded online into O(1)
+        accumulators instead.  Reported over the current phase (reset at
+        ``end_warmup``):
+
+          ``delta_H_abs_mean`` / ``delta_H_abs_max`` -- mean / max ``|delta_H|``
+          ``residual_mean``    / ``residual_max``    -- mean / max fixed-point
+                                                        max-residual per transition
+          ``fp_iters_mean``    / ``fp_iters_max``    -- mean per-substep iters /
+                                                        worst single substep
+        """
         steps = max(self._step, 1)
         return {
             "accept_rate": self._accepted / steps,    # (N,) per chain
             "num_divergences": self._num_divergences,  # (N,) per-chain count
             "step_size": self.step_size,              # (N,) per chain
-            # RMHMC-specific extras (no Pyro equivalent):
-            "delta_Hs": self._delta_Hs,
-            "residuals": self._residuals,
-            "fp_iters": self._fp_iters,
+            # RMHMC-specific running summaries (no Pyro equivalent), (N,) each:
+            "delta_H_abs_mean": self._delta_H_abs_sum / steps,
+            "delta_H_abs_max":  self._delta_H_abs_max,
+            "residual_mean":    self._residual_sum / steps,
+            "residual_max":     self._residual_max,
+            "fp_iters_mean":    self._fp_iters_sum / steps,
+            "fp_iters_max":     self._fp_iters_max,
         }
 
