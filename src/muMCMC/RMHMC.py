@@ -310,6 +310,31 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
 # finite-difference of the first-order force is kept as a robust fallback for
 # models where the second-order graph is fragile.
 
+def _vector_field_jacobian(outputs, inputs, vectorized=True):
+    """Jacobian of a batched vector field: ``outputs`` (N, d) w.r.t. ``inputs``
+    (N, d), returning ``(N, d, d)`` with ``[n, k, i] = d outputs[n,k]/d inputs[n,i]``.
+
+    ``vectorized=True`` takes all ``d`` output rows in ONE reverse pass via
+    ``is_grads_batched`` (vmap over the output basis) instead of a Python loop of
+    ``d`` separate backwards.  The per-row loop is kept as a fallback for models
+    whose backward is not vmap-compatible.  ``retain_graph`` is set so the caller
+    can reuse ``inputs``'s graph afterwards.
+    """
+    d = outputs.shape[-1]
+    if vectorized:
+        eye = torch.eye(d, dtype=outputs.dtype, device=outputs.device)
+        grad_outputs = eye.unsqueeze(1).expand(d, *outputs.shape)      # (d, N, d)
+        (J,) = torch.autograd.grad(outputs, inputs, grad_outputs=grad_outputs,
+                                   is_grads_batched=True, retain_graph=True)
+        return J.movedim(0, -2)                                        # (N, d, d)
+    rows = []
+    for k in range(d):
+        (gk,) = torch.autograd.grad(outputs[..., k].sum(), inputs,
+                                    retain_graph=True, allow_unused=True)
+        rows.append(torch.zeros_like(inputs) if gk is None else gk)
+    return torch.stack(rows, dim=-2)
+
+
 def _dHdq(q_mid, p_mid, evaluate_model, create_graph=False):
     """First-order force dH/dq at (q_mid, p_mid).
 
@@ -324,22 +349,18 @@ def _dHdq(q_mid, p_mid, evaluate_model, create_graph=False):
     return g, qm
 
 
-def _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model):
+def _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model, vectorized=True):
     """Hqq = d(dH/dq)/dq at the midpoint via exact second-order autodiff.
 
-    Row ``k`` is ``d(dH/dq)_k/dq`` (``p_mid`` held fixed), so ``Hqq[..., k, i] =
-    d^2 H / dq_k dq_i`` -- symmetric up to autodiff round-off.  Uses one double
-    backward; the returned tensor is detached (no graph escapes).
+    ``Hqq[..., k, i] = d^2 H / dq_k dq_i`` (``p_mid`` held fixed) -- symmetric up
+    to autodiff round-off.  The force is taken with a graph and its Jacobian in
+    one batched second backward (``_vector_field_jacobian``); the returned tensor
+    is detached (no graph escapes).
     """
-    d = q_mid.shape[-1]
     with torch.enable_grad():
         g, qm = _dHdq(q_mid, p_mid, evaluate_model, create_graph=True)
-        rows = []
-        for k in range(d):
-            (gk,) = torch.autograd.grad(g[..., k].sum(), qm,
-                                        retain_graph=True, allow_unused=True)
-            rows.append(torch.zeros_like(qm) if gk is None else gk)
-    return torch.stack(rows, dim=-2).detach()
+        Hqq = _vector_field_jacobian(g, qm, vectorized)
+    return Hqq.detach()
 
 
 def _force_position_hessian_fd(q_mid, p_mid, evaluate_model, fd_step, central):
@@ -368,7 +389,7 @@ def _force_position_hessian_fd(q_mid, p_mid, evaluate_model, fd_step, central):
 
 def _implicit_midpoint_residual_jacobian(
     q, p, eps, evaluate_model, z, *, force_hessian="autodiff",
-    fd_step=1e-6, fd_central=False,
+    vectorized=True, fd_step=1e-6, fd_central=False,
 ):
     """Per-chain Jacobian ``d r / d z`` of the implicit-midpoint residual
     ``r(z) = z - F(z)`` at the endpoint iterate ``z = [q_k, p_k]``.
@@ -397,6 +418,11 @@ def _implicit_midpoint_residual_jacobian(
     back to finite-differencing the first-order force (``fd_step`` / ``fd_central``)
     for models where the second-order graph is fragile.  Both are verified
     against a brute-force finite-difference Jacobian of the residual.
+
+    ``vectorized=True`` builds the per-block Jacobians (``Da`` and, for
+    ``"autodiff"``, ``Hqq``) in one batched reverse pass each rather than a
+    Python loop over the ``d`` output rows; set it False for models whose
+    backward is not vmap-compatible.
     """
     d = q.shape[-1]
     N = q.shape[0]
@@ -413,12 +439,7 @@ def _implicit_midpoint_residual_jacobian(
         _, metric = evaluate_model(qm)
         a = metric.inv_metric_times_vec(w)                      # (N, d) = Ginv w
     if a.requires_grad:                                         # (N,d,d): [:,k,i]=da_k/dq_i
-        rows = []
-        for k in range(d):
-            (gk,) = torch.autograd.grad(a[..., k].sum(), qm,
-                                        retain_graph=True, allow_unused=True)
-            rows.append(torch.zeros_like(qm) if gk is None else gk)
-        Da = torch.stack(rows, dim=-2).detach()
+        Da = _vector_field_jacobian(a, qm, vectorized).detach()
     else:                                                       # metric independent of q
         Da = torch.zeros(N, d, d, dtype=q.dtype, device=q.device)
     with torch.no_grad():                                       # dense Ginv, reuses metric
@@ -428,7 +449,7 @@ def _implicit_midpoint_residual_jacobian(
 
     # The one second-order block: exact autodiff by default, FD fallback.
     if force_hessian == "autodiff":
-        Hqq = _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model)
+        Hqq = _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model, vectorized)
     elif force_hessian == "fd":
         Hqq = _force_position_hessian_fd(q_mid, p_mid, evaluate_model, fd_step, fd_central)
     else:

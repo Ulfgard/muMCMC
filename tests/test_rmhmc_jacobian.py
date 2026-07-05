@@ -104,6 +104,21 @@ def test_autodiff_and_fd_agree():
     assert torch.allclose(J_ad, J_fd, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("model_fn", [model_qdep, model_const])
+@pytest.mark.parametrize("force_hessian", ["autodiff", "fd"])
+def test_vectorized_matches_looped(model_fn, force_hessian):
+    """The vectorized (is_grads_batched) Jacobian must equal the per-row looped
+    one bit-for-bit up to float round-off."""
+    evaluate_model = _evaluate_model(model_fn)
+    q, p, z, eps = _sample_inputs()
+    kw = dict(force_hessian=force_hessian, fd_central=True)
+    J_vec = _implicit_midpoint_residual_jacobian(
+        q, p, eps, evaluate_model, z, vectorized=True, **kw)
+    J_loop = _implicit_midpoint_residual_jacobian(
+        q, p, eps, evaluate_model, z, vectorized=False, **kw)
+    assert torch.allclose(J_vec, J_loop, atol=1e-10, rtol=1e-8)
+
+
 def test_residual_jacobian_is_detached():
     """No autograd graph escapes, even though the model's U/G carry one and Hqq
     uses a double backward internally."""
