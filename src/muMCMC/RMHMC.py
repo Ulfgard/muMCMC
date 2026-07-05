@@ -291,6 +291,155 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
     return z_k[..., :d].detach(), z_k[..., d:].detach(), iters, residual.detach()
 
 
+# ---- Residual Jacobian (for Newton-type inner solves) -------------------- #
+#
+# The fixed-point solvers above (Picard / Anderson) only need residual *values*.
+# A Newton-type corrector instead needs the Jacobian d r / d z of the residual
+# r(z) = z - F(z) at the endpoint iterate z = [q_k, p_k].  For a stiff,
+# strongly position-varying metric the fixed-point contraction factor ~ eps * L
+# is large and Picard/Anderson stall, whereas Newton is spectrum-agnostic -- so
+# this Jacobian is the building block for a simplified/frozen-Jacobian Newton
+# corrector.
+#
+# Structure exploited (see _implicit_midpoint_residual_jacobian): with the
+# metric available in closed form, only ONE block of the Jacobian is genuinely
+# second-order in the model (the force/position Hessian Hqq); every other block
+# is a first derivative of the metric.  Hqq is taken with exact second-order
+# autodiff by default (the model's metric is a closed-form forward map, so this
+# is a plain double backward, not a nested autograd-of-autograd); a
+# finite-difference of the first-order force is kept as a robust fallback for
+# models where the second-order graph is fragile.
+
+def _dHdq(q_mid, p_mid, evaluate_model, create_graph=False):
+    """First-order force dH/dq at (q_mid, p_mid).
+
+    Mirrors the gradient inside ``_midpoint_map``.  ``create_graph=True`` keeps
+    the graph so a second derivative (Hqq) can be taken through it.
+    """
+    qm = q_mid.detach().requires_grad_(True)
+    with torch.enable_grad():
+        U, metric = evaluate_model(qm)
+        H = _hamiltonian(qm, p_mid, U, metric)
+        (g,) = torch.autograd.grad(H.sum(), qm, create_graph=create_graph)
+    return g, qm
+
+
+def _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model):
+    """Hqq = d(dH/dq)/dq at the midpoint via exact second-order autodiff.
+
+    Row ``k`` is ``d(dH/dq)_k/dq`` (``p_mid`` held fixed), so ``Hqq[..., k, i] =
+    d^2 H / dq_k dq_i`` -- symmetric up to autodiff round-off.  Uses one double
+    backward; the returned tensor is detached (no graph escapes).
+    """
+    d = q_mid.shape[-1]
+    with torch.enable_grad():
+        g, qm = _dHdq(q_mid, p_mid, evaluate_model, create_graph=True)
+        rows = []
+        for k in range(d):
+            (gk,) = torch.autograd.grad(g[..., k].sum(), qm,
+                                        retain_graph=True, allow_unused=True)
+            rows.append(torch.zeros_like(qm) if gk is None else gk)
+    return torch.stack(rows, dim=-2).detach()
+
+
+def _force_position_hessian_fd(q_mid, p_mid, evaluate_model, fd_step, central):
+    """Fallback for ``_force_position_hessian_autodiff``: Hqq by finite-
+    differencing the first-order force in ``q_mid`` (``p_mid`` fixed).  Central
+    uses 2d force evals, one-sided d+1 (reusing the base force).  No second-order
+    autodiff.
+    """
+    d = q_mid.shape[-1]
+    Hqq = torch.empty(*q_mid.shape[:-1], d, d, dtype=q_mid.dtype, device=q_mid.device)
+    if central:
+        for i in range(d):
+            e = torch.zeros_like(q_mid); e[..., i] = fd_step
+            gp, _ = _dHdq(q_mid + e, p_mid, evaluate_model)
+            gm, _ = _dHdq(q_mid - e, p_mid, evaluate_model)
+            Hqq[..., :, i] = (gp - gm).detach() / (2 * fd_step)
+    else:
+        base, _ = _dHdq(q_mid, p_mid, evaluate_model)
+        base = base.detach()
+        for i in range(d):
+            e = torch.zeros_like(q_mid); e[..., i] = fd_step
+            gp, _ = _dHdq(q_mid + e, p_mid, evaluate_model)
+            Hqq[..., :, i] = (gp.detach() - base) / fd_step
+    return Hqq
+
+
+def _implicit_midpoint_residual_jacobian(
+    q, p, eps, evaluate_model, z, *, force_hessian="autodiff",
+    fd_step=1e-6, fd_central=False,
+):
+    """Per-chain Jacobian ``d r / d z`` of the implicit-midpoint residual
+    ``r(z) = z - F(z)`` at the endpoint iterate ``z = [q_k, p_k]``.
+
+    Shapes: ``q, p`` are ``(N, d)``; ``z`` is ``(N, 2d)``; ``eps`` is ``(N,)``.
+    Returns ``(N, 2d, 2d)``.
+
+    Derivation.  With ``q_mid = (q+q_k)/2``, ``p_mid = (p+p_k)/2``,
+    ``w = p + p_k = 2 p_mid`` and ``e = eps``,
+
+        F_q = q + (e/2) G^{-1}(q_mid) w
+        F_p = p - e * dH/dq(q_mid, p_mid)
+
+    so, writing ``Ginv = G^{-1}(q_mid)`` and the vector-field Jacobian
+    ``Da = d/dq[ G^{-1}(q) w ]|_{q_mid}`` (first order in the metric),
+
+        Hqp = d(dH/dq)/dp|_mid = Da^T / 2        (first order, since p_mid = w/2)
+        Hqq = d(dH/dq)/dq|_mid                    (second order -> finite diff)
+
+        J_r = [[ I - (e/4) Da ,  -(e/2) Ginv    ],
+               [ (e/2) Hqq    ,   I + (e/2) Hqp ]].
+
+    Only ``Hqq`` needs a second derivative of the model.  ``force_hessian``
+    selects how it is taken: ``"autodiff"`` (default) uses exact second-order
+    autodiff (a double backward through the closed-form metric); ``"fd"`` falls
+    back to finite-differencing the first-order force (``fd_step`` / ``fd_central``)
+    for models where the second-order graph is fragile.  Both are verified
+    against a brute-force finite-difference Jacobian of the residual.
+    """
+    d = q.shape[-1]
+    N = q.shape[0]
+    q_k, p_k = z[..., :d], z[..., d:]
+    q_mid = 0.5 * (q + q_k)
+    p_mid = 0.5 * (p + p_k)
+    w = (p + p_k).detach()
+    e = eps.reshape(N, *([1] * 2))
+    eye = torch.eye(d, dtype=q.dtype, device=q.device).expand(N, d, d)
+
+    # First-order blocks from a single grad-enabled metric evaluation at q_mid.
+    qm = q_mid.detach().requires_grad_(True)
+    with torch.enable_grad():
+        _, metric = evaluate_model(qm)
+        a = metric.inv_metric_times_vec(w)                      # (N, d) = Ginv w
+    if a.requires_grad:                                         # (N,d,d): [:,k,i]=da_k/dq_i
+        rows = []
+        for k in range(d):
+            (gk,) = torch.autograd.grad(a[..., k].sum(), qm,
+                                        retain_graph=True, allow_unused=True)
+            rows.append(torch.zeros_like(qm) if gk is None else gk)
+        Da = torch.stack(rows, dim=-2).detach()
+    else:                                                       # metric independent of q
+        Da = torch.zeros(N, d, d, dtype=q.dtype, device=q.device)
+    with torch.no_grad():                                       # dense Ginv, reuses metric
+        Ginv = torch.stack(
+            [metric.inv_metric_times_vec(eye[..., j]) for j in range(d)], dim=-1)
+    Hqp = Da.transpose(-2, -1) * 0.5
+
+    # The one second-order block: exact autodiff by default, FD fallback.
+    if force_hessian == "autodiff":
+        Hqq = _force_position_hessian_autodiff(q_mid, p_mid, evaluate_model)
+    elif force_hessian == "fd":
+        Hqq = _force_position_hessian_fd(q_mid, p_mid, evaluate_model, fd_step, fd_central)
+    else:
+        raise ValueError(
+            f"force_hessian must be 'autodiff' or 'fd', got {force_hessian!r}")
+
+    top = torch.cat([eye - (e / 4) * Da,  -(e / 2) * Ginv],     dim=-1)
+    bot = torch.cat([(e / 2) * Hqq,        eye + (e / 2) * Hqp], dim=-1)
+    return torch.cat([top, bot], dim=-2)
+
+
 # =========================================================================== #
 #                                                                             #
 #  Chain state                                                                #
