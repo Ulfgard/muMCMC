@@ -126,9 +126,10 @@ class _PicardUpdate:
     def __init__(self, beta=1.0):
         self.beta = float(beta)
 
-    def new(self, d):
+    def new(self, d, jacobian_fn=None):
         """Fresh working updater for a solve over ``d``-dim positions; stateless,
-        so ``self`` is reused."""
+        so ``self`` is reused.  ``jacobian_fn`` is ignored (Picard needs only
+        residual values); it is accepted for a uniform updater interface."""
         return self
 
     def propose(self, z, r):
@@ -180,9 +181,10 @@ class _AndersonUpdate:
         self._Z = []   # committed iterates z_k        (each (N, 2d))
         self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
 
-    def new(self, d):
+    def new(self, d, jacobian_fn=None):
         """Fresh, empty-buffer working updater for a solve over ``d``-dim
-        positions, resolving a None ``history`` to ``d``."""
+        positions, resolving a None ``history`` to ``d``.  ``jacobian_fn`` is
+        ignored (Anderson needs only residual values)."""
         return _AndersonUpdate(d if self.history is None else self.history, self.beta)
 
     def propose(self, z, r):
@@ -214,6 +216,84 @@ class _AndersonUpdate:
 
         z_next = z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
         return z_next
+
+
+class _NewtonUpdate:
+    """Frozen-Jacobian (simplified) Newton corrector for the same fixed point.
+
+    Solves ``r(z) = z - F(z) = 0`` with a Newton step ``z_{k+1} = z_k - beta *
+    J_r^{-1} r_k``, where ``J_r`` is the residual Jacobian
+    (``_implicit_midpoint_residual_jacobian``).  Unlike Picard/Anderson -- whose
+    contraction factor ``~ eps * L`` blows up on a stiff, strongly
+    position-varying metric -- Newton is spectrum-agnostic, so it does not stall
+    in that regime.
+
+    ``J_r`` is computed once at the start of the solve and its LU factorization
+    is *reused* across the corrector iterations (simplified/modified Newton):
+    each iteration then costs one residual evaluation plus a triangular solve,
+    i.e. Picard's per-iteration cost with Newton-like convergence.  A frozen
+    Jacobian is a great fit here because the metric varies little over a single
+    integrator step; ``refresh_every > 0`` re-factorizes periodically for the
+    rare step where it does not.  ``reg`` adds a Levenberg-Marquardt floor
+    ``(J + reg I)`` for chains whose Jacobian is (near-)singular; being only a
+    step-direction change, it does not move the fixed point.
+
+    A configured instance (held by ``RMHMC``) carries the config; ``new`` returns
+    a fresh working copy bound to a solve's ``jacobian_fn`` with empty state.
+
+    Parameters
+    ----------
+    beta : float
+        Damping factor in (0, 1] (globalization); 1.0 is the undamped step.
+    force_hessian : str
+        ``"autodiff"`` (exact double backward) or ``"fd"`` (finite-difference
+        the first-order force) for the one second-order Jacobian block.
+    vectorized : bool
+        Build the Jacobian blocks in one batched reverse pass (``is_grads_batched``)
+        vs a per-row loop; set False if the model's backward is not vmap-safe.
+    refresh_every : int
+        Re-factorize the Jacobian every this many iterations; 0 freezes it for
+        the whole solve (pure simplified Newton).
+    reg : float
+        Levenberg-Marquardt floor added to the Jacobian diagonal before the
+        solve.  Default 0 (exact Newton).
+    """
+
+    def __init__(self, beta=1.0, force_hessian="autodiff", vectorized=True,
+                 refresh_every=0, reg=0.0):
+        self.beta          = float(beta)
+        self.force_hessian = force_hessian
+        self.vectorized    = vectorized
+        self.refresh_every = int(refresh_every)
+        self.reg           = float(reg)
+        self._jacobian_fn  = None    # bound per-solve by new()
+        self._lu           = None    # cached (LU, pivots)
+        self._iter         = 0
+
+    def new(self, d, jacobian_fn=None):
+        """Fresh working updater bound to this solve's ``jacobian_fn`` (a closure
+        ``z, **kw -> J_r(z)`` supplied by ``_implicit_midpoint_step``)."""
+        u = _NewtonUpdate(self.beta, self.force_hessian, self.vectorized,
+                          self.refresh_every, self.reg)
+        u._jacobian_fn = jacobian_fn
+        return u
+
+    def _factorize(self, z):
+        J = self._jacobian_fn(z, force_hessian=self.force_hessian,
+                              vectorized=self.vectorized)          # (N, 2d, 2d)
+        if self.reg:
+            m = J.shape[-1]
+            J = J + self.reg * torch.eye(m, dtype=J.dtype, device=J.device)
+        self._lu = torch.linalg.lu_factor(J)
+
+    def propose(self, z, r):
+        # (Re)factorize at the start, then every refresh_every iterations.
+        if self._lu is None or (self.refresh_every
+                                and self._iter % self.refresh_every == 0):
+            self._factorize(z)
+        self._iter += 1
+        delta = torch.linalg.lu_solve(*self._lu, r.unsqueeze(-1)).squeeze(-1)
+        return z - self.beta * delta
 
 
 # ---- Implicit midpoint step --------------------------------------------- #
@@ -253,7 +333,12 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
         F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
         return z - torch.cat([F_q, F_p], dim=-1)
 
-    updater = (solver if solver is not None else _PicardUpdate()).new(d)
+    def jacobian_fn(z, **kw):
+        # Jacobian of residual_fn at z; **kw carries the Newton solver's
+        # force_hessian / vectorized choices.  Only Newton uses this.
+        return _implicit_midpoint_residual_jacobian(q, p, eps, evaluate_model, z, **kw)
+
+    updater = (solver if solver is not None else _PicardUpdate()).new(d, jacobian_fn)
 
     z_k = torch.cat([q, p], dim=-1)            # (N, 2d)
     r_k = residual_fn(z_k)
@@ -593,10 +678,13 @@ class RMHMC(BaseSampler):
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
         Fixed-point solver driving the implicit-midpoint solve: ``"picard"``
-        (default) or ``"anderson"``.  Both solve the identical equation and
-        return the same endpoint up to ``fp_tol``; Anderson typically reaches
-        it in fewer iterations (hence fewer model evals) on stiff metrics, at
-        the cost of a small m×m solve per iteration.
+        (default), ``"anderson"``, or ``"newton"``.  All solve the identical
+        equation and return the same endpoint up to ``fp_tol``.  Anderson
+        typically converges in fewer iterations than Picard on stiff metrics;
+        ``"newton"`` (frozen-Jacobian / simplified Newton) is spectrum-agnostic
+        and does not stall when the fixed-point contraction ``~ eps * L`` is
+        large -- the regime of a strongly position-varying, ill-conditioned
+        metric -- at the cost of one residual-Jacobian factorization per step.
     anderson_history : int or None
         History length ``m`` for the Anderson solver (ignored for Picard).
         ``None`` (default) resolves per-solve to ``dim(q)`` (the free-parameter
@@ -604,12 +692,31 @@ class RMHMC(BaseSampler):
         overhead is negligible next to a single likelihood/metric evaluation,
         which dominates RMHMC cost.  Must be ≥ 1 if given.
     damping : float
-        Under-relaxation factor β ∈ (0, 1] shared by both solvers (default 1.0
-        = undamped).  The step becomes ``(1−β) z + β·(solver step)``; β < 1
-        trades convergence speed for stability and is the lever for the
+        Under-relaxation factor β ∈ (0, 1] shared by all solvers (default 1.0
+        = undamped).  For Picard/Anderson the step becomes ``(1−β) z + β·(solver
+        step)``; for Newton it is the step-length ``z − β J⁻¹ r`` (globalization).
+        β < 1 trades convergence speed for stability and is the lever for the
         (near-)imaginary iteration spectrum of the implicit-midpoint map.  It
         affects only stability/iteration count, not the endpoint, nor the
         Anderson inner solve's conditioning (which the Tikhonov floor handles).
+    newton_force_hessian : str
+        For ``solver="newton"``: how the one second-order Jacobian block is
+        taken -- ``"autodiff"`` (exact double backward through the closed-form
+        metric, default) or ``"fd"`` (finite-difference the first-order force,
+        for models whose second-order graph is fragile).
+    newton_vectorized : bool
+        For ``solver="newton"``: build the Jacobian blocks in one batched reverse
+        pass (``is_grads_batched``) rather than a per-row loop.  Default True;
+        set False if the model's backward is not vmap-compatible.
+    newton_refresh : int
+        For ``solver="newton"``: re-factorize the Jacobian every this many
+        corrector iterations.  0 (default) freezes it for the whole solve, which
+        is ideal when the metric varies little over one integrator step.
+    newton_reg : float
+        For ``solver="newton"``: Levenberg-Marquardt floor added to the Jacobian
+        diagonal (``J + reg·I``) to keep the solve well-posed for (near-)singular
+        chains.  Default 0 (exact Newton); a step-direction change only, so it
+        does not move the fixed point.
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence.  Default 100.
@@ -629,6 +736,10 @@ class RMHMC(BaseSampler):
         solver: str = "picard",
         anderson_history: int = None,
         damping: float = 1.0,
+        newton_force_hessian: str = "autodiff",
+        newton_vectorized: bool = True,
+        newton_refresh: int = 0,
+        newton_reg: float = 0.0,
         divergence_threshold: float = 100.0
     ):
         super().__init__(potential_fn=model_fn, space=space, requires_metric=True)
@@ -648,9 +759,23 @@ class RMHMC(BaseSampler):
                 raise ValueError(
                     f"anderson_history must be >= 1, got {anderson_history}")
             self._solver = _AndersonUpdate(anderson_history, damping)
+        elif solver == "newton":
+            if newton_force_hessian not in ("autodiff", "fd"):
+                raise ValueError(
+                    "newton_force_hessian must be 'autodiff' or 'fd', got "
+                    f"{newton_force_hessian!r}")
+            if newton_refresh < 0:
+                raise ValueError(
+                    f"newton_refresh must be >= 0, got {newton_refresh}")
+            if newton_reg < 0.0:
+                raise ValueError(f"newton_reg must be >= 0, got {newton_reg}")
+            self._solver = _NewtonUpdate(damping, newton_force_hessian,
+                                         newton_vectorized, newton_refresh,
+                                         newton_reg)
         else:
             raise ValueError(
-                f"unknown solver {solver!r}; expected 'picard' or 'anderson'")
+                f"unknown solver {solver!r}; expected 'picard', 'anderson' or "
+                "'newton'")
 
         self._step_size_init       = step_size       # scalar; tensorized per-chain in init()
         self.step_size             = step_size

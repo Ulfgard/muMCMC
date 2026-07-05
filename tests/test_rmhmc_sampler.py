@@ -238,17 +238,31 @@ def test_logging_empty_before_steps_then_populated():
 
 
 # ========================================================================== #
-#  solver argument: picard vs anderson                                       #
+#  solver argument: picard vs anderson vs newton                             #
 # ========================================================================== #
 
 def test_invalid_solver_raises():
     with pytest.raises(ValueError, match="unknown solver"):
-        make_sampler(solver="newton")
+        make_sampler(solver="gauss_seidel")
 
 
 def test_invalid_anderson_history_raises():
     with pytest.raises(ValueError, match="anderson_history"):
         make_sampler(solver="anderson", anderson_history=0)
+
+
+def test_invalid_newton_force_hessian_raises():
+    with pytest.raises(ValueError, match="newton_force_hessian"):
+        make_sampler(solver="newton", newton_force_hessian="exact")
+
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(newton_refresh=-1), "newton_refresh"),
+    (dict(newton_reg=-1.0), "newton_reg"),
+])
+def test_invalid_newton_params_raise(kw, match):
+    with pytest.raises(ValueError, match=match):
+        make_sampler(solver="newton", **kw)
 
 
 @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
@@ -281,6 +295,27 @@ def test_anderson_solver_runs_and_matches_picard_endpoint():
     q_picard = run("picard")
     q_anderson = run("anderson")
     assert torch.allclose(q_anderson, q_picard, atol=1e-7)
+
+
+def _transition_q(**kw):
+    torch.manual_seed(0)
+    s = make_sampler(model_qdep, adapt=False, num_steps=3, **kw)
+    return s.step(s.init(torch.zeros(4, D))).q
+
+
+@pytest.mark.parametrize("newton_kw", [
+    dict(),                                  # frozen exact Newton
+    dict(newton_force_hessian="fd"),         # FD force Hessian
+    dict(newton_vectorized=False),           # looped Jacobian
+    dict(newton_refresh=2),                  # periodic re-factorization
+    dict(newton_reg=1e-8),                   # Levenberg floor
+])
+def test_newton_solver_matches_picard_endpoint(newton_kw):
+    # Every Newton configuration solves the same implicit-midpoint equations,
+    # so a full transition must land where Picard does (shared seed, no adapt).
+    q_picard = _transition_q(solver="picard")
+    q_newton = _transition_q(solver="newton", **newton_kw)
+    assert torch.allclose(q_newton, q_picard, atol=1e-7)
 
 
 # ========================================================================== #
