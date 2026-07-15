@@ -1,28 +1,20 @@
 """
 Stochastic optimizers.
 
-Two small, self-contained stochastic optimizers, decoupled from Pyro.
-Both are general-purpose -- step-size adaptation is merely how the RMHMC
-kernel happens to use them -- and both are vectorised over a leading axis
-so that N independent problems are solved in parallel without coupling.
+Two self-contained stochastic optimizers, vectorised over a leading axis so
+that N independent problems are solved in parallel without coupling.
 
 * :class:`DualAveraging` -- a first-order stochastic subgradient optimizer
-  (Nesterov dual averaging, adapted for MCMC; Nesterov [1], Hoffman &
-  Gelman [2]).  Minimises a convex objective given a stream of (noisy)
-  subgradients fed one per step.  Byte-for-byte equivalent to
-  ``pyro.ops.dual_averaging`` for scalar inputs (same defaults
-  ``t0=10, kappa=0.75, gamma=0.05``), but every update is elementwise so
-  the parameter and subgradients may be ``(N,)`` tensors.
+  (Nesterov dual averaging; Nesterov [1], Hoffman & Gelman [2]).  Minimises
+  a convex objective given a stream of (noisy) subgradients fed one per
+  step.  Every update is elementwise, so the parameter and subgradients may
+  be ``(N,)`` tensors.
 
 * :class:`REINFORCEAdapter` -- a derivative-free (zeroth-order) stochastic
   optimizer: it minimises a Gaussian-smoothed objective using only noisy
   *evaluations* of the objective (no gradient access), estimating the
-  gradient with the score-function/REINFORCE estimator and driving the
-  parameter with a :class:`DualAveraging` instance.
-
-Owning these here (rather than importing from Pyro) decouples adaptation
-from Pyro and lets the same primitives be reused to build our own kernel
-and, later, our own HMC/NUTS adaptation.
+  gradient with the score-function / REINFORCE estimator and driving the
+  parameter with a dual-averaging optimizer.
 
 References
 ----------
@@ -39,9 +31,9 @@ class DualAveraging:
     First-order stochastic subgradient optimizer (Nesterov dual averaging).
 
     Minimises a convex objective ``J(x)`` over a parameter ``x`` using a
-    stream of (possibly noisy) subgradients, one per iteration.  Under the
-    usual dual-averaging conditions the *averaged* iterate ``x_avg``
-    converges to the optimum even though individual subgradients are noisy.
+    stream of (possibly noisy) subgradients, one per iteration.  The
+    *averaged* iterate ``x_avg`` converges to the optimum even though
+    individual subgradients are noisy.
 
     Optimizer contract (ask/tell)
     -----------------------------
@@ -51,29 +43,27 @@ class DualAveraging:
         g = subgradient_of_J(x_t)      # caller evaluates a subgradient at x_t
         opt.step(g)                    # tell the optimizer
 
-    The caller supplies ``g``, a subgradient (or unbiased noisy estimate of
-    one) of the objective.  Use ``x_t`` while optimising and ``x_avg`` as
-    the final answer (it is the stabilised estimate).
+    ``g`` is a subgradient (or unbiased noisy estimate of one) of the
+    objective.  Use ``x_t`` while optimising and ``x_avg`` as the final
+    answer.
 
     Vectorisation
     -------------
     Every update is elementwise, so ``prox_center`` and the subgradient
     ``g`` may be scalars or ``(N,)`` tensors -- the latter solves ``N``
-    independent problems in parallel with no coupling.  The iteration
-    counter is shared.  For scalar inputs the output matches
-    ``pyro.ops.dual_averaging.DualAveraging`` exactly.
+    independent problems in parallel.  The iteration counter is shared.
 
     Parameters
     ----------
     prox_center : float or Tensor
-        Reference point the primal sequence is pulled toward (a soft
-        initial guess / regulariser).  May be set after construction (it is
-        read in :meth:`step`).  Default 0.
+        Reference point the primal sequence is pulled toward (a soft initial
+        guess).  May be set after construction (it is read in
+        :meth:`step`).  Default 0.
     t0 : float
         Stabilises the early iterations.  Default 10.
     kappa : float
-        Averaging-weight exponent; should be in (0.5, 1].  Smaller forgets
-        early iterates faster.  Default 0.75.
+        Averaging-weight exponent, in (0.5, 1].  Smaller forgets early
+        iterates faster.  Default 0.75.
     gamma : float
         Step-scale parameter controlling convergence speed.  Default 0.05.
     """
@@ -86,16 +76,12 @@ class DualAveraging:
         self.reset()
 
     def reset(self):
-        # average of the primal sequence; before any update it is the
-        # prox-center, so a never-stepped optimizer round-trips:
-        # get_state()[1] == prox_center.  (At t=1 the averaging weight is
-        # 1^-kappa = 1, so the first step fully overwrites this seed --
-        # stepped runs are unaffected by the choice of seed here.)
+        # average of the primal sequence; seeded at prox_center so
+        # get_state() is valid before any step.
         self._x_avg = self.prox_center
         self._g_avg = 0.0   # average of dual sequence
         self._t = 0
-        # latest primal point; equals prox_center before the first step, so
-        # get_state() is valid (and round-trips) prior to any update.
+        # latest primal point; equals prox_center before the first step.
         self._x_t = self.prox_center
 
     def step(self, g):
@@ -128,15 +114,14 @@ class REINFORCEAdapter:
         J(mu) = E_{eps ~ N(0, I)} [ f(mu + sigma * eps) ]
 
     over ``mu``, using only noisy *evaluations* of ``f`` -- no gradient of
-    ``f`` is required (``f`` may be a black box, e.g. a noisy simulation
-    diagnostic).  The gradient of ``J`` is estimated unbiasedly by the
+    ``f`` is required.  The gradient of ``J`` is estimated unbiasedly by the
     score-function / REINFORCE estimator
 
         grad J ≈ (f_t − b_t) · eps_t / sigma,
 
     where ``eps_t`` is the perturbation used at this step and ``b_t`` is an
     EMA baseline that reduces variance without introducing bias.  That
-    gradient drives a :class:`DualAveraging` optimizer on ``mu``.
+    gradient drives a dual-averaging optimizer on ``mu``.
 
     Optimizer contract (ask/tell)
     -----------------------------
@@ -153,26 +138,24 @@ class REINFORCEAdapter:
     Vectorisation
     -------------
     Solves ``n`` independent problems in parallel: ``f_t`` is ``(N,)`` and
-    the returned state is ``(N,)``.  Per-problem signals are never mixed
-    (no averaging across the batch).
+    the returned state is ``(N,)``.  Per-problem signals are never mixed.
 
     Parameters
     ----------
     n : int
         Number of independent problems optimised in parallel.
     sigma : float
-        Perturbation / smoothing radius.  Larger explores more but
-        smooths the objective more; also the denominator of the gradient
-        estimate.  Default 0.1.
+        Perturbation / smoothing radius, and the denominator of the
+        gradient estimate.  Larger explores more but smooths the objective
+        more.  Default 0.1.
     ema_decay : float
         Decay factor of the EMA baseline used for variance reduction.
         Default 0.2.
     gamma : float
-        Step-scale of the underlying :class:`DualAveraging` (the learning
-        rate; the update is ``-sqrt(t)/gamma * g_avg``, so *larger* gamma
-        means gentler steps).  Default 0.05.  The default is tuned for the
-        bounded diagnostics step-size adaptation feeds it; a steeper or
-        unbounded objective may need a larger gamma to stay stable.
+        Step-scale of the underlying dual averaging (the learning rate; the
+        update is ``-sqrt(t)/gamma * g_avg``, so *larger* gamma means
+        gentler steps).  Default 0.05.  A steeper or unbounded objective may
+        need a larger gamma to stay stable.
     """
 
     def __init__(self, n: int, sigma: float = 0.1, ema_decay: float = 0.2,
@@ -200,7 +183,7 @@ class REINFORCEAdapter:
 
         # REINFORCE gradient estimate, per chain (N,)
         stat = (f_t - self._g) / self.sigma * self._eps
-        self._dual.step(stat)               # vectorised: one DualAveraging, (N,) input
+        self._dual.step(stat)               # vectorised, (N,) input
 
         self._eps = torch.randn(self.n)
 

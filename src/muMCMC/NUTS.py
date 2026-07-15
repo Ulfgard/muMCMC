@@ -7,34 +7,21 @@ from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
  
  
 class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
-    """Pyro NUTS kernel with an extended diagnostics() that exposes the
-    full post-warmup state.
- 
-    Pyro spawns one worker process per chain, pickles a copy of the
-    kernel into each, and adapts that copy independently.  The parent
-    process's kernel never adapts -- so reading
-    sampler._kernel.step_size or .inverse_mass_matrix from the parent
-    after run() returns the un-adapted initial values.
- 
-    The post-warmup state lives in each worker's kernel copy.  Pyro
-    collects worker state by calling kernel.diagnostics() in each
-    worker and aggregating the returned dicts in the parent under
-    self._diagnostics[chain_id].  Default HMC.diagnostics() returns
-    only divergences and acceptance rate; we override to also include
-    step_size, accept counts, the warmup count, and the adapted
-    inverse mass matrix.
- 
-    Returned dict:
+    """Pyro NUTS kernel whose ``diagnostics()`` also returns the adapted
+    post-warmup state.
+
+    Pyro adapts a pickled copy of the kernel per worker and aggregates each
+    worker's ``diagnostics()`` dict; the default reports only divergences and
+    acceptance rate.  This adds:
+
         step_size:           final adapted step size (post warmup)
-        divergences:         list of post-warmup step indices that diverged
+        divergences:         post-warmup step indices that diverged
         accept_cnt:          accumulated accept count post warmup
         t:                   total step count (warmup + sampling)
         warmup_steps:        warmup count
-        inverse_mass_matrix: tensor (full d-by-d if full_mass=True,
-                             diag d-vector otherwise) of the adapted
-                             IMM at end of warmup.
-        inverse_mass_matrix_site_key: the site-name tuple under which
-                             pyro stored the IMM (kept for traceability).
+        inverse_mass_matrix: adapted IMM at end of warmup (full d-by-d if
+                             full_mass else diagonal d-vector)
+        inverse_mass_matrix_site_key: site-name tuple pyro stored the IMM under
     """
  
     def diagnostics(self):
@@ -60,13 +47,10 @@ class NUTS(PyroSampler):
     No-U-Turn Sampler with automatic constrained-space reparameterization.
  
     Thin wrapper around Pyro's NUTS kernel with the correctly transformed
-    potential, see BaseSampler.
- 
-    The underlying pyro kernel is a _RichDiagNUTS subclass that exposes
-    the adapted inverse_mass_matrix and step_size in its diagnostics()
-    so that per-chain values can be read via sampler.mcmc.diagnostics()
-    after run_mcmc().
- 
+    potential, see BaseSampler.  The underlying kernel is a ``_RichDiagNUTS``,
+    so the adapted step size and inverse mass matrix are available per chain
+    via ``sampler.mcmc.diagnostics()``.
+
     Parameters
     ----------
     potential_fn : callable

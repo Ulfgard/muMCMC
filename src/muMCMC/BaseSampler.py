@@ -25,12 +25,9 @@ class BaseSampler(ABC):
         end_warmup()           # warmup -> sampling, when the driver decides
 
     plus the user-facing :meth:`run_mcmc`, which drives that interface and
-    returns constrained-space samples.  ``init`` / ``step`` / ``end_warmup``
-    are the interface (duck-typed; concrete samplers such as RMHMC implement
-    them).  Note ``init`` need not be stateless -- it may also arm a
-    sampler's warmup/adaptation machinery.  Everything else (integrator,
-    acceptance rule, adaptation) is a sampler's own implementation detail and
-    is deliberately *not* part of this base contract.
+    returns constrained-space samples.  ``init`` may also arm a sampler's
+    warmup/adaptation.  Everything else (integrator, acceptance rule,
+    adaptation) is the sampler's own implementation detail.
 
     Two optional hooks complete the interface, both defaulting to an empty
     dict: :meth:`logging` (per-step stats surfaced on the progress bar) and
@@ -73,9 +70,7 @@ class BaseSampler(ABC):
         self, z_free: torch.Tensor, beta: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, TransformedMetric]]:
         """
-        Posterior evaluation at the unconstrained free vector ``z`` -- the
-        overridable default a sampler relies on (override for needs beyond
-        the assembly below).
+        Posterior evaluation at the unconstrained free vector ``z``.
 
         Depending on ``requires_metric`` the user's ``potential_fn`` is:
 
@@ -89,23 +84,16 @@ class BaseSampler(ABC):
 
         (prior from ``space.prior_log_prob_vector``, Jacobian log-det from the
         transform), and -- when ``requires_metric=True`` -- the pulled-back
-        metric ``G_u(z) = J^T (beta * G_lik + G_prior) J`` (summing the space's prior
-        metric, Cholesky-factoring, restricting to free coordinates, wrapped
-        in a ``TransformedMetric``).  ``beta`` (default ``self.beta``, 1.0 =
-        untempered) tempers the likelihood only.
+        metric ``G_u(z) = J^T (beta * G_lik + G_prior) J``.  ``beta`` (default
+        ``self.beta``, 1.0 = untempered) tempers the likelihood only.
 
         Returns
         -------
         Tensor U of shape (N,)                          if requires_metric is False
         (Tensor U of shape (N,), TransformedMetric)     if requires_metric is True
 
-        Batching note
-        -------------
-        Batched-pure: takes ``(N, d)`` and returns ``U`` of shape ``(N,)``
-        (plus, in the metric branch, a batched ``TransformedMetric``); it does
-        no squeeze/unsqueeze.  The own batched driver calls this directly.
-        The single-element ``(d,)`` contract Pyro's NUTS path needs is
-        provided by ``PyroSampler._pyro_potential``.
+        Batched over the leading axis: ``(N, d)`` -> ``U`` of shape ``(N,)``
+        (plus a batched ``TransformedMetric`` in the metric branch).
         """
         if beta is None:
             beta = self.beta
@@ -181,17 +169,14 @@ class BaseSampler(ABC):
         Run MCMC via the own batched driver and return constrained samples.
 
         Drives the sampler's operator interface directly -- ``init`` then
-        repeated ``step`` (one transition each) -- holding all ``num_chains``
-        chains in a single batched state (no process spawning).
-        ``end_warmup`` is called once warmup is done (just before the first
-        sampling transition, which also makes ``num_warmup_steps == 0`` a
-        clean no-op).  A future PT driver inserts a ``state.reorder`` swap
-        between transitions here.  Live :meth:`logging` stats are shown on the
-        progress bar.
+        repeated ``step`` -- holding all ``num_chains`` chains in a single
+        batched state (no process spawning).  ``end_warmup`` is called once
+        warmup is done, so ``num_warmup_steps == 0`` is a clean no-op.  Live
+        :meth:`logging` stats are shown on the progress bar.
 
         This driver is single-threaded and batched; multiprocessing knobs do
-        not apply.  Extra keyword arguments (e.g. the Pyro path's
-        ``mp_context``) are accepted for call-site compatibility and ignored.
+        not apply.  Extra keyword arguments are accepted for call-site
+        compatibility and ignored.
 
         Returns
         -------
@@ -200,8 +185,7 @@ class BaseSampler(ABC):
             grouped by chain (shape ``(num_chains, num_samples, ...)``) --
             the same contract as the Pyro path.
         """
-        # transform constrained point to unconstrained free vector, batched
-        # over chains (the sampler batches over the leading axis).
+        # constrained point -> unconstrained free vector, batched over chains
         z_free_init = self._init_z_free(initial_params)
         if z_free_init.dim() == 1:
             z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
@@ -210,14 +194,13 @@ class BaseSampler(ABC):
         collected = []
         total = num_warmup_steps + num_samples
 
-        # Single tqdm bar, Pyro-style: the postfix carries whatever logging()
-        # returns (eps / |dH| / acc. prob / ...), desc switches Warmup->Sample.
+        # Single tqdm bar; the postfix carries whatever logging() returns.
         bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}{postfix}]"
         with tqdm(total=total, file=sys.stderr, disable=disable_progbar,
                   bar_format=bar_format,
                   desc="Warmup" if num_warmup_steps else "Sample") as bar:
             if getattr(bar, "ncols", None) is not None:
-                bar.ncols = min(120, max(80, bar.ncols))   # clamp width, like Pyro
+                bar.ncols = min(120, max(80, bar.ncols))   # clamp width
             for it in range(total):
                 if it == num_warmup_steps:          # warmup done -> freeze/finalize
                     self.end_warmup()
@@ -241,10 +224,9 @@ class PyroSampler(BaseSampler):
     BaseSampler specialization that runs through Pyro's ``MCMC`` driver.
 
     For kernels that are Pyro ``MCMCKernel`` s driven by Pyro's own
-    multi-chain machinery (e.g. NUTS).  All Pyro-specific logic lives here:
-    the scalar ``_pyro_potential`` bridge and a ``run_mcmc`` that builds and
-    runs a ``pyro.infer.mcmc.MCMC``.  The own batched driver in the base
-    class is thus kept free of Pyro.
+    multi-chain machinery (e.g. NUTS).  Holds the Pyro-specific logic: the
+    scalar ``_pyro_potential`` bridge and a ``run_mcmc`` that builds and runs
+    a ``pyro.infer.mcmc.MCMC``.
     """
 
     @property
@@ -256,24 +238,21 @@ class PyroSampler(BaseSampler):
     def _pyro_potential(self, params_dict: dict) -> torch.Tensor:
         """Pyro-compatible scalar potential wrapper.
 
-        Pyro's HMC/NUTS kernel calls ``potential_fn(params_dict)`` with a
-        single ``(d,)`` state and expects a scalar back.  This is the
-        single-element bridge to the batched ``evaluate_model``: it lifts
-        the state to ``(1, d)``, evaluates, and squeezes the ``(1,)``
-        potential back to a scalar.  Implemented as a bound method (not a
-        closure) so that Pyro's multi-chain spawning can pickle it.  Only
-        valid when ``requires_metric=False``.
+        Pyro's HMC/NUTS kernel calls ``potential_fn(params_dict)`` with a single
+        ``(d,)`` state and expects a scalar back; this lifts it to ``(1, d)``,
+        evaluates, and squeezes back.  A bound method (not a closure) so Pyro
+        can pickle it for multi-chain spawning.  Only valid when
+        ``requires_metric=False``.
         """
         z = params_dict["params"]                  # (d,)
         return self.evaluate_model(z.unsqueeze(0)).squeeze(0)   # (1,d)->(1,)->()
 
     def diagnostics(self) -> dict:
         """Per-chain diagnostics in the common schema -- ``accept_rate``,
-        ``num_divergences``, ``step_size`` (each a ``(num_chains,)`` tensor) --
-        translated from Pyro's ``MCMC.diagnostics()`` (which keys per chain as
-        ``'chain i'``).  Empty before :meth:`run_mcmc` has run.  The full Pyro
-        detail (r_hat, n_eff, inverse mass matrix, divergence indices, ...)
-        remains available via ``self.mcmc.diagnostics()``."""
+        ``num_divergences``, ``step_size`` (each a ``(num_chains,)`` tensor).
+        Empty before :meth:`run_mcmc` has run.  Full Pyro detail (r_hat, n_eff,
+        inverse mass matrix, divergence indices, ...) is available via
+        ``self.mcmc.diagnostics()``."""
         mcmc = getattr(self, "mcmc", None)
         if mcmc is None:
             return {}
@@ -324,10 +303,8 @@ class PyroSampler(BaseSampler):
 
         # transform constrained point to unconstrained parameters
         z_free_init = self._init_z_free(initial_params)
-        # Pyro's MCMC expects initial_params of shape (num_chains, d) when
-        # num_chains > 1.  Replicate the single anchor across chains so
-        # that NUTS's per-chain randomization (momentum, slice variable)
-        # is the only source of inter-chain variation at the start.
+        # Pyro expects initial_params of shape (num_chains, d) for
+        # num_chains > 1; replicate the single anchor across chains.
         if num_chains > 1 and z_free_init.dim() == 1:
             z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
@@ -341,12 +318,8 @@ class PyroSampler(BaseSampler):
             mp_context=mp_context,
         )
         mcmc.run()
-        # Stash the MCMC object so callers can read per-chain diagnostics
-        # via `sampler.mcmc.diagnostics()` after run_mcmc returns.  Pyro
-        # populates this from each worker's kernel.diagnostics() call,
-        # so it reflects the true post-warmup state per chain (the
-        # parent's self.kernel never adapted; only the pickled copies in
-        # workers did).
+        # Stash the MCMC object so callers can read per-chain diagnostics via
+        # self.mcmc.diagnostics().
         self.mcmc = mcmc
 
         # Transform back to constrained space.
