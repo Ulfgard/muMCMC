@@ -14,6 +14,7 @@ __version__ = "0.1.0"
 from .BaseSampler import BaseSampler, PyroSampler
 from .RMHMC import RMHMC, RMHMCState
 from .NUTS import NUTS
+from .SMC import SMC
 from .spaces import (
     ElementwiseTransform,
     TransformedMetric,
@@ -29,6 +30,7 @@ __all__ = [
     "RMHMC",
     "RMHMCState",
     "NUTS",
+    "SMC",
     "ElementwiseTransform",
     "TransformedMetric",
     "UnconstrainedSpace",

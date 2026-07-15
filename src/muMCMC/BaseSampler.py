@@ -67,9 +67,10 @@ class BaseSampler(ABC):
         self.potential_fn = potential_fn
         self.space = space
         self.requires_metric = requires_metric
+        self.beta = 1.0   # inverse temperature
 
     def evaluate_model(
-        self, z_free: torch.Tensor,
+        self, z_free: torch.Tensor, beta: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, TransformedMetric]]:
         """
         Posterior evaluation at the unconstrained free vector ``z`` -- the
@@ -84,13 +85,14 @@ class BaseSampler(ABC):
 
         This method assembles the full unconstrained-space potential
 
-            U(z) = U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
+            U(z) = beta * U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
 
         (prior from ``space.prior_log_prob_vector``, Jacobian log-det from the
         transform), and -- when ``requires_metric=True`` -- the pulled-back
-        metric ``G_u(z) = J^T (G_lik + G_prior) J`` (summing the space's prior
+        metric ``G_u(z) = J^T (beta * G_lik + G_prior) J`` (summing the space's prior
         metric, Cholesky-factoring, restricting to free coordinates, wrapped
-        in a ``TransformedMetric``).
+        in a ``TransformedMetric``).  ``beta`` (default ``self.beta``, 1.0 =
+        untempered) tempers the likelihood only.
 
         Returns
         -------
@@ -105,6 +107,9 @@ class BaseSampler(ABC):
         The single-element ``(d,)`` contract Pyro's NUTS path needs is
         provided by ``PyroSampler._pyro_potential``.
         """
+        if beta is None:
+            beta = self.beta
+
         theta_map = self.space.map_to_constrained_vector(z_free)
         theta_free = theta_map.mapped_point
         theta_full = self._free_to_full(theta_free)
@@ -116,16 +121,27 @@ class BaseSampler(ABC):
             u_likelihood = result
 
         u_prior = -self.space.prior_log_prob_vector(theta_free)
-        U = u_likelihood + u_prior - theta_map.jacobian_log_det
+        U = beta * u_likelihood + u_prior - theta_map.jacobian_log_det
 
         if not self.requires_metric:
             return U
 
         G_prior = self.space.prior_metric(theta_full)
-        G_full = G_lik if G_prior is None else G_lik + G_prior
+        G_full = beta * G_lik if G_prior is None else beta * G_lik + G_prior
         metric = self.space.push_forward_metric(theta_full, G_full, theta_map=theta_map)
 
         return U, metric
+
+    def potential_likelihood(self, z_free: torch.Tensor) -> torch.Tensor:
+        """
+        The likelihood potential ``U_lik = -log p(data | theta(z))``.
+
+        Batched over the leading axis: ``(N, d)`` -> ``(N,)``.
+        """
+        theta_map = self.space.map_to_constrained_vector(z_free)
+        theta_full = self._free_to_full(theta_map.mapped_point)
+        result = self.potential_fn(theta_full)
+        return result[0] if self.requires_metric else result
 
     def _free_to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Free constrained vector -> full constrained vector (with fixed)."""
