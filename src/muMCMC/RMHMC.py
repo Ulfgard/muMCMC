@@ -13,11 +13,9 @@ from .adapters import REINFORCEAdapter
 #  RMHMC helpers  (implicit midpoint integrator)                              #
 #                                                                             #
 #  The implicit-midpoint step solves a per-chain fixed-point equation         #
-#  z = F(z).  The *update rule* that drives that solve is pluggable: the      #
-#  default Picard iteration (z_{k+1} = F(z_k)) and Anderson acceleration      #
-#  (z_{k+1} = a residual-minimising combination of the last m iterates) both  #
-#  attack the same F and share the same convergence / freeze / blow-up        #
-#  bookkeeping in ``_implicit_midpoint_step`` -- only the proposal differs.    #
+#  z = F(z).  The update rule that drives that solve is pluggable: Picard      #
+#  iteration (z_{k+1} = F(z_k)) and Anderson acceleration both solve the       #
+#  same F; only the proposal differs.                                          #
 #                                                                             #
 # =========================================================================== #
 
@@ -32,9 +30,8 @@ def _hamiltonian(
     """
     H(q, p) = U + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
 
-    All position-dependent quantities (U, metric) must be pre-evaluated
-    at q.  The argument q is included for interface clarity (mirroring
-    the mathematical H(q,p)) but is not used in the computation.
+    U and metric must be pre-evaluated at q.  The argument q mirrors the
+    mathematical H(q, p) but is not used in the computation.
     """
     Ginv_p = metric.inv_metric_times_vec(p)
     kinetic = 0.5 * (p * Ginv_p).sum(-1)
@@ -54,21 +51,18 @@ def _midpoint_map(
     """
     Evaluate the I.M.(a) fixed-point map F(z_k) and return (F_q, F_p).
 
-    Implements algorithm I.M.(a) from Brofos & Lederman (2021): the unknown
-    is the endpoint (q_k, p_k), with the midpoint derived from it:
+    Algorithm I.M.(a) of Brofos & Lederman (2021): the unknown is the
+    endpoint (q_k, p_k), with the midpoint derived from it:
 
         q_mid = ½(q + q_k)
         p_mid = ½(p + p_k)
         F_q   = q + (ε/2) G⁻¹(q_mid) (p + p_k)
         F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}
 
-    The Picard fixed-point iteration only needs the *values* of F_q, F_p
-    (no Jacobian), so the sole gradient required is the first-order
-    ∂H/∂q at the midpoint.  We therefore compute that gradient in a local
-    enable_grad block on a fresh leaf q_mid (create_graph defaults to
-    False) and build F_q, F_p under no_grad.  Nothing carries an autograd
-    graph out of this function -- there is no second-order graph and no
-    cross-iteration accumulation.
+    Only the values of F_q, F_p are needed (no Jacobian), so the sole
+    gradient is the first-order ∂H/∂q at the midpoint, taken under a local
+    enable_grad block on a fresh leaf q_mid.  F_q, F_p are built under
+    no_grad; no autograd graph leaves this function.
     """
     q_mid = (0.5 * (q + q_k)).detach().requires_grad_(True)   # fresh leaf
     p_mid = 0.5 * (p + p_k)
@@ -76,14 +70,12 @@ def _midpoint_map(
     with torch.enable_grad():
         U, metric = evaluate_model(q_mid)
         H = _hamiltonian(q_mid, p_mid, U, metric)
-        # H has shape (N,); each H[i] depends only on q_mid[i] (no cross-chain
-        # coupling), so grad of the sum is the per-chain gradient with no mixing.
-        (dHdq,) = torch.autograd.grad(H.sum(), q_mid)         # first-order only
+        # H has shape (N,) with no cross-chain coupling, so grad of the sum
+        # is the per-chain gradient.
+        (dHdq,) = torch.autograd.grad(H.sum(), q_mid)
 
-    # eps is the per-chain step size, shape (N,); RMHMC.init() tensorizes
-    # step_size per chain, so eps is always a vector here -- we just add the
-    # trailing axis to broadcast against the (N, d) updates, with no scalar
-    # special-casing inside the hot math.
+    # eps is the per-chain step size, shape (N,); add a trailing axis to
+    # broadcast against the (N, d) updates.
     e = eps.unsqueeze(-1)
     with torch.no_grad():
         F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
@@ -98,24 +90,14 @@ def _midpoint_map(
 # ``F(z_k) = z_k − r_k`` and the Anderson residual (Walker & Ni's notation) is
 # ``f_k = F(z_k) − z_k = −r_k``.  A fresh updater is built per solve, so any
 # internal history it keeps is scoped to a single ``_implicit_midpoint_step``.
-#
-# ``propose`` is always called with the *committed* (post-freeze) (z_k, r_k):
-# a frozen chain feeds an unchanged z_k in, so any history it accumulates has
-# zero differences for that chain and contributes nothing -- the freeze mask in
-# ``_implicit_midpoint_step`` stays authoritative regardless of the updater.
 
 class _PicardUpdate:
     """Relaxed Picard iteration: z_{k+1} = z_k − β r_k = (1−β) z_k + β F(z_k).
 
-    Stateless.  ``beta`` is the under-relaxation / damping factor; β = 1 is the
-    plain iteration (the cold-started first iterate is then already an explicit
-    Euler step, so Picard needs no separate predictor to warm-start).  β < 1
-    trades speed for stability: it pulls the iteration eigenvalues (β − 1) + β λ
-    toward the point (1 − β) on the real axis, which is what tames the (near-)
-    imaginary spectrum of the implicit-midpoint map.
-
-    An instance is both the configured solver (held by ``RMHMC``) and, being
-    stateless, its own per-solve working copy -- ``new`` just returns ``self``.
+    Stateless.  ``beta`` is the under-relaxation factor; β = 1 is the plain
+    iteration.  β < 1 trades speed for stability, pulling the iteration
+    eigenvalues (β − 1) + β λ toward (1 − β) on the real axis to tame the
+    near-imaginary spectrum of the implicit-midpoint map.
 
     Parameters
     ----------
@@ -145,21 +127,13 @@ class _AndersonUpdate:
 
         z_{k+1} = z_k + β f_k − (ΔZ + β ΔF) γ.
 
-    ``beta`` is the same under-relaxation factor as ``_PicardUpdate`` (β = 1 is
-    undamped; β < 1 stabilises the near-imaginary spectrum).  It enters only
-    this final combination -- the γ least squares is β-independent -- so damping
-    changes stability, NOT the inner-solve conditioning: the Tikhonov floor
-    below is still what keeps the m×m solve well-posed (a frozen chain
-    contributes zero ΔF columns, giving γ = 0 → a plain damped Picard step that
-    is masked out anyway).
+    ``beta`` is the same under-relaxation factor as ``_PicardUpdate``; it enters
+    only this final combination, so it affects stability but not the γ least
+    squares, whose conditioning is kept well-posed by the Tikhonov floor below.
 
     On a linear map Anderson(m≥1) reaches the fixed point in one accelerated
     step; on the true nonlinear map it typically converges in fewer iterations
     than Picard, trading extra model evals for a cheap m×m solve.
-
-    A configured instance (held by ``RMHMC``) carries its history/damping but no
-    live buffers; ``new`` returns a fresh working copy for a single solve, at
-    which point a ``history`` of None resolves to dim(q).
 
     Parameters
     ----------
@@ -205,8 +179,7 @@ class _AndersonUpdate:
         b  = dF.transpose(-2, -1) @ f_k.unsqueeze(-1)     # (N, mk, 1)
         mk = A.shape[-1]
         # Scale-aware Tikhonov floor so the solve is well-posed even when a
-        # chain's ΔF columns are (near-)collinear or all zero.  Independent of
-        # beta, which does not enter this solve.
+        # chain's ΔF columns are (near-)collinear or all zero.
         scale = A.diagonal(dim1=-2, dim2=-1).mean(-1)     # (N,)
         reg   = (self.reg_rel * scale + self.reg_abs).view(-1, 1, 1)
         A = A + reg * torch.eye(mk, dtype=A.dtype, device=A.device)
@@ -224,11 +197,9 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
     per-chain fixed-point iteration, with the midpoint derived from the current
     iterate and the start-of-step point.  ``solver`` is a configured update rule
     (``_PicardUpdate`` or ``_AndersonUpdate``, defaulting to undamped Picard);
-    ``solver.new(d)`` supplies the fresh per-solve updater, so this function
-    never re-validates the choice.  Every such rule solves the identical
-    fixed-point equation, so the returned endpoint, reversibility, and
-    symplecticity are solver- and damping-independent; only the iteration count
-    (and stability) differs.
+    ``solver.new(d)`` supplies the fresh per-solve updater.  Every rule solves
+    the identical fixed-point equation, so the endpoint is solver- and
+    damping-independent; only the iteration count and stability differ.
 
     Batched over a leading chain axis (q, p have shape (N, d)).  Each chain
     runs its own fixed-point solve; a chain "finishes" when it either
@@ -237,7 +208,7 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
     and residual stop updating -- while live chains keep iterating, so the
     loop runs until all chains finish or max_iter is reached.  (Finished
     chains are still re-evaluated each iteration since the model call is
-    batched; only their *updates* are discarded.)
+    batched; only their updates are discarded.)
 
     Returns
     -------
@@ -309,18 +280,16 @@ class RMHMCState:
         Potential at ``q``.
     metric : TransformedMetric or None
         Metric at ``q``.  ``U`` and ``metric`` are present after
-        ``init`` / ``accept`` and ``None`` right
-        after ``step`` (the integrator evaluates the model only at
-        midpoints, so the endpoint's ``U``/``metric`` are not free); they
-        are filled lazily by :meth:`complete`.
+        ``init`` / ``accept`` and ``None`` after ``step`` (the integrator
+        evaluates the model only at midpoints); they are filled lazily by
+        :meth:`complete`.
     max_residual : (N,) or None
         Running max fixed-point residual over the current trajectory.
     fp_iters : list of (N,)
         Per-midpoint-step fixed-point iteration counts for the trajectory.
 
     The trajectory accumulators (``max_residual``, ``fp_iters``) are reset
-    by ``init`` and ``accept``; ``step`` carries them forward.  The
-    state is operator-internal, so it stores whatever is cheap to keep.
+    by ``init`` and ``accept``; ``step`` carries them forward.
     """
 
     def __init__(self, q, p=None, U=None, metric=None,
@@ -337,32 +306,27 @@ class RMHMCState:
         are not already present; a no-op on an already-complete state."""
         if self.U is None or self.metric is None:
             # Endpoint evaluations only feed energies/diagnostics and are never
-            # backpropagated (the integrator takes its gradient at midpoints in
-            # ``_midpoint_map``'s own ``enable_grad`` block).  Evaluating under
-            # ``no_grad`` keeps a model whose U/G carry an autograd graph from
-            # pinning that graph via ``delta_H`` in the diagnostics list, which
-            # would otherwise accumulate CUDA memory across the whole run.
+            # backpropagated, so evaluate under no_grad to avoid pinning an
+            # autograd graph.
             with torch.no_grad():
                 self.U, self.metric = evaluate_model(self.q)
         return self
 
     def reorder(self, perm):
-        """Permute the *state* (configuration) across chain slots: slot ``i`` of
-        the result carries the configuration ``q, p, U, metric`` from slot
-        ``perm[i]`` (e.g. a PT rung swap).  ``perm`` is an ``(N,)`` long index
-        tensor.  Pure -- returns a new state; absent (None) fields stay None.
+        """Permute the state (configuration) across chain slots: slot ``i`` of
+        the result carries ``q, p, U, metric`` from slot ``perm[i]``.  ``perm``
+        is an ``(N,)`` long index tensor.  Returns a new state; absent (None)
+        fields stay None.
 
-        ``max_residual`` and ``fp_iters`` are deliberately NOT permuted: they
-        are integrator diagnostics belonging to the chain slot (its step size,
-        and under PT its own distribution), not to the configuration that
-        occupies it, so they do not travel when configurations are exchanged.
+        ``max_residual`` and ``fp_iters`` are integrator diagnostics bound to
+        the chain slot, not to the configuration, so they are not permuted.
         """
         return RMHMCState(
             q            = self.q[perm],
             p            = None if self.p is None else self.p[perm],
             U            = None if self.U is None else self.U[perm],
             metric       = None if self.metric is None else self.metric.reorder(perm),
-            max_residual = self.max_residual,   # slot-bound: not permuted (see docstring)
+            max_residual = self.max_residual,   # slot-bound: not permuted
             fp_iters     = self.fp_iters,       # slot-bound: not permuted
         )
 
@@ -381,17 +345,15 @@ class RMHMC(BaseSampler):
     the user specifies the model in **constrained** space; the pull-back is
     handled by :meth:`BaseSampler.evaluate_model`.
 
-    It both *is* the sampler (``run_mcmc`` via the own batched driver) and
-    implements the operator interface the driver composes:
+    It implements the operator interface the driver composes:
 
         init(q) -> state    # initialize per-chain step_size/adapter/counters
-                            #   AND return the initial chain state (not stateless)
+                            #   AND return the initial chain state
         step(s) -> state    # one transition: num_steps leapfrogs + accept
         end_warmup()        # freeze step_size to the adapter average
 
     with ``leapfrog_step`` / ``accept`` / ``_bookkeep`` as implementation
-    detail (not part of the base contract).  All chains run in one batched
-    state; a PT swap would ``state.reorder`` between transitions.
+    detail.  All chains run in one batched state.
 
     User contract
     -------------
@@ -423,23 +385,18 @@ class RMHMC(BaseSampler):
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
         Fixed-point solver driving the implicit-midpoint solve: ``"picard"``
-        (default) or ``"anderson"``.  Both solve the identical equation and
-        return the same endpoint up to ``fp_tol``; Anderson typically reaches
-        it in fewer iterations (hence fewer model evals) on stiff metrics, at
-        the cost of a small m×m solve per iteration.
+        (default) or ``"anderson"``.  Both return the same endpoint up to
+        ``fp_tol``; Anderson typically reaches it in fewer iterations on stiff
+        metrics, at the cost of a small m×m solve per iteration.
     anderson_history : int or None
         History length ``m`` for the Anderson solver (ignored for Picard).
-        ``None`` (default) resolves per-solve to ``dim(q)`` (the free-parameter
-        dimension): a safe, model-agnostic choice because the m×m least-squares
-        overhead is negligible next to a single likelihood/metric evaluation,
-        which dominates RMHMC cost.  Must be ≥ 1 if given.
+        ``None`` (default) resolves per-solve to ``dim(q)``, the free-parameter
+        dimension.  Must be ≥ 1 if given.
     damping : float
         Under-relaxation factor β ∈ (0, 1] shared by both solvers (default 1.0
         = undamped).  The step becomes ``(1−β) z + β·(solver step)``; β < 1
-        trades convergence speed for stability and is the lever for the
-        (near-)imaginary iteration spectrum of the implicit-midpoint map.  It
-        affects only stability/iteration count, not the endpoint, nor the
-        Anderson inner solve's conditioning (which the Tikhonov floor handles).
+        trades convergence speed for stability.  Affects only stability and
+        iteration count, not the endpoint.
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence.  Default 100.
@@ -466,9 +423,7 @@ class RMHMC(BaseSampler):
         if fp_max_iter == 0:
             fp_max_iter = 100
 
-        # Resolve the string choice into a configured solver here, once, so the
-        # integrator never re-checks it and RMHMC holds no solver-specific
-        # scalars (history/damping live inside the solver object).
+        # Resolve the string choice into a configured solver.
         if not 0.0 < damping <= 1.0:
             raise ValueError(f"damping must be in (0, 1], got {damping}")
         if solver == "picard":
@@ -500,16 +455,14 @@ class RMHMC(BaseSampler):
     def init(self, q):
         """Initialize a run and return the initial chain state.
 
-        NOT stateless: sizes the per-chain ``step_size``, adapter, and
-        diagnostic counters from ``q``'s batch and arms adaptation
-        (``_adapting = adapt_step_size``).  Then builds the initial chain
-        state (evaluate (U, metric), sample momentum, reset accumulators).
+        Sizes the per-chain ``step_size``, adapter, and diagnostic counters
+        from ``q``'s batch and arms adaptation (``_adapting =
+        adapt_step_size``), then builds the initial chain state (evaluate
+        (U, metric), sample momentum, reset accumulators).
 
-        There is no ``num_warmup_steps`` here -- the driver decides when to
-        call :meth:`end_warmup`.  For a zero-warmup run the driver calls
-        ``end_warmup`` before the first transition; since the adapter
-        round-trips with no updates, ``step_size`` is left at its
-        constructor value.
+        The driver decides when to call :meth:`end_warmup`.  For a zero-warmup
+        run it is called before the first transition; the adapter round-trips
+        with no updates, so ``step_size`` is left at its constructor value.
         """
         N = q.shape[0]
         dtype, device = q.dtype, q.device
@@ -523,10 +476,7 @@ class RMHMC(BaseSampler):
         self._accepted = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
         self._num_divergences = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
         # Running per-chain integrator summaries (O(1) memory), folded in by
-        # _bookkeep each transition.  These replace the old unbounded per-step
-        # lists (one (N,) tensor -- plus, for fp_iters, num_steps of them --
-        # appended every transition), so the diagnostics footprint stays
-        # constant over an arbitrarily long run instead of growing with it.
+        # _bookkeep each transition.
         self._reset_diagnostics()
 
         # arm adaptation; the driver flips it off via end_warmup()
@@ -546,17 +496,12 @@ class RMHMC(BaseSampler):
     #
     # init(q) -> step -> step -> ...  is the chain; each step is one
     # transition (num_steps leapfrog substeps + accept).  leapfrog_step is the
-    # HMC-internal substep that variants may build on; it is not the
-    # transition.  The driver composes these; the split lets a PT swap
-    # (state.reorder) sit between transitions, or variants refresh p between
-    # substeps.
+    # HMC-internal substep; it is not the transition.
 
     def step(self, s):
         """One chain transition from the ready state ``s``: integrate
         ``num_steps`` leapfrog substeps, then Metropolis accept/reject.
-        Returns the chosen ready-to-step state.  This is the transition verb
-        -- ``num_steps`` is the sampler's own business, so a driver just calls
-        ``s = step(s)`` repeatedly."""
+        Returns the chosen ready-to-step state."""
         new = s
         for _ in range(self.num_steps):
             new = self.leapfrog_step(new)
@@ -565,8 +510,7 @@ class RMHMC(BaseSampler):
     def leapfrog_step(self, s):
         """One implicit-midpoint substep.  Returns a new state whose U/metric
         are ``None`` (the integrator evaluates only at midpoints) and whose
-        trajectory accumulators are carried forward.  HMC-internal; ``step``
-        composes ``num_steps`` of these."""
+        trajectory accumulators are carried forward."""
         q, p, fp_it, residual = _implicit_midpoint_step(
             s.q, s.p, self.step_size,
             self.evaluate_model,
@@ -584,7 +528,7 @@ class RMHMC(BaseSampler):
         the step-size update.  Returns the chosen ready-to-step state: U/metric
         are carried over per chain via ``TransformedMetric.select`` (no model
         eval) and a fresh momentum is sampled at the chosen point."""
-        new.complete(self.evaluate_model)      # endpoint eval (1 model eval)
+        new.complete(self.evaluate_model)       # endpoint eval (1 model eval)
         old.complete(self.evaluate_model)       # no-op: start already complete
 
         H_new = _hamiltonian(new.q, new.p, new.U, new.metric)   # (N,)
@@ -605,8 +549,8 @@ class RMHMC(BaseSampler):
 
         self._bookkeep(accepted, delta_H, is_divergent, new.max_residual, new.fp_iters)
 
-        # Ready-to-step state: mix U/metric per chain (free -- both already
-        # computed) and resample momentum at the chosen point.
+        # Ready-to-step state: mix U/metric per chain and resample momentum
+        # at the chosen point.
         chosen_U = torch.where(accepted, new.U, old.U)               # (N,)
         chosen_metric = new.metric.select(accepted, old.metric)
         out = RMHMCState(chosen_q, None, chosen_U, chosen_metric)
@@ -618,9 +562,7 @@ class RMHMC(BaseSampler):
         """(Re)initialize the running per-chain integrator summaries to empty.
 
         Called by ``init`` and ``end_warmup`` to start a phase.  Every summary
-        is an ``(N,)`` accumulator sized from ``step_size`` (already tensorized
-        per chain by then), so the diagnostics cost is O(num_chains), not
-        O(num_chains * num_steps) as the old append-per-step lists were.
+        is an ``(N,)`` accumulator sized from ``step_size``.
         """
         N = self.step_size.shape[0]
         dtype, device = self.step_size.dtype, self.step_size.device
@@ -635,10 +577,9 @@ class RMHMC(BaseSampler):
         self._fp_iters_max     = z.clone()   # running max per-transition worst-substep iters
 
     def _bookkeep(self, accepted, delta_H, is_divergent, max_residual, fp_iters):
-        # Fold this transition into the O(1) running per-chain summaries rather
-        # than appending to unbounded lists.  Everything folded in is detached
-        # (delta_H explicitly; max_residual and fp_iters carry no graph), so no
-        # per-step model graph is pinned across the run.
+        # Fold this transition into the O(1) running per-chain summaries.
+        # Everything folded in is detached, so no per-step model graph is
+        # pinned across the run.
         dH = delta_H.detach()                                         # (N,)
         fp = torch.stack(fp_iters).to(self.step_size.dtype)           # (num_steps, N)
         it_mean = fp.mean(0)                                          # (N,) per-substep mean
@@ -655,8 +596,7 @@ class RMHMC(BaseSampler):
 
         self._accepted += accepted
         self._step += 1
-        # per-chain divergence count (post-warmup once reset at end_warmup,
-        # mirroring Pyro NUTS conventions).
+        # per-chain divergence count (reset at end_warmup)
         self._num_divergences += is_divergent.long()
 
         # step-size adaptation (per chain), while the driver leaves us adapting
@@ -673,9 +613,8 @@ class RMHMC(BaseSampler):
             # times solver_penalty = exp(-residual/step_size), an analogous
             # acceptance term for the fixed-point solver error.  Taking -log of
             # that product (floored at eta, normalised by |log eta|) turns the
-            # efficiency into a cost AND gives rare solver/Metropolis failures
-            # large weight -- a plain average would let infrequent failures be
-            # drowned out.
+            # efficiency into a cost and gives rare solver/Metropolis failures
+            # large weight.
             solver_penalty  = torch.exp(-max_residual / self.step_size)        # (N,)
             delta_H_penalty = torch.exp(-delta_H.abs())                         # (N,)
             f_t = (-0.5 * torch.log(
@@ -687,11 +626,10 @@ class RMHMC(BaseSampler):
 
     def end_warmup(self):
         """Transition from warmup to sampling: freeze ``step_size`` to the
-        adapter's running average and stop adapting, then reset the diagnostic
-        counters for the sampling phase.  Driver-timed.  For a zero-warmup run
-        this is called before any transition; the adapter, never updated,
-        reports its seed, so ``step_size`` is left at its constructor value
-        (up to the float ``exp(log(.))`` round-trip)."""
+        adapter's running average, stop adapting, and reset the diagnostic
+        counters for the sampling phase.  For a zero-warmup run this is called
+        before any transition; the adapter, never updated, reports its seed, so
+        ``step_size`` is left at its constructor value."""
         if self._adapt_step_size:
             # final step size = slow-moving average, per chain
             self.step_size = torch.exp(self._adapter.get_state()[1])   # (N,)
@@ -725,11 +663,8 @@ class RMHMC(BaseSampler):
         ``num_divergences``, ``step_size`` (each a ``(num_chains,)`` tensor) --
         matches the Pyro path.
 
-        The RMHMC-specific integrator extras are running per-chain *summaries*
-        (each an ``(num_chains,)`` tensor), not the full per-step history: the
-        history grew without bound over a run (and its churn of many tiny
-        tensors fragmented the heap), so it is folded online into O(1)
-        accumulators instead.  Reported over the current phase (reset at
+        The RMHMC-specific integrator extras are running per-chain summaries
+        (each a ``(num_chains,)`` tensor) over the current phase (reset at
         ``end_warmup``):
 
           ``delta_H_abs_mean`` / ``delta_H_abs_max`` -- mean / max ``|delta_H|``
