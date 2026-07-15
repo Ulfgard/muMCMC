@@ -158,7 +158,7 @@ def test_recovers_gaussian_posterior_and_evidence():
 
     samples = smc.run_smc(4000, disable_progbar=True)
     x = samples["x"]
-    assert x.shape == (4000,)
+    assert x.shape == (1, 4000)
 
     # conjugate posterior: precision 1+lam, mean lam*mu/(1+lam), var 1/(1+lam)
     post_mean = lam * mu / (1.0 + lam)
@@ -169,15 +169,15 @@ def test_recovers_gaussian_posterior_and_evidence():
     # log evidence: log Z = -1/2 log(1+lam) - 1/2 lam*mu^2/(1+lam)
     log_Z = -0.5 * math.log(1.0 + lam) - 0.5 * lam * mu ** 2 / (1.0 + lam)
     diag = smc.diagnostics()
-    assert diag["log_evidence"] == pytest.approx(log_Z, abs=0.15)
+    assert float(diag["log_evidence_estimate"]) == pytest.approx(log_Z, abs=0.15)
 
     # schedule: strictly increasing from 0 to exactly 1
-    betas = diag["betas"]
-    assert betas[0] == 0.0 and betas[-1] == pytest.approx(1.0)
-    assert all(b1 < b2 for b1, b2 in zip(betas, betas[1:]))
-    # ESS held near the target (0.5 * N) at every interior stage
-    for e in diag["ess"][:-1]:
-        assert e == pytest.approx(0.5 * 4000, rel=0.25)
+    betas = diag["betas"][:, 0]
+    assert float(betas[0]) == 0.0 and float(betas[-1]) == pytest.approx(1.0)
+    assert bool((betas[1:] > betas[:-1]).all())
+    # ESS held near the target (0.5 * M) at every interior stage
+    for e in diag["ess"][:-1, 0]:
+        assert float(e) == pytest.approx(0.5 * 4000, rel=0.25)
 
 
 def test_recovers_bimodal_posterior_with_balanced_mass():
@@ -203,3 +203,33 @@ def test_recovers_bimodal_posterior_with_balanced_mass():
     # symmetric target -> roughly balanced mass between the modes
     frac_pos = float((x > 0).to(torch.float64).mean())
     assert frac_pos == pytest.approx(0.5, abs=0.12)
+
+
+# --------------------------------------------------------------------------- #
+#  parallel populations: per-chain diagnostics, evidence, R-hat                #
+# --------------------------------------------------------------------------- #
+
+def test_multi_chain_diagnostics_and_rhat():
+    torch.manual_seed(0)
+    lam, mu = 3.0, 2.0
+    space = gaussian_1d_space()
+    smc = make_smc(gaussian_1d(lam, mu), space, num_mcmc_steps=5)
+
+    samples = smc.run_smc(1000, num_chains=4, disable_progbar=True)
+    assert samples["x"].shape == (4, 1000)
+
+    diag = smc.diagnostics()
+    assert diag["log_evidence"].shape == (4,)
+    assert diag["betas"].shape[1] == 4 and diag["ess"].shape[1] == 4
+
+    # combined evidence matches the closed form; per-chain spread is finite
+    log_Z = -0.5 * math.log(1.0 + lam) - 0.5 * lam * mu ** 2 / (1.0 + lam)
+    assert float(diag["log_evidence_estimate"]) == pytest.approx(log_Z, abs=0.15)
+    assert float(diag["log_evidence_se"]) >= 0.0
+
+    # unimodal target: chains agree, so R-hat ~ 1
+    assert float(diag["r_hat"]["x"]) == pytest.approx(1.0, abs=0.1)
+
+    # posterior mean recovered (pooled over chains)
+    post_mean = lam * mu / (1.0 + lam)
+    assert float(samples["x"].mean()) == pytest.approx(post_mean, abs=0.05)

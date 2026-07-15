@@ -115,7 +115,9 @@ class BaseSampler(ABC):
             return U
 
         G_prior = self.space.prior_metric(theta_full)
-        G_full = beta * G_lik if G_prior is None else beta * G_lik + G_prior
+        # beta may be per-particle (N,); reshape to broadcast against G_lik (N, d, d)
+        beta_g = beta.reshape(-1, 1, 1) if torch.is_tensor(beta) and beta.ndim > 0 else beta
+        G_full = beta_g * G_lik if G_prior is None else beta_g * G_lik + G_prior
         metric = self.space.push_forward_metric(theta_full, G_full, theta_map=theta_map)
 
         return U, metric
