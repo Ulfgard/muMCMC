@@ -15,9 +15,11 @@ from .BaseSampler import BaseSampler, PyroSampler
 from .RMHMC import RMHMC, RMHMCState
 from .NUTS import NUTS
 from .SMC import SMC
+from .PT import PT
 from .spaces import (
     ElementwiseTransform,
-    TransformedMetric,
+    TemperedMetric,
+    TemperedPotential,
     UnconstrainedSpace,
     UniformBoxSpace,
     transforms,
@@ -31,8 +33,10 @@ __all__ = [
     "RMHMCState",
     "NUTS",
     "SMC",
+    "PT",
     "ElementwiseTransform",
-    "TransformedMetric",
+    "TemperedMetric",
+    "TemperedPotential",
     "UnconstrainedSpace",
     "UniformBoxSpace",
     "transforms",

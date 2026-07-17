@@ -62,9 +62,9 @@ def test_init_tensorises_step_size_and_resets_counters():
     assert s._adapting is True
     # adapter seeded at log(step_size)
     assert torch.allclose(s._adapter.prox_center, torch.log(s.step_size))
-    # initial state is complete and has momentum
+    # initial state is complete; step() samples the momentum
     assert state.U is not None and state.metric is not None
-    assert state.p.shape == (5, D)
+    assert state.p is None
     assert torch.allclose(state.max_residual, torch.zeros(5))
 
 
@@ -75,23 +75,13 @@ def test_init_without_adaptation_does_not_arm_adapter():
 
 
 # ========================================================================== #
-#  RMHMCState: complete / reorder                                            #
+#  RMHMCState: reorder                                                       #
 # ========================================================================== #
-
-def test_complete_fills_then_is_idempotent():
-    s = make_sampler(model_qdep)
-    st = RMHMCState(torch.randn(2, D))
-    assert st.U is None and st.metric is None
-    st.complete(s.evaluate_model)
-    U_ref, metric_ref = st.U, st.metric
-    assert U_ref is not None and metric_ref is not None
-    st.complete(s.evaluate_model)                 # no-op on a complete state
-    assert st.U is U_ref and st.metric is metric_ref
-
 
 def test_reorder_permutes_config_but_not_slot_diagnostics():
     s = make_sampler(model_qdep)
-    state = s.init(torch.randn(3, D))             # q, p, U, metric all present
+    state = s.init(torch.randn(3, D))             # q, U, metric present
+    state.p = state.metric.sample_momentum()      # give it momentum, as step() would
     state.max_residual = torch.tensor([1.0, 2.0, 3.0])
     state.fp_iters = [torch.tensor([4, 5, 6])]
     perm = torch.tensor([2, 0, 1])
@@ -99,7 +89,7 @@ def test_reorder_permutes_config_but_not_slot_diagnostics():
 
     assert torch.equal(r.q, state.q[perm])
     assert torch.equal(r.p, state.p[perm])
-    assert torch.equal(r.U, state.U[perm])
+    assert torch.equal(r.U.value, state.U.value[perm])
     # metric travels with the configuration (log-det follows the permutation)
     assert torch.allclose(r.metric.log_det_metric(),
                           state.metric.log_det_metric()[perm])
@@ -122,6 +112,7 @@ def test_reorder_leaves_absent_fields_none():
 def test_accept_rejects_when_endpoint_energy_far_higher():
     s = make_sampler(adapt=False, num_steps=1)
     old = s.init(torch.zeros(2, D))               # low energy at the origin
+    old.p = torch.zeros_like(old.q)               # start momentum (step() would sample it)
     new = _endpoint(50.0, N=2)                    # huge U -> delta_H >> 0
     out = s.accept(new, old)
     assert torch.allclose(out.q, old.q)           # rejected: kept the start
@@ -131,6 +122,7 @@ def test_accept_rejects_when_endpoint_energy_far_higher():
 def test_accept_accepts_when_endpoint_energy_far_lower():
     s = make_sampler(adapt=False, num_steps=1)
     old = s.init(torch.full((2, D), 50.0))        # high energy far out
+    old.p = torch.zeros_like(old.q)
     new = _endpoint(0.0, N=2)                     # low U at origin
     out = s.accept(new, old)
     assert torch.allclose(out.q, new.q)           # accepted: moved to endpoint
@@ -140,20 +132,21 @@ def test_accept_accepts_when_endpoint_energy_far_lower():
 def test_accept_counts_divergence_over_threshold():
     s = make_sampler(adapt=False, num_steps=1, divergence_threshold=100.0)
     old = s.init(torch.zeros(2, D))
+    old.p = torch.zeros_like(old.q)
     new = _endpoint(50.0, N=2)                    # delta_H >> 100
     s.accept(new, old)
     assert torch.equal(s._num_divergences, torch.ones(2, dtype=torch.long))
 
 
-def test_accept_returns_complete_ready_state_with_fresh_momentum():
+def test_accept_leaves_momentum_unset():
     torch.manual_seed(0)
     s = make_sampler(adapt=False, num_steps=1)
     old = s.init(torch.zeros(3, D))
-    p_old = old.p.clone()
+    old.p = old.metric.sample_momentum()          # start momentum, as step() sets it
     new = _endpoint(0.5, N=3)
     out = s.accept(new, old)
     assert out.U is not None and out.metric is not None
-    assert out.p is not None and not torch.allclose(out.p, p_old)   # resampled
+    assert out.p is None                          # sampled by the next step()
     assert torch.allclose(out.max_residual, torch.zeros(3))
 
 
@@ -176,11 +169,11 @@ def test_step_runs_exactly_num_steps_leapfrogs():
     assert calls["n"] == 4
 
 
-def test_step_returns_ready_state():
+def test_step_returns_complete_state():
     s = make_sampler(adapt=False, num_steps=3)
     state = s.init(torch.zeros(2, D))
     out = s.step(state)
-    assert out.U is not None and out.metric is not None and out.p is not None
+    assert out.U is not None and out.metric is not None and out.p is None
     assert out.q.shape == (2, D)
     assert torch.allclose(out.max_residual, torch.zeros(2))
 
@@ -305,9 +298,9 @@ def test_endpoint_state_carries_no_autograd_graph():
 
     assert not s._delta_H_last.requires_grad
     assert not s._delta_H_abs_sum.requires_grad and not s._delta_H_abs_max.requires_grad
-    assert not state.U.requires_grad
+    assert not state.U.value.requires_grad
     assert not state.metric.L.requires_grad
-    assert not state.p.requires_grad
+    assert state.p is None                        # momentum is a within-step transient
 
 
 def test_diagnostics_footprint_is_constant_over_steps():

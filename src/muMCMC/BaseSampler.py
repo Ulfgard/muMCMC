@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from tqdm.auto import tqdm
@@ -10,7 +10,7 @@ import pyro
 from pyro.infer.mcmc import MCMC
 from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
 
-from .spaces import TransformedMetric
+from .spaces import TemperedMetric, TemperedPotential
 
 
 class BaseSampler(ABC):
@@ -68,9 +68,10 @@ class BaseSampler(ABC):
 
     def evaluate_model(
         self, z_free: torch.Tensor, beta: Optional[float] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, TransformedMetric]]:
+    ) -> Tuple[TemperedPotential, Optional[TemperedMetric]]:
         """
-        Posterior evaluation at the unconstrained free vector ``z``.
+        Posterior evaluation at the unconstrained free vector ``z`` as
+        tempering-aware objects.
 
         Depending on ``requires_metric`` the user's ``potential_fn`` is:
 
@@ -78,22 +79,21 @@ class BaseSampler(ABC):
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
               G_lik a (d_full, d_full) SPD metric in constrained coordinates.
 
-        This method assembles the full unconstrained-space potential
+        Returns ``(potential, metric)``:
 
-            U(z) = beta * U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
+          - :class:`TemperedPotential` with ``value = beta * U_lik + U_base``,
+            ``U_base = U_prior - log|det dtheta/dz|``.
+          - :class:`TemperedMetric` with ``G_u(beta) = beta * A_lik + A_prior``,
+            the likelihood/prior metrics pushed forward to free unconstrained
+            coordinates (``None`` when ``requires_metric`` is False).
 
-        (prior from ``space.prior_log_prob_vector``, Jacobian log-det from the
-        transform), and -- when ``requires_metric=True`` -- the pulled-back
-        metric ``G_u(z) = J^T (beta * G_lik + G_prior) J``.  ``beta`` (default
-        ``self.beta``, 1.0 = untempered) tempers the likelihood only.
+        Both own their inverse temperature and a ``reorder`` that retempers a
+        moved configuration, so a caller keeping them across a temperature
+        change needs no knowledge of ``beta`` (default ``self.beta``, 1.0 =
+        untempered).  Callers wanting the scalar potential use ``.value``.
 
-        Returns
-        -------
-        Tensor U of shape (N,)                          if requires_metric is False
-        (Tensor U of shape (N,), TransformedMetric)     if requires_metric is True
-
-        Batched over the leading axis: ``(N, d)`` -> ``U`` of shape ``(N,)``
-        (plus a batched ``TransformedMetric`` in the metric branch).
+        Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential
+        (plus a batched ``TemperedMetric`` in the metric branch).
         """
         if beta is None:
             beta = self.beta
@@ -108,19 +108,16 @@ class BaseSampler(ABC):
         else:
             u_likelihood = result
 
-        u_prior = -self.space.prior_log_prob_vector(theta_free)
-        U = beta * u_likelihood + u_prior - theta_map.jacobian_log_det
+        U_base = -self.space.prior_log_prob_vector(theta_free) - theta_map.jacobian_log_det
+        potential = TemperedPotential(u_likelihood, U_base, beta)
 
         if not self.requires_metric:
-            return U
+            return potential, None
 
         G_prior = self.space.prior_metric(theta_full)
-        # beta may be per-particle (N,); reshape to broadcast against G_lik (N, d, d)
-        beta_g = beta.reshape(-1, 1, 1) if torch.is_tensor(beta) and beta.ndim > 0 else beta
-        G_full = beta_g * G_lik if G_prior is None else beta_g * G_lik + G_prior
-        metric = self.space.push_forward_metric(theta_full, G_full, theta_map=theta_map)
-
-        return U, metric
+        A_lik = self.space.push_forward_metric(G_lik, theta_map)
+        A_prior = None if G_prior is None else self.space.push_forward_metric(G_prior, theta_map)
+        return potential, TemperedMetric(A_lik, A_prior, beta)
 
     def potential_likelihood(self, z_free: torch.Tensor) -> torch.Tensor:
         """
@@ -247,7 +244,8 @@ class PyroSampler(BaseSampler):
         ``requires_metric=False``.
         """
         z = params_dict["params"]                  # (d,)
-        return self.evaluate_model(z.unsqueeze(0)).squeeze(0)   # (1,d)->(1,)->()
+        potential, _ = self.evaluate_model(z.unsqueeze(0))
+        return potential.value.squeeze(0)          # (1,d)->(1,)->()
 
     def diagnostics(self) -> dict:
         """Per-chain diagnostics in the common schema -- ``accept_rate``,
