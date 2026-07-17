@@ -80,11 +80,11 @@ def test_hamiltonian_matches_dense():
     torch.manual_seed(0)
     q = torch.randn(4, D)
     p = torch.randn(4, D)
-    U, metric = ev(q)
+    potential, metric = ev(q)
     G = model_qdep(q)[1]
     Ginv_p = torch.linalg.solve(G, p[..., None])[..., 0]
-    expected = U + 0.5 * (p * Ginv_p).sum(-1) + 0.5 * torch.logdet(G)
-    H = _hamiltonian(q, p, U, metric)
+    expected = potential.value + 0.5 * (p * Ginv_p).sum(-1) + 0.5 * torch.logdet(G)
+    H = _hamiltonian(q, p, potential.value, metric)
     assert H.shape == (4,)
     assert torch.allclose(H, expected, atol=1e-10)
 
@@ -96,9 +96,9 @@ def test_hamiltonian_ignores_position_argument():
     torch.manual_seed(1)
     q = torch.randn(3, D)
     p = torch.randn(3, D)
-    U, metric = ev(q)
-    assert torch.equal(_hamiltonian(q, p, U, metric),
-                       _hamiltonian(q + 5.0, p, U, metric))
+    potential, metric = ev(q)
+    assert torch.equal(_hamiltonian(q, p, potential.value, metric),
+                       _hamiltonian(q + 5.0, p, potential.value, metric))
 
 
 # ========================================================================== #
@@ -137,8 +137,8 @@ def test_midpoint_map_momentum_gradient_matches_finite_difference():
     p_mid = 0.5 * (p + p_k)
 
     def H_of(qm):
-        U, m = ev(qm)
-        return _hamiltonian(qm, p_mid, U, m)
+        potential, m = ev(qm)
+        return _hamiltonian(qm, p_mid, potential.value, m)
 
     h = 1e-5
     dHdq_fd = torch.zeros(2, D)
@@ -230,8 +230,8 @@ def test_step_preserves_volume_and_symplectic_form():
 # ========================================================================== #
 
 def _H_at(ev, q, p):
-    U, metric = ev(q)
-    return _hamiltonian(q, p, U, metric)
+    potential, metric = ev(q)
+    return _hamiltonian(q, p, potential.value, metric)
 
 
 @pytest.mark.parametrize("eps_val", [0.05, 0.1, 0.3, 0.7])

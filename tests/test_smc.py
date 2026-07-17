@@ -85,9 +85,9 @@ def test_potential_likelihood_is_likelihood_only():
 
     # evaluate_model's potential adds the N(0,1) prior (no Jacobian in the
     # identity space): U - U_lik == -log prior == 1/2 z^2 + 1/2 log(2 pi).
-    U, _ = sampler.evaluate_model(z, beta=1.0)
+    potential, _ = sampler.evaluate_model(z, beta=1.0)
     u_prior = 0.5 * z[..., 0] ** 2 + 0.5 * math.log(2 * math.pi)
-    assert torch.allclose(U - u_lik, u_prior)
+    assert torch.allclose(potential.value - u_lik, u_prior)
 
 
 # --------------------------------------------------------------------------- #

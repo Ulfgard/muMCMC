@@ -5,7 +5,7 @@ import torch
 import math
 
 from .BaseSampler import BaseSampler
-from .spaces import TransformedMetric
+from .spaces import TemperedMetric
 from .adapters import REINFORCEAdapter
 
 # =========================================================================== #
@@ -25,7 +25,7 @@ def _hamiltonian(
     q: torch.Tensor,
     p: torch.Tensor,
     U: torch.Tensor,
-    metric: TransformedMetric,
+    metric: TemperedMetric,
 ) -> torch.Tensor:
     """
     H(q, p) = U + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
@@ -68,8 +68,8 @@ def _midpoint_map(
     p_mid = 0.5 * (p + p_k)
 
     with torch.enable_grad():
-        U, metric = evaluate_model(q_mid)
-        H = _hamiltonian(q_mid, p_mid, U, metric)
+        potential, metric = evaluate_model(q_mid)
+        H = _hamiltonian(q_mid, p_mid, potential.value, metric)
         # H has shape (N,) with no cross-chain coupling, so grad of the sum
         # is the per-chain gradient.
         (dHdq,) = torch.autograd.grad(H.sum(), q_mid)
@@ -276,20 +276,22 @@ class RMHMCState:
     ------
     q, p : (N, d)
         Position and momentum.
-    U : (N,) or None
-        Potential at ``q``.
-    metric : TransformedMetric or None
-        Metric at ``q``.  ``U`` and ``metric`` are present after
-        ``init`` / ``accept`` and ``None`` after ``step`` (the integrator
-        evaluates the model only at midpoints); they are filled lazily by
-        :meth:`complete`.
+    U : TemperedPotential or None
+        Potential at ``q`` (``U.value`` is the ``(N,)`` energy).
+    metric : TemperedMetric or None
+        Metric at ``q``.  ``U`` and ``metric`` are set at ``init`` / ``accept``
+        and ``None`` after ``step`` (the integrator evaluates the model only at
+        midpoints).
     max_residual : (N,) or None
         Running max fixed-point residual over the current trajectory.
     fp_iters : list of (N,)
         Per-midpoint-step fixed-point iteration counts for the trajectory.
 
-    The trajectory accumulators (``max_residual``, ``fp_iters``) are reset
-    by ``init`` and ``accept``; ``step`` carries them forward.
+    ``U`` and ``metric`` are configuration-bound objects that carry their own
+    temperature and retemper themselves under ``reorder`` -- the state stays
+    agnostic to tempering.  The trajectory accumulators (``max_residual``,
+    ``fp_iters``) are reset by ``init`` and ``accept``; ``step`` carries them
+    forward.
     """
 
     def __init__(self, q, p=None, U=None, metric=None,
@@ -301,30 +303,21 @@ class RMHMCState:
         self.max_residual = max_residual
         self.fp_iters = [] if fp_iters is None else fp_iters
 
-    def complete(self, evaluate_model):
-        """Fill ``U`` and ``metric`` by evaluating the model at ``q`` if they
-        are not already present; a no-op on an already-complete state."""
-        if self.U is None or self.metric is None:
-            # Endpoint evaluations only feed energies/diagnostics and are never
-            # backpropagated, so evaluate under no_grad to avoid pinning an
-            # autograd graph.
-            with torch.no_grad():
-                self.U, self.metric = evaluate_model(self.q)
-        return self
-
     def reorder(self, perm):
         """Permute the state (configuration) across chain slots: slot ``i`` of
         the result carries ``q, p, U, metric`` from slot ``perm[i]``.  ``perm``
         is an ``(N,)`` long index tensor.  Returns a new state; absent (None)
         fields stay None.
 
-        ``max_residual`` and ``fp_iters`` are integrator diagnostics bound to
-        the chain slot, not to the configuration, so they are not permuted.
+        ``U`` and ``metric`` reorder themselves -- both are slot-bound in their
+        temperature, so a moved configuration is retempered to its new slot.
+        ``max_residual`` and ``fp_iters`` are integrator diagnostics bound to the
+        slot, so they are not permuted.
         """
         return RMHMCState(
             q            = self.q[perm],
             p            = None if self.p is None else self.p[perm],
-            U            = None if self.U is None else self.U[perm],
+            U            = None if self.U is None else self.U.reorder(perm),
             metric       = None if self.metric is None else self.metric.reorder(perm),
             max_residual = self.max_residual,   # slot-bound: not permuted
             fp_iters     = self.fp_iters,       # slot-bound: not permuted
@@ -361,8 +354,8 @@ class RMHMC(BaseSampler):
     full constrained vector, ``U_lik`` the scalar likelihood potential
     ``-log p(data | theta)``, and ``G_lik`` the (d_full, d_full) SPD
     likelihood metric in constrained coordinates.  BaseSampler adds the prior
-    log-prob and prior metric, Choleskys, restricts to free coordinates, and
-    pulls back through the Jacobian (see ``spaces.TransformedMetric``).
+    log-prob and prior metric and pushes the metric forward to free
+    unconstrained coordinates (see ``spaces.push_forward_metric``).
 
     Parameters
     ----------
@@ -457,8 +450,9 @@ class RMHMC(BaseSampler):
 
         Sizes the per-chain ``step_size``, adapter, and diagnostic counters
         from ``q``'s batch and arms adaptation (``_adapting =
-        adapt_step_size``), then builds the initial chain state (evaluate
-        (U, metric), sample momentum, reset accumulators).
+        adapt_step_size``), then builds the initial chain state at ``q``
+        (evaluate the model, zero the residual accumulator); ``step`` samples
+        the momentum.
 
         The driver decides when to call :meth:`end_warmup`.  For a zero-warmup
         run it is called before the first transition; the adapter round-trips
@@ -486,9 +480,9 @@ class RMHMC(BaseSampler):
             self._adapter.prox_center = torch.log(self.step_size)   # (N,)
             self._adapter.reset()
 
-        # initial chain state at q
-        s = RMHMCState(q).complete(self.evaluate_model)
-        s.p = s.metric.sample_momentum()
+        with torch.no_grad():
+            U, metric = self.evaluate_model(q)
+        s = RMHMCState(q, U=U, metric=metric)
         s.max_residual = torch.zeros(N, dtype=dtype, device=device)
         return s
 
@@ -499,9 +493,10 @@ class RMHMC(BaseSampler):
     # HMC-internal substep; it is not the transition.
 
     def step(self, s):
-        """One chain transition from the ready state ``s``: integrate
+        """One chain transition: sample momentum at ``s``, integrate
         ``num_steps`` leapfrog substeps, then Metropolis accept/reject.
-        Returns the chosen ready-to-step state."""
+        The returned state has momentum unset (the next ``step`` samples it)."""
+        s.p = s.metric.sample_momentum()
         new = s
         for _ in range(self.num_steps):
             new = self.leapfrog_step(new)
@@ -525,15 +520,16 @@ class RMHMC(BaseSampler):
     def accept(self, new, old):
         """Per-chain Metropolis accept/reject between the trajectory endpoint
         ``new`` and its start ``old``, plus bookkeeping and (while adapting)
-        the step-size update.  Returns the chosen ready-to-step state: U/metric
-        are carried over per chain via ``TransformedMetric.select`` (no model
-        eval) and a fresh momentum is sampled at the chosen point."""
-        new.complete(self.evaluate_model)       # endpoint eval (1 model eval)
-        old.complete(self.evaluate_model)       # no-op: start already complete
+        the step-size update.  Returns the chosen state with U/metric mixed per
+        chain via their ``select`` (no further model eval) and momentum unset --
+        the next :meth:`step` samples it.  ``old`` is already complete (from
+        ``init`` or the previous transition)."""
+        with torch.no_grad():
+            new.U, new.metric = self.evaluate_model(new.q)   # endpoint eval (1 model eval)
 
-        H_new = _hamiltonian(new.q, new.p, new.U, new.metric)   # (N,)
-        H_old = _hamiltonian(old.q, old.p, old.U, old.metric)   # (N,)
-        delta_H_raw = H_new - H_old                              # (N,)
+        H_new = _hamiltonian(new.q, new.p, new.U.value, new.metric)   # (N,)
+        H_old = _hamiltonian(old.q, old.p, old.U.value, old.metric)   # (N,)
+        delta_H_raw = H_new - H_old                                   # (N,)
 
         # Divergence: raw delta_H non-finite or over threshold.  Clamping
         # below is for Metropolis-ratio safety only; it does not affect
@@ -549,12 +545,10 @@ class RMHMC(BaseSampler):
 
         self._bookkeep(accepted, delta_H, is_divergent, new.max_residual, new.fp_iters)
 
-        # Ready-to-step state: mix U/metric per chain and resample momentum
-        # at the chosen point.
-        chosen_U = torch.where(accepted, new.U, old.U)               # (N,)
+        # Mix U / metric per chain; momentum is left unset (sampled by step).
+        chosen_U      = new.U.select(accepted, old.U)
         chosen_metric = new.metric.select(accepted, old.metric)
         out = RMHMCState(chosen_q, None, chosen_U, chosen_metric)
-        out.p = chosen_metric.sample_momentum()
         out.max_residual = torch.zeros(N, dtype=chosen_q.dtype, device=chosen_q.device)
         return out
 

@@ -82,7 +82,7 @@ def test_potential_adds_prior_on_identity_space():
     s = _RecordingSampler(space, potential_fn=lambda th: 0.5 * (th ** 2).sum(-1))
 
     z = torch.randn(5, 2)
-    U = s.evaluate_model(z)
+    U = s.evaluate_model(z)[0].value
     u_lik = 0.5 * (z ** 2).sum(-1)
     prior_lp = Normal(0.0, 1.0).log_prob(z).sum(-1)   # computed independently
     assert U.shape == (5,)
@@ -100,7 +100,7 @@ def test_potential_subtracts_jacobian_log_det_on_box_space():
     theta_map = space.map_to_constrained_vector(z)
     theta = theta_map.mapped_point
     expected = theta.sum(-1) - theta_map.jacobian_log_det
-    assert torch.allclose(s.evaluate_model(z), expected, atol=ATOL)
+    assert torch.allclose(s.evaluate_model(z)[0].value, expected, atol=ATOL)
 
 
 def test_potential_splices_fixed_coordinate_and_skips_its_prior():
@@ -112,7 +112,7 @@ def test_potential_splices_fixed_coordinate_and_skips_its_prior():
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
     z = torch.randn(4, 2)                       # free coords a, b
-    U = s.evaluate_model(z)
+    U = s.evaluate_model(z)[0].value
     u_lik = z.sum(-1) + 2.0                      # fixed c spliced in
     prior_lp = Normal(0.0, 1.0).log_prob(z).sum(-1)   # free names only
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
@@ -149,16 +149,15 @@ def test_metric_branch_returns_pulled_back_likelihood_metric():
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
     z = torch.randn(4, 2)
-    U, metric = s.evaluate_model(z)
+    potential, metric = s.evaluate_model(z)
     # U = U_lik (no prior, identity Jacobian)
-    assert torch.allclose(U, 0.5 * (z ** 2).sum(-1), atol=ATOL)
+    assert torch.allclose(potential.value, 0.5 * (z ** 2).sum(-1), atol=ATOL)
     v = torch.randn(4, 2)
-    assert torch.allclose(metric.metric_times_vec(v), 2.0 * v, atol=ATOL)
-    assert torch.allclose(metric.inv_metric_times_vec(v), v / 2.0, atol=ATOL)
+    assert torch.allclose(metric.inv_metric_times_vec(v), v / 2.0, atol=ATOL)   # G = 2 I
 
 
 def test_metric_branch_adds_prior_metric():
-    # G_full = G_lik + G_prior = (2 + 3) I, so metric_times_vec(v) == 5 v.
+    # G_full = G_lik + G_prior = (2 + 3) I, so G^{-1} v == v / 5.
     def prior_metric_fn(theta_full):
         n = theta_full.shape[-1]
         return 3.0 * torch.eye(n, dtype=theta_full.dtype).expand(
@@ -170,7 +169,7 @@ def test_metric_branch_adds_prior_metric():
     z = torch.randn(4, 2)
     _, metric = s.evaluate_model(z)
     v = torch.randn(4, 2)
-    assert torch.allclose(metric.metric_times_vec(v), 5.0 * v, atol=ATOL)
+    assert torch.allclose(metric.inv_metric_times_vec(v), v / 5.0, atol=ATOL)
 
 
 # ========================================================================== #

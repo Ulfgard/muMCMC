@@ -1,12 +1,11 @@
 """Contract tests for ``ElementwiseTransform`` and the ``transforms`` factory.
 
-The transforms are the geometric core every space leans on: they expose a
-Jacobian-vector-product interface (``jvp``/``vjp``/``jinvvp``/``vjinvp``) plus a
-log-determinant, and the samplers and ``TransformedMetric`` trust those to be
-mutually consistent and to match the actual analytic Jacobian.  These tests pin
-that contract down -- round trips, inverse relationships, batched vs. unbatched
-shapes, and the per-chain ``where``/``reorder`` helpers used by parallel
-tempering.
+The transforms are the geometric core every space leans on: they expose the
+mapped point, the diagonal Jacobian (``jvp`` / ``jacobian_diag``) and its
+log-determinant, and the inverse transform, and the samplers and
+``push_forward_metric`` trust those to match the actual analytic Jacobian.
+These tests pin that contract down -- the Jacobian, its log-det, inverse round
+trips, and batched vs. unbatched shapes.
 """
 import math
 
@@ -38,7 +37,7 @@ def _make(diag_J, *, p=None):
 
 
 # --------------------------------------------------------------------------- #
-#  ElementwiseTransform: jvp/vjp/inverse contract                             #
+#  ElementwiseTransform: Jacobian / inverse contract                          #
 # --------------------------------------------------------------------------- #
 
 def test_jvp_is_elementwise_scaling():
@@ -46,18 +45,7 @@ def test_jvp_is_elementwise_scaling():
     t = _make(diag)
     v = torch.tensor([1.0, -4.0, 2.0])
     assert torch.allclose(t.jvp(v), diag * v, atol=ATOL)
-    # The Jacobian is diagonal, hence symmetric: vjp == jvp.
-    assert torch.allclose(t.vjp(v), t.jvp(v), atol=ATOL)
-
-
-def test_jinvvp_undoes_jvp():
-    diag = torch.tensor([2.0, 0.5, 3.0, 1.25])
-    t = _make(diag)
-    v = torch.randn(4)
-    assert torch.allclose(t.jinvvp(t.jvp(v)), v, atol=ATOL)
-    assert torch.allclose(t.vjinvp(t.vjp(v)), v, atol=ATOL)
-    # inverse solves are themselves elementwise division.
-    assert torch.allclose(t.jinvvp(v), v / diag, atol=ATOL)
+    assert torch.allclose(t.jacobian_diag, diag, atol=ATOL)
 
 
 def test_jacobian_log_det_property():
@@ -85,9 +73,9 @@ def test_inv_swaps_endpoints_and_negates_log_det():
     # diagonal inverts, log-det negates
     assert torch.allclose(ti.jvp(torch.ones(3)), 1.0 / diag, atol=ATOL)
     assert torch.allclose(ti.jacobian_log_det, -t.jacobian_log_det, atol=ATOL)
-    # inv.jvp == original.jinvvp
+    # inverse Jacobian is elementwise division
     v = torch.randn(3)
-    assert torch.allclose(ti.jvp(v), t.jinvvp(v), atol=ATOL)
+    assert torch.allclose(ti.jvp(v), v / diag, atol=ATOL)
 
 
 def test_inv_of_inv_round_trips():
@@ -100,36 +88,6 @@ def test_inv_of_inv_round_trips():
 
 
 # --------------------------------------------------------------------------- #
-#  Per-chain helpers used by parallel tempering                               #
-# --------------------------------------------------------------------------- #
-
-def test_where_selects_per_chain():
-    a = _make(torch.tensor([[2.0, 3.0], [4.0, 5.0]]),
-              p=torch.tensor([[0.0, 0.0], [1.0, 1.0]]))
-    b = _make(torch.tensor([[20.0, 30.0], [40.0, 50.0]]),
-              p=torch.tensor([[9.0, 9.0], [8.0, 8.0]]))
-    mask = torch.tensor([True, False])
-    c = a.where(mask, b)
-    # row 0 from a, row 1 from b
-    assert torch.allclose(c.jvp(torch.ones(2, 2))[0], a.jvp(torch.ones(2, 2))[0], atol=ATOL)
-    assert torch.allclose(c.jvp(torch.ones(2, 2))[1], b.jvp(torch.ones(2, 2))[1], atol=ATOL)
-    assert torch.equal(c.p[0], a.p[0])
-    assert torch.equal(c.p[1], b.p[1])
-    # inputs untouched (purity)
-    assert torch.equal(a.p[1], torch.tensor([1.0, 1.0]))
-
-
-def test_reorder_permutes_chains():
-    diag = torch.tensor([[2.0, 3.0], [4.0, 5.0], [6.0, 7.0]])
-    t = _make(diag, p=torch.tensor([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]))
-    perm = torch.tensor([2, 0, 1])
-    r = t.reorder(perm)
-    assert torch.allclose(r.jvp(torch.ones(3, 2)), diag[perm], atol=ATOL)
-    assert torch.equal(r.p, t.p[perm])
-    assert torch.allclose(r.jacobian_log_det, t.jacobian_log_det[perm], atol=ATOL)
-
-
-# --------------------------------------------------------------------------- #
 #  transforms.identity                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -139,7 +97,6 @@ def test_identity_is_a_no_op():
     assert torch.equal(t.mapped_point, p)
     v = torch.randn(3)
     assert torch.allclose(t.jvp(v), v, atol=ATOL)
-    assert torch.allclose(t.jinvvp(v), v, atol=ATOL)
 
 
 def test_identity_log_det_shapes():
