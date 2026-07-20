@@ -119,7 +119,7 @@ class PT(BaseSampler):
     def logging(self) -> dict:
         if self._nstep == 0:
             return {}
-        rate = float((self._swap_acc / self._swap_cnt.clamp(min=1.0)).min())
+        rate = float((self._swap_acc / self._swap_cnt.clamp(min=1.0)).mean(0).min())
         return {"swap": f"{rate:.2f}"}
 
     def diagnostics(self) -> dict:
