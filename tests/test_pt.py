@@ -44,6 +44,27 @@ def bimodal_1d(m, s):
     return model
 
 
+def test_pt_swap_is_grad_free_with_grad_requiring_model():
+    # A model closure holding a requires_grad parameter would, under the old
+    # potential_likelihood recompute, build a retained autograd graph that
+    # accumulates into _u_lik_sum. Reading U_lik from the grad-free state
+    # avoids it.
+    torch.manual_seed(0)
+    scale = torch.tensor(3.0, requires_grad=True)
+
+    def model(theta):
+        U = 0.5 * scale * (theta[..., 0] - 2.0) ** 2
+        G = scale * torch.eye(1, dtype=theta.dtype).expand(*theta.shape[:-1], 1, 1)
+        return U, G
+
+    sampler = RMHMC(model, gaussian_1d_space(), step_size=0.3, num_steps=4,
+                    adapt_step_size=False)
+    pt = PT(sampler, torch.linspace(0.0, 1.0, 4))
+    pt.run_mcmc(torch.zeros(1), num_samples=20, num_warmup_steps=10,
+                num_chains=1, disable_progbar=True)
+    assert not pt._u_lik_sum.requires_grad
+
+
 def test_pt_recovers_gaussian_and_evidence():
     torch.manual_seed(0)
     lam, mu = 3.0, 2.0

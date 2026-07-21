@@ -43,8 +43,9 @@ class SMC:
     Transports a particle population from the prior (beta=0) to the posterior
     (beta=1) along ``prior * likelihood**beta``.  Each stage is reweight ->
     systematic resample -> mutate.  The wrapped ``sampler`` supplies the
-    mutation kernel via its ``init`` / ``step`` / ``beta`` interface and the
-    likelihood potential via ``potential_likelihood``.
+    mutation kernel via its ``init`` / ``step`` / ``beta`` interface; the
+    likelihood potential for reweighting is read from the kernel state's
+    tempered potential (``state.U.lik``).
 
     ``num_chains`` independent populations are run in parallel over the kernel's
     batch axis: each has its own particles, resampling, and adaptively-bisected
@@ -146,13 +147,18 @@ class SMC:
         self._accept = []
         self._log_evidence = torch.zeros(C, dtype=z.dtype, device=z.device)
 
+        # Evaluate the prior population once; the kernel state carries U_lik,
+        # so reweighting reads it (grad-free) instead of recomputing.
+        sampler.beta = beta.unsqueeze(-1).expand(C, M).reshape(N)
+        s = sampler.init(z)
+
         bar_format = "{l_bar}{bar}| {n:.3f}/{total:.3f} [{elapsed}{postfix}]"
         with tqdm(total=1.0, file=sys.stderr, disable=disable_progbar,
                   bar_format=bar_format, desc="SMC") as bar:
             progressed = 0.0
             while bool((beta < 1.0).any()):
                 # reweight: per-chain schedule + incremental weights from U_lik
-                u_lik = sampler.potential_likelihood(z).reshape(C, M)
+                u_lik = s.U.lik.reshape(C, M)                     # (C, M), from the state
                 dbeta = self._next_dbeta(u_lik, 1.0 - beta)       # (C,)
                 log_w = -dbeta.unsqueeze(-1) * u_lik              # (C, M)
                 self._log_evidence += torch.logsumexp(log_w, dim=-1) - math.log(M)
@@ -161,7 +167,7 @@ class SMC:
                 W = torch.softmax(log_w, dim=-1)                  # (C, M)
                 ess = 1.0 / (W * W).sum(dim=-1)                   # (C,)
                 idx = _systematic_resample(W)                     # (C, M)
-                z = z.reshape(C, M, d).gather(
+                z = s.q.reshape(C, M, d).gather(
                     1, idx.unsqueeze(-1).expand(C, M, d)).reshape(N, d)
                 beta = beta + dbeta
 
@@ -171,7 +177,6 @@ class SMC:
                 sampler.end_warmup()
                 for _ in range(self.num_mcmc_steps):
                     s = sampler.step(s)
-                z = s.q
 
                 self._betas.append(beta.clone())
                 self._ess.append(ess)
@@ -185,6 +190,7 @@ class SMC:
                                 refresh=False)
 
         sampler.beta = 1.0                                        # restore kernel default
+        z = s.q                                                   # final mutated population
 
         theta_free = space.map_to_constrained_vector(z).mapped_point
         free = space.from_vector(theta_free)

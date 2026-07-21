@@ -41,8 +41,9 @@ class PT(BaseSampler):
     kernel state is permuted with :meth:`reorder`, which retempers each moved
     configuration to its new slot temperature (no model re-evaluation).
 
-    The wrapped kernel's state must expose ``q`` and a ``reorder`` that
-    retempers under a temperature change (as ``RMHMCState`` does).
+    The wrapped kernel's state must expose ``q``, the tempered potential ``U``
+    (whose ``lik`` is the likelihood potential used for the swap ratio), and a
+    ``reorder`` that retempers under a temperature change (as ``RMHMCState`` does).
 
     Parameters
     ----------
@@ -103,7 +104,7 @@ class PT(BaseSampler):
         L, K, M = self.L, self.K, self.L * self.K
 
         inner = self.sampler.step(s.inner)                 # explore every replica at its temperature
-        u = self.potential_likelihood(inner.q).reshape(L, K)   # U_lik per temperature
+        u = inner.U.lik.reshape(L, K)                      # U_lik per temperature (grad-free, from state)
         self._u_lik_sum += u                               # for thermodynamic integration
 
         # even then odd swap sweep, composed into one relabeling of the replicas

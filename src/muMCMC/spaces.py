@@ -9,9 +9,9 @@ is no contribution (uniform priors, or unconstrained spaces without an explicit
 prior metric).
 
 `push_forward_metric` pushes a constrained-space metric forward to the free
-unconstrained coordinates; `TemperedMetric` and `TemperedPotential` hold the
-pushed-forward metric and the potential affinely in an inverse temperature, so a
-driver can retemper a moved configuration by reordering alone.
+unconstrained coordinates; `TemperedAffine` holds a quantity affinely in an
+inverse temperature, so a driver can retemper a moved configuration by
+reordering alone.
 """
 
 from functools import cached_property
@@ -127,49 +127,86 @@ def _solve_triangular_vec(triag_mat: torch.Tensor, vec: torch.Tensor, upper: boo
     return torch.linalg.solve_triangular(triag_mat, vec[..., None], upper=upper)[..., 0]
 
 
-class TemperedMetric:
+class TemperedAffine:
     """
-    Free-space metric assembled affinely in an inverse temperature:
+    Quantity assembled affinely in an inverse temperature:
 
-        G_u(beta) = beta * A_lik + A_prior
+        value = beta * lik + base
 
-    where ``A_lik`` and ``A_prior`` are the likelihood and prior metrics already
-    pushed forward to free unconstrained coordinates (see
-    ``space.push_forward_metric``), dense ``(N, d, d)`` SPD tensors.  ``beta`` is
-    slot-bound: :meth:`reorder` and :meth:`select` permute or mix the ``A``
-    pieces while leaving ``beta`` in place, so a moved configuration is
-    retempered to its slot's temperature.
-
-    The Cholesky factor ``L`` of ``G_u(beta)`` is computed on first use, so a
-    swap that only reorders costs no factorization.  Operations follow from
-    ``G_u = L Lᵀ``.
+    ``lik`` is the temperature-scaled (likelihood) part and ``base`` the
+    temperature-free part (``None`` when absent).  ``lik`` and ``base`` share a
+    leading batch axis and may carry further trailing feature axes, over which
+    ``beta`` broadcasts.  ``beta`` is slot-bound: :meth:`select` and
+    :meth:`reorder` mix or permute ``lik``/``base`` along the batch axis while
+    leaving ``beta`` in place, so a moved configuration is retempered to its
+    slot's temperature.
 
     Parameters
     ----------
-    A_lik : Tensor (N, d, d)
-        Pushed-forward likelihood metric, scaled by ``beta``.
-    A_prior : Tensor (N, d, d) or None
-        Pushed-forward prior metric, untempered.
+    lik : Tensor, shape (N, *feat)
+        Temperature-scaled part.
+    base : Tensor, shape (N, *feat), or None
+        Temperature-free part.
     beta : float or Tensor
-        Inverse temperature scaling ``A_lik``.
+        Inverse temperature scaling ``lik``.
     """
 
-    def __init__(self, A_lik: torch.Tensor, A_prior, beta):
-        self.A_lik = A_lik
-        self.A_prior = A_prior
+    def __init__(self, lik: torch.Tensor, base, beta):
+        self.lik = lik
+        self.base = base
         self.beta = beta
+
+    def _beta_bcast(self):
+        """``beta`` reshaped to broadcast over ``lik``'s trailing feature axes."""
+        beta = self.beta
+        if torch.is_tensor(beta) and beta.ndim > 0:
+            beta = beta.reshape((-1,) + (1,) * (self.lik.dim() - 1))
+        return beta
+
+    @cached_property
+    def value(self) -> torch.Tensor:
+        v = self._beta_bcast() * self.lik
+        return v if self.base is None else v + self.base
+
+    def select(self, mask: torch.Tensor, other: "TemperedAffine") -> "TemperedAffine":
+        """This quantity where ``mask`` is True, ``other`` where False, per batch
+        element.  Both share the same temperature."""
+        m = mask.reshape(mask.shape + (1,) * (self.lik.dim() - mask.dim()))
+        return type(self)(
+            torch.where(m, self.lik, other.lik),
+            None if self.base is None else torch.where(m, self.base, other.base),
+            self.beta,
+        )
+
+    def reorder(self, perm: torch.Tensor) -> "TemperedAffine":
+        """Permute the batch axis: row ``i`` of the result is row ``perm[i]``.
+        ``beta`` is slot-bound and stays in place."""
+        return type(self)(
+            self.lik[perm],
+            None if self.base is None else self.base[perm],
+            self.beta,
+        )
+
+
+class TemperedMetric(TemperedAffine):
+    """
+    Free-space metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD
+    :attr:`value` whose operations are built from its Cholesky factor ``G = L Lᵀ``.
+
+    ``A_lik`` and ``A_prior`` (``lik`` and ``base``) are the likelihood and prior
+    metrics pushed forward to free unconstrained coordinates (see
+    ``space.push_forward_metric``); ``A_prior`` is ``None`` when the prior
+    contributes no metric.  ``L`` is computed on first use, so a reorder-only
+    swap costs no factorization.
+    """
 
     @cached_property
     def L(self) -> torch.Tensor:
-        """Lower-triangular Cholesky factor of ``G_u(beta)``, positive diagonal."""
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:     # per-chain: broadcast over (N, d, d)
-            beta = beta.reshape(-1, 1, 1)
-        G = beta * self.A_lik if self.A_prior is None else beta * self.A_lik + self.A_prior
-        return torch.linalg.cholesky(G)
+        """Lower-triangular Cholesky factor of :attr:`value`, positive diagonal."""
+        return torch.linalg.cholesky(self.value)
 
     def inv_metric_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """G_u⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
+        """G⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
         return _solve_triangular_vec(
             self.L.transpose(-2, -1),
             _solve_triangular_vec(self.L, v, upper=False),
@@ -177,123 +214,13 @@ class TemperedMetric:
         )
 
     def log_det_metric(self) -> torch.Tensor:
-        """log det G_u = 2 Σ log|diag L|."""
+        """log det G = 2 Σ log|diag L|."""
         return 2.0 * self.L.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)
 
     def sample_momentum(self) -> torch.Tensor:
-        """Sample p ~ N(0, G_u) via p = L ξ, ξ ~ N(0, I)."""
-        xi = torch.randn(self.A_lik.shape[:-1], dtype=self.A_lik.dtype, device=self.A_lik.device)
+        """Sample p ~ N(0, G) via p = L ξ, ξ ~ N(0, I)."""
+        xi = torch.randn(self.lik.shape[:-1], dtype=self.lik.dtype, device=self.lik.device)
         return (self.L @ xi[..., None])[..., 0].detach()
-
-    def select(self, mask: torch.Tensor, other: "TemperedMetric") -> "TemperedMetric":
-        """Per-chain select: this metric's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        m = mask.reshape(mask.shape + (1,) * (self.A_lik.dim() - mask.dim()))
-        return TemperedMetric(
-            torch.where(m, self.A_lik, other.A_lik),
-            None if self.A_prior is None else torch.where(m, self.A_prior, other.A_prior),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedMetric":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedMetric(
-            self.A_lik[perm],
-            None if self.A_prior is None else self.A_prior[perm],
-            self.beta,
-        )
-
-
-class TemperedPotential:
-    """
-    Potential assembled affinely in an inverse temperature:
-
-        U = beta * U_lik + U_base
-
-    with ``U_lik = -log p(data | theta)`` and ``U_base = U_prior - log|det J|``.
-    ``beta`` is slot-bound: :meth:`reorder` and :meth:`select` permute or mix
-    ``U_lik``/``U_base`` while leaving ``beta`` in place, so a moved configuration
-    is retempered to its slot's temperature.  ``value`` is the assembled ``(N,)``
-    potential.
-
-    Parameters
-    ----------
-    U_lik, U_base : Tensor (N,)
-        The temperature-scaled and temperature-free pieces of the potential.
-    beta : float or Tensor
-        Inverse temperature scaling ``U_lik``.
-    """
-
-    def __init__(self, U_lik: torch.Tensor, U_base: torch.Tensor, beta):
-        self.U_lik = U_lik
-        self.U_base = U_base
-        self.beta = beta
-
-    @cached_property
-    def value(self) -> torch.Tensor:
-        return self.beta * self.U_lik + self.U_base
-
-    def select(self, mask: torch.Tensor, other: "TemperedPotential") -> "TemperedPotential":
-        """Per-chain select: this potential's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        return TemperedPotential(
-            torch.where(mask, self.U_lik, other.U_lik),
-            torch.where(mask, self.U_base, other.U_base),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedPotential":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedPotential(self.U_lik[perm], self.U_base[perm], self.beta)
-
-
-class TemperedGradient:
-    """
-    Gradient of the potential assembled affinely in an inverse temperature:
-
-        g = beta * g_lik + g_base
-
-    with ``g_lik = ∂U_lik/∂z`` and ``g_base = ∂U_base/∂z``.  ``beta`` is
-    slot-bound, so :meth:`reorder` and :meth:`select` permute or mix
-    ``g_lik``/``g_base`` while leaving ``beta`` in place.  ``value`` is the
-    assembled ``(N, d)`` gradient.
-
-    Parameters
-    ----------
-    g_lik, g_base : Tensor, shape (N, d)
-        Temperature-scaled and temperature-free parts of ``∂U/∂z``.
-    beta : float or Tensor
-        Inverse temperature scaling ``g_lik``.
-    """
-
-    def __init__(self, g_lik: torch.Tensor, g_base: torch.Tensor, beta):
-        self.g_lik = g_lik
-        self.g_base = g_base
-        self.beta = beta
-
-    @cached_property
-    def value(self) -> torch.Tensor:
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:     # per-chain: broadcast over (N, d)
-            beta = beta.reshape(-1, 1)
-        return beta * self.g_lik + self.g_base
-
-    def select(self, mask: torch.Tensor, other: "TemperedGradient") -> "TemperedGradient":
-        """Per-chain select: this gradient's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        m = mask.reshape(mask.shape + (1,) * (self.g_lik.dim() - mask.dim()))
-        return TemperedGradient(
-            torch.where(m, self.g_lik, other.g_lik),
-            torch.where(m, self.g_base, other.g_base),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedGradient":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedGradient(self.g_lik[perm], self.g_base[perm], self.beta)
 
 
 # ====================================================================== #

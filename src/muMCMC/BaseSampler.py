@@ -11,7 +11,7 @@ import pyro
 from pyro.infer.mcmc import MCMC
 from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
 
-from .spaces import TemperedMetric, TemperedPotential, TemperedGradient
+from .spaces import TemperedMetric, TemperedAffine
 
 
 class BaseSampler(ABC):
@@ -84,13 +84,13 @@ class BaseSampler(ABC):
         Returns ``(potential, metric)``, or ``(potential, metric, gradient)``
         when ``grad`` is True:
 
-          - :class:`TemperedPotential` with ``value = beta * U_lik + U_base``,
-            ``U_base = U_prior - log|det dtheta/dz|``.
+          - potential: :class:`TemperedAffine` with ``value = beta * U_lik +
+            U_base``, ``U_base = U_prior - log|det dtheta/dz|``.
           - :class:`TemperedMetric` with ``G_u(beta) = beta * A_lik + A_prior``,
             the likelihood/prior metrics pushed forward to free unconstrained
             coordinates (``None`` when ``requires_metric`` is False).
-          - :class:`TemperedGradient` with ``value = ∂U/∂z``, returned only
-            when ``grad`` is True.  ``grad`` detaches all returned objects.
+          - gradient: :class:`TemperedAffine` with ``value = ∂U/∂z``, returned
+            only when ``grad`` is True.  ``grad`` detaches all returned objects.
 
         Both own their inverse temperature and a ``reorder`` that retempers a
         moved configuration, so a caller keeping them across a temperature
@@ -126,7 +126,7 @@ class BaseSampler(ABC):
             metric = TemperedMetric(A_lik, A_prior, beta)
 
         if not grad:
-            return TemperedPotential(u_likelihood, U_base, beta), metric
+            return TemperedAffine(u_likelihood, U_base, beta), metric
 
         def grad_of(out):
             # U_base is constant in z with no prior and a volume-preserving
@@ -137,21 +137,10 @@ class BaseSampler(ABC):
                                      allow_unused=True)
             return torch.zeros_like(z_free) if g is None else g
 
-        gradient = TemperedGradient(grad_of(u_likelihood).detach(),
-                                    grad_of(U_base).detach(), beta)
-        potential = TemperedPotential(u_likelihood.detach(), U_base.detach(), beta)
+        gradient = TemperedAffine(grad_of(u_likelihood).detach(),
+                                  grad_of(U_base).detach(), beta)
+        potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
-
-    def potential_likelihood(self, z_free: torch.Tensor) -> torch.Tensor:
-        """
-        The likelihood potential ``U_lik = -log p(data | theta(z))``.
-
-        Batched over the leading axis: ``(N, d)`` -> ``(N,)``.
-        """
-        theta_map = self.space.map_to_constrained_vector(z_free)
-        theta_full = self._free_to_full(theta_map.mapped_point)
-        result = self.potential_fn(theta_full)
-        return result[0] if self.requires_metric else result
 
     def _free_to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Free constrained vector -> full constrained vector (with fixed)."""

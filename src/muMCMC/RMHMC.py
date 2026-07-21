@@ -276,7 +276,7 @@ class RMHMCState:
     ------
     q, p : (N, d)
         Position and momentum.
-    U : TemperedPotential or None
+    U : TemperedAffine or None
         Potential at ``q`` (``U.value`` is the ``(N,)`` energy).
     metric : TemperedMetric or None
         Metric at ``q``.  ``U`` and ``metric`` are set at ``init`` / ``accept``

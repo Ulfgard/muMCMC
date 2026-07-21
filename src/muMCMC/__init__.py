@@ -20,9 +20,8 @@ from .SMC import SMC
 from .PT import PT
 from .spaces import (
     ElementwiseTransform,
+    TemperedAffine,
     TemperedMetric,
-    TemperedPotential,
-    TemperedGradient,
     UnconstrainedSpace,
     UniformBoxSpace,
     transforms,
@@ -40,9 +39,8 @@ __all__ = [
     "SMC",
     "PT",
     "ElementwiseTransform",
+    "TemperedAffine",
     "TemperedMetric",
-    "TemperedPotential",
-    "TemperedGradient",
     "UnconstrainedSpace",
     "UniformBoxSpace",
     "transforms",

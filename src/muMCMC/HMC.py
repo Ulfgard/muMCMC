@@ -31,9 +31,9 @@ class HMCState:
     ----------
     q : Tensor, shape (N, d)
         Position in free unconstrained coordinates.
-    U : TemperedPotential
+    U : TemperedAffine
         Potential at ``q``.
-    grad : TemperedGradient
+    grad : TemperedAffine
         Gradient ``∂U/∂q`` at ``q``.
     p : Tensor, shape (N, d), or None
         Momentum, set by ``init_momentum`` and unset between transitions.
