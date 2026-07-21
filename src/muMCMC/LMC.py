@@ -180,13 +180,8 @@ class LMC(BaseSampler):
             G = metric.value                                      # (N, d, d)
 
             # grad phi = grad(U + 1/2 log det G) in one reverse pass.
-            phi = 0.5 * torch.logdet(G)
-            if U.requires_grad:
-                phi = phi + U
-            if phi.requires_grad:
-                (grad_phi,) = torch.autograd.grad(phi.sum(), q, retain_graph=True)
-            else:
-                grad_phi = torch.zeros_like(q)
+            phi = U + 0.5 * torch.logdet(G)
+            (grad_phi,) = torch.autograd.grad(phi.sum(), q, retain_graph=True)
 
             # D = (v . grad) G via double-backward: vjp_c(w) = sum_ab w_ab dG_abc
             # is linear in the seed w, so its derivative contracted with v gives
