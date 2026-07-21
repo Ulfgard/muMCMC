@@ -10,9 +10,7 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
     """Pyro NUTS kernel whose ``diagnostics()`` also returns the adapted
     post-warmup state.
 
-    Pyro adapts a pickled copy of the kernel per worker and aggregates each
-    worker's ``diagnostics()`` dict; the default reports only divergences and
-    acceptance rate.  This adds:
+    Added keys:
 
         step_size:           final adapted step size (post warmup)
         divergences:         post-warmup step indices that diverged
@@ -21,7 +19,7 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
         warmup_steps:        warmup count
         inverse_mass_matrix: adapted IMM at end of warmup (full d-by-d if
                              full_mass else diagonal d-vector)
-        inverse_mass_matrix_site_key: site-name tuple pyro stored the IMM under
+        inverse_mass_matrix_site_key: site-name tuple the IMM is stored under
     """
  
     def diagnostics(self):
@@ -45,16 +43,13 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
 class NUTS(PyroSampler):
     """
     No-U-Turn Sampler with automatic constrained-space reparameterization.
- 
-    Thin wrapper around Pyro's NUTS kernel with the correctly transformed
-    potential, see BaseSampler.  The underlying kernel is a ``_RichDiagNUTS``,
-    so the adapted step size and inverse mass matrix are available per chain
-    via ``sampler.mcmc.diagnostics()``.
+
+    Wraps Pyro's NUTS kernel with the transformed potential.
 
     Parameters
     ----------
     potential_fn : callable
-        Likelihood-only potential.  Takes a vector in coordinates defined by space.
+        Likelihood-only potential over a vector in coordinates defined by space.
     space
         Parameter space object.
     adapt_step_size, adapt_mass_matrix, full_mass, target_accept_prob,

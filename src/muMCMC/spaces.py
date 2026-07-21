@@ -1,17 +1,14 @@
 """
 Parameter spaces and their transforms.
 
-Each space exposes `prior_log_prob_vector`, operating on flat free vectors.
+Each space exposes ``prior_log_prob_vector``, operating on flat free vectors,
+and ``prior_metric``, returning the constrained-space metric contribution of
+the prior as a ``(d_full, d_full)`` SPD tensor, or None when there is no
+contribution.
 
-Each space exposes `prior_metric`, returning the constrained-space metric
-contribution of the prior as a (d_full, d_full) SPD tensor, or None when there
-is no contribution (uniform priors, or unconstrained spaces without an explicit
-prior metric).
-
-`push_forward_metric` pushes a constrained-space metric forward to the free
-unconstrained coordinates; `TemperedAffine` holds a quantity affinely in an
-inverse temperature, so a driver can retemper a moved configuration by
-reordering alone.
+``push_forward_metric`` pushes a constrained-space metric forward to the free
+unconstrained coordinates.  ``TemperedAffine`` holds a quantity affinely in an
+inverse temperature.
 """
 
 from functools import cached_property
@@ -83,12 +80,12 @@ class transforms:
 
     @staticmethod
     def _box(p, p_prime, l, u):
-        """Helper for box <-> unconstrained transform.  Uses tanh:
-            p' = (u+l)/2 + (u-l)/2 * tanh(p)
-            p  = atanh( 2 (p' - (u+l)/2) / (u-l) )
-        Jacobian (in the unconstrained-to-constrained direction):
-            d p' / d p = (u-l)/2 * sech^2(p)
-        so log|d p'/d p| = log((u-l)/2) - 2 log|cosh(p)|.
+        """Box <-> unconstrained tanh transform.
+
+            p'            = (u+l)/2 + (u-l)/2 * tanh(p)
+            p             = atanh( 2 (p' - (u+l)/2) / (u-l) )
+            d p'/d p      = (u-l)/2 * sech^2(p)
+            log|d p'/d p| = log((u-l)/2) - 2 log|cosh(p)|
         """
         scale = (u - l) / 2.0
         log_diag_J = torch.log(scale) - 2.0 * torch.log(torch.cosh(p))
@@ -195,9 +192,8 @@ class TemperedMetric(TemperedAffine):
 
     ``A_lik`` and ``A_prior`` (``lik`` and ``base``) are the likelihood and prior
     metrics pushed forward to free unconstrained coordinates (see
-    ``space.push_forward_metric``); ``A_prior`` is ``None`` when the prior
-    contributes no metric.  ``L`` is computed on first use, so a reorder-only
-    swap costs no factorization.
+    ``space.push_forward_metric``). ``A_prior`` is ``None`` when the prior
+    contributes no metric.
     """
 
     @cached_property
@@ -244,11 +240,8 @@ class UnconstrainedSpace:
             constrained coords as a (d_full, d_full) SPD tensor, accessed via
             ``prior_metric``.  Defaults to None (no contribution).
         fixed : dict[str, float] or None
-            Names to hold fixed (pinned to the given value in this
-            parameterization).  Fixed names are removed from the sampled
-            (free) space but spliced back for model evaluation, and their
-            row/column is projected out of the metric.  None / empty means
-            nothing fixed.
+            Names to hold fixed at the given value.  Removed from the free
+            space.  None or empty means nothing fixed.
         """
         self.names = list(names)
         self.priors = priors
@@ -265,8 +258,8 @@ class UnconstrainedSpace:
         name_to_idx = {yi: i for i, yi in enumerate(self.names)}
         self.free_indices = [name_to_idx[yi] for yi in self._free_names]
         self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
-        # Whether the fixed coordinates are the trailing ones: then the metric
-        # projection is the leading Cholesky block; otherwise a QR is used.
+        # True when fixed coords are trailing. Metric projection then uses the
+        # leading Cholesky block, else a QR.
         self._fixed_are_trailing = (
             len(self.fixed_indices) == 0
             or self.fixed_indices == list(range(self.d, self.d_full))
@@ -311,14 +304,13 @@ class UnconstrainedSpace:
         if self.priors is None:
             raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
         result = 0
-        # Sum over free names only: a fixed coordinate contributes a constant
-        # to the log-prior (irrelevant for sampling) and is absent from y.
+        # Sum over free names only. Fixed coords are absent from y.
         for yi in self._free_names:
             result += self.priors[yi].log_prob(y[yi]).squeeze(-1)
         return result
 
     def prior_log_prob_vector(self, theta_free):
-        """Vector form of prior_log_prob; zero if no prior is configured."""
+        """Prior log-density on a free vector, zero if no prior is configured."""
         if self.priors is None:
             return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
         return self.prior_log_prob(self.from_vector(theta_free))
@@ -330,14 +322,18 @@ class UnconstrainedSpace:
         return self.prior_metric_fn(theta_full)
         
     def push_forward_metric(self, G, theta_map):
-        """Push a constrained-space metric ``G`` (``(N, d_full, d_full)``) forward
-        to the free unconstrained coordinates: restrict to the free block and
-        scale by the diagonal Jacobian ``dθ/dz``.  ``theta_map`` is the z->θ map
-        (``map_to_constrained_vector``).  Returns the dense ``(N, d, d)`` metric.
+        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
+        block ``G_ff``.
 
-        The transform is elementwise (diagonal ``J``), so the free block of the
-        push-forward is the push-forward of the free block -- fixed coordinates
-        do not couple in.
+        Parameters
+        ----------
+        G : Tensor, shape (N, d_full, d_full)
+            Constrained-space metric.
+        theta_map : the z->θ map (``map_to_constrained_vector``).
+
+        Returns
+        -------
+        Tensor, shape (N, d, d)
         """
         dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
         fi = torch.as_tensor(self.free_indices, device=G.device)
@@ -349,10 +345,8 @@ class UnconstrainedSpace:
             raise ValueError("Unconstrained space without priors cannot be sampled from")
         samples = {}
         for yi in self._free_names:
-            # Each name is a single scalar coordinate, so a per-name prior is
-            # univariate.  reshape normalises a trailing singleton (e.g. a prior
-            # built as Normal(zeros(1), ones(1))) and rejects a multivariate
-            # prior, which the space cannot represent.
+            # Per-name prior is univariate. reshape normalises a trailing
+            # singleton and rejects a multivariate prior.
             samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
         return self.add_fixed(samples)
 
@@ -445,8 +439,7 @@ class UniformBoxSpace:
         return transforms.box(z_vec, self.l, self.u)
 
     def prior_log_prob(self, y):
-        # Returns the unnormalized log probability.  With no prior given,
-        # returns zero -- the uniform prior on the box.
+        # Unnormalized log-prior. Zero with no prior (uniform on the box).
         first = next(iter(y.values()))
         result = torch.zeros(first.shape, device=first.device, dtype=first.dtype)
         for yi in self.free_names:
@@ -466,14 +459,18 @@ class UniformBoxSpace:
         return self.prior_metric_fn(theta_full)
         
     def push_forward_metric(self, G, theta_map):
-        """Push a constrained-space metric ``G`` (``(N, d_full, d_full)``) forward
-        to the free unconstrained coordinates: restrict to the free block and
-        scale by the diagonal Jacobian ``dθ/dz``.  ``theta_map`` is the z->θ map
-        (``map_to_constrained_vector``).  Returns the dense ``(N, d, d)`` metric.
+        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
+        block ``G_ff``.
 
-        The transform is elementwise (diagonal ``J``), so the free block of the
-        push-forward is the push-forward of the free block -- fixed coordinates
-        do not couple in.
+        Parameters
+        ----------
+        G : Tensor, shape (N, d_full, d_full)
+            Constrained-space metric.
+        theta_map : the z->θ map (``map_to_constrained_vector``).
+
+        Returns
+        -------
+        Tensor, shape (N, d, d)
         """
         dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
         fi = torch.as_tensor(self.free_indices, device=G.device)
@@ -488,9 +485,8 @@ class UniformBoxSpace:
             samples = {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
             return self.add_fixed(samples)
 
-        # Per-coord rejection sampling: draw from the prior and resample
-        # anything outside its [l, u] so every draw lies in the box.  Coords
-        # are independent (one scalar column per name).
+        # Per-coord rejection sampling: draw from the prior, resample draws
+        # outside [l, u]. Coords are independent.
         dev, dt = self.l.device, self.l.dtype
         samples = {}
         for i, yi in enumerate(self.free_names):

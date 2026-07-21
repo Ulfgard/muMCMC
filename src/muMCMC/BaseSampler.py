@@ -15,44 +15,24 @@ from .spaces import TemperedMetric, TemperedAffine
 
 
 class BaseSampler(ABC):
-    """
-    Base class for MCMC samplers.
+    """Base class for MCMC samplers.
 
-    A sampler exposes a small operator interface that a driver composes into
-    a chain::
-
-        s = init(q)            # initial chain state
-        repeat: s = step(s)    # one transition each
-        end_warmup()           # warmup -> sampling, when the driver decides
-
-    plus the user-facing :meth:`run_mcmc`, which drives that interface and
-    returns constrained-space samples.  ``init`` may also arm a sampler's
-    warmup/adaptation.  Everything else (integrator, acceptance rule,
-    adaptation) is the sampler's own implementation detail.
-
-    Two optional hooks complete the interface, both defaulting to an empty
-    dict: :meth:`logging` (per-step stats surfaced on the progress bar) and
-    :meth:`diagnostics` (post-run, per-chain summaries).  Samplers override
-    them to expose live/standing statistics.
-
-    Posterior evaluation is shared.  The user supplies ``potential_fn`` in
-    **constrained** coordinates while the sampler works in unconstrained
-    space; :meth:`evaluate_model` performs the pull-back and assembles the
-    unconstrained-space potential (and, for metric-based samplers, the
-    metric).  A sampler with different needs may override it.
+    Operator interface: ``init(q)`` returns the initial state, ``step(s)``
+    performs one transition, ``end_warmup()`` switches from warmup to sampling.
+    ``run_mcmc`` drives the interface and returns constrained-space samples.
+    Optional hooks ``logging`` (per-step progress-bar stats) and ``diagnostics``
+    (post-run per-chain summaries) default to ``{}``.
 
     Parameters
     ----------
     potential_fn : callable
-        The model's contribution to the potential, ``U = -log p``, in
-        constrained coordinates.  Its exact signature is method-dependent
-        (see :meth:`evaluate_model`).
+        Model potential ``U = -log p`` in constrained coordinates. Signature is
+        method-dependent (see ``evaluate_model``).
     space
         Parameter space: transforms, free/fixed split, vector<->dict
-        conversions, the prior, and (for metric-based use) the prior metric.
+        conversions, prior, and prior metric.
     requires_metric : bool
-        Whether this sampler needs a position-dependent metric.  Subclasses
-        pass it explicitly.
+        Whether the sampler needs a position-dependent metric.
     """
 
     def __init__(
@@ -71,34 +51,36 @@ class BaseSampler(ABC):
         self, z_free: torch.Tensor, beta: Optional[float] = None,
         grad: bool = False,
     ):
-        """
-        Posterior evaluation at the unconstrained free vector ``z`` as
-        tempering-aware objects.
+        """``value = beta * U_lik + U_base``, ``U_base = U_prior - log|det dtheta/dz|``.
 
-        Depending on ``requires_metric`` the user's ``potential_fn`` is:
+        Posterior evaluation at the unconstrained free vector ``z``. The user's
+        ``potential_fn`` is:
 
           requires_metric=False:  potential_fn(theta) -> scalar U_lik
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
               G_lik a (d_full, d_full) SPD metric in constrained coordinates.
 
-        Returns ``(potential, metric)``, or ``(potential, metric, gradient)``
-        when ``grad`` is True:
+        Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential.
 
-          - potential: :class:`TemperedAffine` with ``value = beta * U_lik +
-            U_base``, ``U_base = U_prior - log|det dtheta/dz|``.
-          - :class:`TemperedMetric` with ``G_u(beta) = beta * A_lik + A_prior``,
-            the likelihood/prior metrics pushed forward to free unconstrained
-            coordinates (``None`` when ``requires_metric`` is False).
-          - gradient: :class:`TemperedAffine` with ``value = ∂U/∂z``, returned
-            only when ``grad`` is True.  ``grad`` detaches all returned objects.
+        Parameters
+        ----------
+        z_free : Tensor
+            Unconstrained free vector.
+        beta : float, optional
+            Inverse temperature. Default ``self.beta`` (1.0 = untempered).
+        grad : bool
+            If True, also return the gradient and detach all returned objects.
 
-        Both own their inverse temperature and a ``reorder`` that retempers a
-        moved configuration, so a caller keeping them across a temperature
-        change needs no knowledge of ``beta`` (default ``self.beta``, 1.0 =
-        untempered).  Callers wanting the scalar potential use ``.value``.
-
-        Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential
-        (plus a batched ``TemperedMetric`` in the metric branch).
+        Returns
+        -------
+        potential
+            ``value = beta * U_lik + U_base``.
+        metric
+            ``G_u(beta) = beta * A_lik + A_prior``, likelihood/prior metrics
+            pushed forward to free unconstrained coordinates. ``None`` when
+            ``requires_metric`` is False.
+        gradient
+            ``value = ∂U/∂z``. Returned only when ``grad`` is True.
         """
         if beta is None:
             beta = self.beta
@@ -129,8 +111,8 @@ class BaseSampler(ABC):
             return TemperedAffine(u_likelihood, U_base, beta), metric
 
         def grad_of(out):
-            # U_base is constant in z with no prior and a volume-preserving
-            # transform, so guard the backward.
+            # guard backward: U_base has no grad with no prior and
+            # volume-preserving transform
             if not out.requires_grad:
                 return torch.zeros_like(z_free)
             g, = torch.autograd.grad(out.sum(), z_free, retain_graph=True,
@@ -158,12 +140,12 @@ class BaseSampler(ABC):
     def logging(self) -> dict:
         """Per-step statistics for the progress bar, as a dict of short
         preformatted strings (e.g. ``{"eps": "1.6e-01", "acc. prob": "0.99"}``).
-        Default: empty (no postfix).  Samplers override to surface live stats."""
+        Default ``{}``."""
         return {}
 
     def diagnostics(self) -> dict:
-        """Post-run, per-chain diagnostics (acceptance rate, divergences, ...).
-        Default: empty.  Samplers override to expose standing statistics."""
+        """Post-run per-chain diagnostics (acceptance rate, divergences, ...).
+        Default ``{}``."""
         return {}
 
     def run_mcmc(
@@ -176,25 +158,30 @@ class BaseSampler(ABC):
         disable_progbar: bool = False,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Run MCMC via the own batched driver and return constrained samples.
+        """Run MCMC via the batched driver and return constrained samples.
 
-        Drives the sampler's operator interface directly -- ``init`` then
-        repeated ``step`` -- holding all ``num_chains`` chains in a single
-        batched state (no process spawning).  ``end_warmup`` is called once
-        warmup is done, so ``num_warmup_steps == 0`` is a clean no-op.  Live
-        :meth:`logging` stats are shown on the progress bar.
+        Holds all ``num_chains`` chains in one batched state: ``init``, then
+        repeated ``step``, then ``end_warmup`` once warmup is done. Extra
+        keyword arguments are ignored.
 
-        This driver is single-threaded and batched; multiprocessing knobs do
-        not apply.  Extra keyword arguments are accepted for call-site
-        compatibility and ignored.
+        Parameters
+        ----------
+        initial_params : Tensor
+            Full or free constrained flat vector.
+        num_samples : int
+            Number of post-warmup samples.
+        num_warmup_steps : int
+            Warmup iterations.
+        num_chains : int
+            Number of parallel chains.
+        disable_progbar : bool
+            Disable the progress bar.
 
         Returns
         -------
         dict[str, Tensor]
-            Samples in constrained space, keyed by free parameter name,
-            grouped by chain (shape ``(num_chains, num_samples, ...)``) --
-            the same contract as the Pyro path.
+            Constrained-space samples, keyed by free parameter name, grouped by
+            chain (shape ``(num_chains, num_samples, ...)``).
         """
         # constrained point -> unconstrained free vector, batched over chains
         z_free_init = self._init_z_free(initial_params)
@@ -205,7 +192,7 @@ class BaseSampler(ABC):
         collected = []
         total = num_warmup_steps + num_samples
 
-        # Single tqdm bar; the postfix carries whatever logging() returns.
+        # single tqdm bar, postfix carries logging() output
         bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}{postfix}]"
         with tqdm(total=total, file=sys.stderr, disable=disable_progbar,
                   bar_format=bar_format,
@@ -231,13 +218,11 @@ class BaseSampler(ABC):
 
 
 class PyroSampler(BaseSampler):
-    """
-    BaseSampler specialization that runs through Pyro's ``MCMC`` driver.
+    """BaseSampler specialization running through Pyro's ``MCMC`` driver.
 
-    For kernels that are Pyro ``MCMCKernel`` s driven by Pyro's own
-    multi-chain machinery (e.g. NUTS).  Holds the Pyro-specific logic: the
-    scalar ``_pyro_potential`` bridge and a ``run_mcmc`` that builds and runs
-    a ``pyro.infer.mcmc.MCMC``.
+    For kernels that are Pyro ``MCMCKernel`` s (e.g. NUTS). Provides the scalar
+    ``_pyro_potential`` bridge and a ``run_mcmc`` built on
+    ``pyro.infer.mcmc.MCMC``.
     """
 
     @property
@@ -246,13 +231,15 @@ class PyroSampler(BaseSampler):
         """The Pyro ``MCMCKernel`` driven by Pyro's ``MCMC``."""
         ...
 
+    # ===================================================================== #
+    # A bound method, not a closure, so Pyro can pickle it when spawning
+    # multi-chain workers.
+    # ===================================================================== #
     def _pyro_potential(self, params_dict: dict) -> torch.Tensor:
         """Pyro-compatible scalar potential wrapper.
 
         Pyro's HMC/NUTS kernel calls ``potential_fn(params_dict)`` with a single
-        ``(d,)`` state and expects a scalar back; this lifts it to ``(1, d)``,
-        evaluates, and squeezes back.  A bound method (not a closure) so Pyro
-        can pickle it for multi-chain spawning.  Only valid when
+        ``(d,)`` state and expects a scalar. Only valid when
         ``requires_metric=False``.
         """
         z = params_dict["params"]                  # (d,)
@@ -260,9 +247,9 @@ class PyroSampler(BaseSampler):
         return potential.value.squeeze(0)          # (1,d)->(1,)->()
 
     def diagnostics(self) -> dict:
-        """Per-chain diagnostics in the common schema -- ``accept_rate``,
+        """Per-chain diagnostics in the common schema: ``accept_rate``,
         ``num_divergences``, ``step_size`` (each a ``(num_chains,)`` tensor).
-        Empty before :meth:`run_mcmc` has run.  Full Pyro detail (r_hat, n_eff,
+        Empty before ``run_mcmc`` has run. Full Pyro detail (r_hat, n_eff,
         inverse mass matrix, divergence indices, ...) is available via
         ``self.mcmc.diagnostics()``."""
         mcmc = getattr(self, "mcmc", None)
@@ -315,8 +302,8 @@ class PyroSampler(BaseSampler):
 
         # transform constrained point to unconstrained parameters
         z_free_init = self._init_z_free(initial_params)
-        # Pyro expects initial_params of shape (num_chains, d) for
-        # num_chains > 1; replicate the single anchor across chains.
+        # Pyro expects initial_params of shape (num_chains, d) for num_chains > 1.
+        # replicate the single anchor across chains.
         if num_chains > 1 and z_free_init.dim() == 1:
             z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
@@ -330,8 +317,7 @@ class PyroSampler(BaseSampler):
             mp_context=mp_context,
         )
         mcmc.run()
-        # Stash the MCMC object so callers can read per-chain diagnostics via
-        # self.mcmc.diagnostics().
+        # stash MCMC object for per-chain diagnostics via self.mcmc.diagnostics()
         self.mcmc = mcmc
 
         # Transform back to constrained space.

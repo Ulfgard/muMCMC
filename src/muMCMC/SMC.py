@@ -11,9 +11,13 @@ from .BaseSampler import BaseSampler
 
 
 def _systematic_resample(weights: torch.Tensor) -> torch.Tensor:
-    """Systematic resampling along the last axis of the normalized ``weights``
-    (``(..., M)``) to ``(..., M)`` ancestor indices, drawn with replacement in
-    proportion to them.
+    """Systematic resampling of normalized ``weights`` ``(..., M)`` to ``(..., M)``
+    ancestor indices, with replacement in proportion to the weights.
+
+    Parameters
+    ----------
+    weights : torch.Tensor
+        Normalized weights along the last axis, ``(..., M)``.
     """
     M = weights.shape[-1]
     batch = weights.shape[:-1]
@@ -25,8 +29,13 @@ def _systematic_resample(weights: torch.Tensor) -> torch.Tensor:
 
 
 def _rhat(x: torch.Tensor) -> torch.Tensor:
-    """Gelman-Rubin R-hat across the C populations of ``x`` (``(C, M)``): the
-    ratio of the pooled variance estimate to the within-population variance.
+    """Gelman-Rubin R-hat = sqrt(var_plus / W), with var_plus = (M-1)/M W + B/M,
+    across the C populations of ``x`` ``(C, M)``.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Samples, ``(C, M)`` (C populations, M draws).
     """
     C, M = x.shape
     chain_mean = x.mean(dim=1)
@@ -36,35 +45,42 @@ def _rhat(x: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(var_plus / W)
 
 
+# ===================================================================== #
+# num_chains independent populations run in parallel over the kernel's
+# batch axis, each with its own particles, resampling, and schedule.
+# Independent populations give a between-run estimate of Monte Carlo error:
+# the spread of the log-evidence estimates and R-hat across populations.
+# The likelihood potential for reweighting is read from the kernel state's
+# tempered potential (state.U.lik), grad-free, rather than recomputed. The
+# mutation kernel runs at a fixed step size, its adaptation frozen via
+# end_warmup.
+# ===================================================================== #
+
+
 class SMC:
     """
     Adaptive tempered Sequential Monte Carlo on top of a batched sampler.
 
-    Transports a particle population from the prior (beta=0) to the posterior
-    (beta=1) along ``prior * likelihood**beta``.  Each stage is reweight ->
-    systematic resample -> mutate.  The wrapped ``sampler`` supplies the
-    mutation kernel via its ``init`` / ``step`` / ``beta`` interface; the
-    likelihood potential for reweighting is read from the kernel state's
-    tempered potential (``state.U.lik``).
+    Transports a particle population from the prior (beta = 0) to the posterior
+    (beta = 1) along ``prior * likelihood**beta``, each stage being reweight ->
+    systematic resample -> mutate. Per-chain ``beta_{k+1}`` is bisected so the
+    post-reweighting ESS = ``ess_target * num_particles``. Incremental weights are
+    ``exp(-dbeta * U_lik)`` and the log-evidence accumulates ``LSE(log_w) - log M``.
 
-    ``num_chains`` independent populations are run in parallel over the kernel's
-    batch axis: each has its own particles, resampling, and adaptively-bisected
-    schedule (``beta_{k+1}`` chosen so its post-reweighting ESS equals
-    ``ess_target * num_particles``).  Independent populations give a between-run
-    estimate of Monte Carlo error -- the spread of the log-evidence estimates
-    and R-hat across populations (see :meth:`diagnostics`).  The mutation kernel
-    runs at a fixed step size, its adaptation frozen via ``end_warmup``.
+    The wrapped ``sampler`` supplies the mutation kernel via its
+    ``init`` / ``step`` / ``beta`` interface. The likelihood potential for
+    reweighting is read from the kernel state's tempered potential (``state.U.lik``).
 
     Parameters
     ----------
-    sampler
-        The mutation kernel (a :class:`BaseSampler`).
+    sampler : BaseSampler
+        The mutation kernel.
     ess_target : float
         Post-reweighting ESS as a fraction of the particle count, in (0, 1).
     num_mcmc_steps : int
         Mutation transitions applied per temperature.
     min_dbeta : float
-        Smallest temperature increment, to guarantee progress on peaked targets.
+        Smallest temperature increment.
     """
 
     def __init__(
@@ -93,11 +109,20 @@ class SMC:
 
     def _next_dbeta(self, u_lik: torch.Tensor, max_dbeta: torch.Tensor,
                     max_iter: int = 60) -> torch.Tensor:
-        """Per-chain temperature increment whose post-reweighting ESS equals
-        ``ess_target * M``.  ``u_lik`` is ``(C, M)`` and ``max_dbeta`` ``(C,)``.
-        ESS(d) = exp(2*LSE(-d*u) - LSE(-2*d*u)) is monotone decreasing in ``d``;
-        each chain takes ``max_dbeta`` if it already meets the target, else
-        bisects, floored at ``min_dbeta`` to guarantee progress.
+        """Per-chain temperature increment ``d`` solving
+        ESS(d) = exp(2 LSE(-d u) - LSE(-2 d u)) = ``ess_target * M``.
+
+        ESS is monotone decreasing in ``d``, so each chain takes ``max_dbeta`` if
+        it already meets the target, else bisects, floored at ``min_dbeta``.
+
+        Parameters
+        ----------
+        u_lik : torch.Tensor
+            Likelihood potentials, ``(C, M)``.
+        max_dbeta : torch.Tensor
+            Per-chain upper bound ``1 - beta``, ``(C,)``.
+        max_iter : int
+            Bisection iterations.
         """
         M = u_lik.shape[-1]
         max_dbeta = torch.as_tensor(max_dbeta, dtype=u_lik.dtype, device=u_lik.device)
@@ -127,11 +152,20 @@ class SMC:
         disable_progbar: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Transport ``num_chains`` independent populations of ``num_particles``
-        each from the prior to the posterior (beta = 1) and return the final
-        populations in constrained space, keyed by parameter name, each of
-        shape ``(num_chains, num_particles)``.  Post-run schedule / ESS /
-        evidence / R-hat are available via :meth:`diagnostics`.
+        Transport ``num_chains`` independent populations of ``num_particles`` each
+        from the prior to the posterior (beta = 1). Returns the final populations
+        in constrained space, keyed by parameter name, each ``(num_chains,
+        num_particles)``. Schedule, ESS, evidence, and R-hat are available via
+        :meth:`diagnostics`.
+
+        Parameters
+        ----------
+        num_particles : int
+            Particles per population.
+        num_chains : int
+            Independent populations run in parallel.
+        disable_progbar : bool
+            Suppress the progress bar.
         """
         sampler, space = self.sampler, self.space
         C, M, N = num_chains, num_particles, num_chains * num_particles
@@ -147,7 +181,7 @@ class SMC:
         self._accept = []
         self._log_evidence = torch.zeros(C, dtype=z.dtype, device=z.device)
 
-        # Evaluate the prior population once; the kernel state carries U_lik,
+        # Evaluate the prior population once. The kernel state carries U_lik,
         # so reweighting reads it (grad-free) instead of recomputing.
         sampler.beta = beta.unsqueeze(-1).expand(C, M).reshape(N)
         s = sampler.init(z)
