@@ -249,6 +249,53 @@ class TemperedPotential:
         return TemperedPotential(self.U_lik[perm], self.U_base[perm], self.beta)
 
 
+class TemperedGradient:
+    """
+    Gradient of the potential assembled affinely in an inverse temperature:
+
+        g = beta * g_lik + g_base
+
+    with ``g_lik = ∂U_lik/∂z`` and ``g_base = ∂U_base/∂z``.  ``beta`` is
+    slot-bound, so :meth:`reorder` and :meth:`select` permute or mix
+    ``g_lik``/``g_base`` while leaving ``beta`` in place.  ``value`` is the
+    assembled ``(N, d)`` gradient.
+
+    Parameters
+    ----------
+    g_lik, g_base : Tensor, shape (N, d)
+        Temperature-scaled and temperature-free parts of ``∂U/∂z``.
+    beta : float or Tensor
+        Inverse temperature scaling ``g_lik``.
+    """
+
+    def __init__(self, g_lik: torch.Tensor, g_base: torch.Tensor, beta):
+        self.g_lik = g_lik
+        self.g_base = g_base
+        self.beta = beta
+
+    @cached_property
+    def value(self) -> torch.Tensor:
+        beta = self.beta
+        if torch.is_tensor(beta) and beta.ndim > 0:     # per-chain: broadcast over (N, d)
+            beta = beta.reshape(-1, 1)
+        return beta * self.g_lik + self.g_base
+
+    def select(self, mask: torch.Tensor, other: "TemperedGradient") -> "TemperedGradient":
+        """Per-chain select: this gradient's chains where ``mask`` is True,
+        ``other``'s where False.  Both share the same temperature."""
+        m = mask.reshape(mask.shape + (1,) * (self.g_lik.dim() - mask.dim()))
+        return TemperedGradient(
+            torch.where(m, self.g_lik, other.g_lik),
+            torch.where(m, self.g_base, other.g_base),
+            self.beta,
+        )
+
+    def reorder(self, perm: torch.Tensor) -> "TemperedGradient":
+        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
+        is slot-bound and stays in place, retempering the moved configuration."""
+        return TemperedGradient(self.g_lik[perm], self.g_base[perm], self.beta)
+
+
 # ====================================================================== #
 #  Spaces                                                                #
 # ====================================================================== #
