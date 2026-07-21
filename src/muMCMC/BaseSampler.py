@@ -124,11 +124,18 @@ class BaseSampler(ABC):
         The likelihood potential ``U_lik = -log p(data | theta(z))``.
 
         Batched over the leading axis: ``(N, d)`` -> ``(N,)``.
+
+        This is a value-only quantity -- it feeds SMC weights, PT swap energies
+        and thermodynamic-integration evidence, never a gradient -- so it is
+        evaluated under ``no_grad``.  A trainable ``potential_fn`` (e.g. a neural
+        network with ``requires_grad`` parameters) would otherwise return a graph
+        that callers accumulating ``U_lik`` pin across steps.
         """
-        theta_map = self.space.map_to_constrained_vector(z_free)
-        theta_full = self._free_to_full(theta_map.mapped_point)
-        result = self.potential_fn(theta_full)
-        return result[0] if self.requires_metric else result
+        with torch.no_grad():
+            theta_map = self.space.map_to_constrained_vector(z_free)
+            theta_full = self._free_to_full(theta_map.mapped_point)
+            result = self.potential_fn(theta_full)
+            return result[0] if self.requires_metric else result
 
     def _free_to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Free constrained vector -> full constrained vector (with fixed)."""

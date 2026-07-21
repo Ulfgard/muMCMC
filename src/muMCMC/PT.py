@@ -103,7 +103,7 @@ class PT(BaseSampler):
         L, K, M = self.L, self.K, self.L * self.K
 
         inner = self.sampler.step(s.inner)                 # explore every replica at its temperature
-        u = self.potential_likelihood(inner.q).reshape(L, K)   # U_lik per temperature
+        u = self.potential_likelihood(inner.q).reshape(L, K)   # U_lik per temperature (no grad)
         self._u_lik_sum += u                               # for thermodynamic integration
 
         # even then odd swap sweep, composed into one relabeling of the replicas
