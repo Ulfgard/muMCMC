@@ -356,7 +356,7 @@ class RMHMCState:
 #                         return the initial chain state                       #
 #      step(s) -> state   one transition (num_steps leapfrogs + accept)        #
 #      end_warmup()       freeze step_size to the adapter average              #
-#  with leapfrog_step / accept / _bookkeep as implementation detail.           #
+#  with integration_step / accept / _bookkeep as implementation detail.        #
 #  All chains run in one batched state.                                        #
 #                                                                              #
 #  model_fn is specified in constrained space. BaseSampler adds the            #
@@ -397,7 +397,7 @@ class RMHMC(BaseSampler):
     adaptation_sigma : float
         Perturbation scale of the REINFORCE adapter. Default 0.1.
     fp_max_iter : int
-        Maximum fixed-point iterations per leapfrog substep.
+        Maximum fixed-point iterations per leapfrog substep. Default 100.
     fp_tol : float
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
@@ -423,7 +423,7 @@ class RMHMC(BaseSampler):
         num_steps: int = 10,
         adapt_step_size: bool = True,
         adaptation_sigma: float = 0.1,
-        fp_max_iter: int = 0,
+        fp_max_iter: int = 100,
         fp_tol: float = 1e-8,
         solver: str = "picard",
         anderson_history: int = None,
@@ -431,9 +431,6 @@ class RMHMC(BaseSampler):
         divergence_threshold: float = 100.0
     ):
         super().__init__(potential_fn=model_fn, space=space, requires_metric=True)
-
-        if fp_max_iter == 0:
-            fp_max_iter = 100
 
         # Resolve the string choice into a configured solver.
         if not 0.0 < damping <= 1.0:
@@ -508,23 +505,27 @@ class RMHMC(BaseSampler):
     # ---- Operator interface (composed by run_mcmc) ---------------------- #
     #
     # init(q) -> step -> step -> ...  is the chain. Each step is one
-    # transition (num_steps leapfrog substeps + accept). leapfrog_step is the
-    # HMC-internal substep, not the transition.
+    # transition (num_steps integration substeps + accept). integration_step is
+    # the internal substep, not the transition.
 
     def step(self, s):
         """One chain transition: sample momentum at ``s``, integrate
-        ``num_steps`` leapfrog substeps, then Metropolis accept/reject.
-        The returned state has momentum unset (the next ``step`` samples it)."""
-        s.p = s.metric.sample_momentum()
+        ``num_steps`` steps, then Metropolis accept/reject. The returned state
+        has momentum unset (the next ``step`` samples it)."""
+        s = self.init_momentum(s)
         new = s
         for _ in range(self.num_steps):
-            new = self.leapfrog_step(new)
+            new = self.integration_step(new)
         return self.accept(new, s)
 
-    def leapfrog_step(self, s):
-        """One implicit-midpoint substep.  Returns a new state whose U/metric
-        are ``None`` (the integrator evaluates only at midpoints) and whose
-        trajectory accumulators are carried forward."""
+    def init_momentum(self, s):
+        """Resample the momentum ``p ~ N(0, G(q))`` on ``s`` and return it."""
+        s.p = s.metric.sample_momentum()
+        return s
+
+    def integration_step(self, s):
+        """One implicit-midpoint substep. Returns a new state whose U/metric
+        are ``None`` and whose trajectory accumulators are carried forward."""
         q, p, fp_it, residual = _implicit_midpoint_step(
             s.q, s.p, self.step_size,
             self.evaluate_model,

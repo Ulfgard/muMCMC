@@ -154,17 +154,17 @@ def test_accept_leaves_momentum_unset():
 #  step: composes num_steps leapfrogs + accept                               #
 # ========================================================================== #
 
-def test_step_runs_exactly_num_steps_leapfrogs():
+def test_step_runs_exactly_num_steps_integration_steps():
     s = make_sampler(adapt=False, num_steps=4)
     state = s.init(torch.zeros(2, D))
     calls = {"n": 0}
-    original = s.leapfrog_step
+    original = s.integration_step
 
     def counting(x):
         calls["n"] += 1
         return original(x)
 
-    s.leapfrog_step = counting
+    s.integration_step = counting
     s.step(state)
     assert calls["n"] == 4
 
