@@ -3,8 +3,9 @@
 A minimal library implementing HMC variants using pytorch. Samplers are batched
 and can thus handle parallel chains naturally.
 
-Currently implemented are  **Riemannian Manifold HMC**, **Euclidean HMC**, and
-**NUTS** samplers over constrained parameter spaces, built on PyTorch and Pyro.
+Currently implemented are  **Riemannian Manifold HMC**, **Euclidean HMC**,
+**Lagrangian MC**, and **NUTS** samplers over constrained parameter spaces,
+built on PyTorch and Pyro.
 
 You write your model in **constrained** coordinates; the sampler works in an
 unconstrained space via a `space` object that owns the transform, the prior,
@@ -108,11 +109,31 @@ samples = sampler.run_mcmc(
 print(sampler.diagnostics()["accept_rate"])  # per-chain tensor, shape (4,)
 ```
 
-The mass matrix `M` defaults to the identity; pass `mass_matrix=` a `(d,)`
-tensor for a diagonal `M` or a `(d, d)` SPD tensor for a dense one, over the
-free-parameter dimension `d`. The trajectory length is `step_size * num_steps`;
-too long a trajectory resonates on near-Gaussian targets, so tune `num_steps`
-alongside the step size.
+The mass matrix `M` defaults to the identity; pass `mass_matrix=` a `(d, d)` SPD
+tensor over the free-parameter dimension `d`. The trajectory length is
+`step_size * num_steps`; too long a trajectory resonates on near-Gaussian
+targets, so tune `num_steps` alongside the step size.
+
+### LMC
+
+`LMC` is the explicit Lagrangian variant of RMHMC (Lan, Stathopoulos, Shahbaba &
+Girolami, *Markov Chain Monte Carlo from Lagrangian Dynamics*, 2015). It uses the
+same `(U, G)` model contract, but samples the velocity `v = G⁻¹p` and integrates
+the geodesic flow with a fully explicit integrator — a `d × d` linear solve per
+half-kick, no fixed-point iteration. The map is not volume-preserving, so a
+Jacobian term corrects the Metropolis test. The step size is adapted by dual
+averaging toward `target_accept_prob`.
+
+```python
+from muMCMC import LMC
+
+sampler = LMC(model, space, step_size=0.3, num_steps=5)   # model returns (U, G)
+samples = sampler.run_mcmc(
+    torch.zeros(2), num_samples=1000, num_warmup_steps=500, num_chains=4,
+)
+```
+
+With a constant metric `G`, LMC reduces exactly to `HMC` with mass matrix `G`.
 
 ### NUTS
 
@@ -154,6 +175,7 @@ src/muMCMC/
     BaseSampler.py   # general base + own batched driver; PyroSampler subclass
     RMHMC.py         # Riemannian Manifold HMC (integrator + sampler)
     HMC.py           # Euclidean HMC (explicit leapfrog, constant mass matrix)
+    LMC.py           # explicit Lagrangian MC (velocity variant of RMHMC)
     NUTS.py          # Pyro NUTS with constrained-space reparameterization
     spaces.py        # transforms, prior/metric pull-back, free/fixed split
     adapters.py      # dual-averaging + derivative-free (REINFORCE) optimizer
