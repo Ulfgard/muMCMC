@@ -36,8 +36,10 @@ from .adapters import DualAveraging
 #                                                                              #
 #      alpha = min(1, exp(E_old - E_new) * det J).                             #
 #                                                                              #
-#  Gamma and Omega come from grad U and dG_abc = d G_ab / d q_c (first-order   #
-#  autodiff through G): Gamma^k_ij = 1/2 sum_l G^kl (dG_jli + dG_ilj - dG_ijl).#
+#  phi = U + 1/2 log det G, so grad phi is one backward pass.  Omega is built  #
+#  directly, without the rank-3 Christoffel tensor: with w = G v and v fixed,  #
+#  J = dw/dq is one batched reverse pass, D = (v . grad) G a double-backward,  #
+#  and Omega(v) = 1/2 G^-1 (D + J - J^T).                                      #
 #                                                                              #
 #  With G constant Omega and the Jacobian vanish and LMC reduces to HMC with   #
 #  mass matrix G.                                                              #
@@ -162,10 +164,13 @@ class LMC(BaseSampler):
     # ---- Geometry ----------------------------------------------------------- #
 
     def _geometry(self, q):
-        """Christoffel tensor and force term at ``q``. Returns
-        ``(gamma, ginv_grad_phi)`` with ``gamma[n,k,i,j] = Gamma^k_ij`` and
-        ``ginv_grad_phi = G^-1 grad phi``, ``phi = U + 1/2 log det G``. Both
-        detached; derivatives come from first-order autodiff through ``G``.
+        """Force term and velocity operator at ``q``. Returns
+        ``(ginv_grad_phi, omega)`` with ``ginv_grad_phi = G^-1 grad phi``,
+        ``phi = U + 1/2 log det G``, and a closure ``omega(v)`` returning the
+        matrix ``Omega(v) = 1/2 G^-1 (D + J - J^T)``, shape ``(N, d, d)``, where
+        ``J = d(G v)/dq`` and ``D = (v . grad) G``. The closure differentiates
+        through ``G`` on a retained graph, so each ``Omega`` is one batched
+        reverse pass plus one double-backward, with no rank-3 tensor.
         """
         N, d = q.shape
         q = q.detach().requires_grad_(True)
@@ -174,51 +179,59 @@ class LMC(BaseSampler):
             U = potential.value                                   # (N,)
             G = metric.value                                      # (N, d, d)
 
-            def grad_or_zero(out):
-                # a constant G (or U) has no grad path in q
-                if not out.requires_grad:
-                    return torch.zeros_like(q)
-                (g,) = torch.autograd.grad(out.sum(), q, retain_graph=True,
-                                           allow_unused=True)
-                return torch.zeros_like(q) if g is None else g
+            # grad phi = grad(U + 1/2 log det G) in one reverse pass.
+            phi = 0.5 * torch.logdet(G)
+            if U.requires_grad:
+                phi = phi + U
+            if phi.requires_grad:
+                (grad_phi,) = torch.autograd.grad(phi.sum(), q, retain_graph=True)
+            else:
+                grad_phi = torch.zeros_like(q)
 
-            gU = grad_or_zero(U)
-            # dG[n, a, b, c] = d G_ab / d q_c
-            cols = [grad_or_zero(G[..., a, b]) for a in range(d) for b in range(d)]
-            dG = torch.stack(cols, dim=1).reshape(N, d, d, d)
-        G, gU, dG = G.detach(), gU.detach(), dG.detach()
+            # D = (v . grad) G via double-backward: vjp_c(w) = sum_ab w_ab dG_abc
+            # is linear in the seed w, so its derivative contracted with v gives
+            # sum_c v_c dG_abc, without materialising dG_abc.
+            if G.requires_grad:
+                seed = torch.zeros_like(G, requires_grad=True)
+                (vjp,) = torch.autograd.grad(G, q, grad_outputs=seed,
+                                             create_graph=True, retain_graph=True)
+            else:
+                seed = vjp = None
 
-        Ginv = torch.linalg.inv(G)                                # (N, d, d)
-        # grad(U + 1/2 log det G): grad log det G_c = sum_ab Ginv_ab dG_abc
-        grad_phi = gU + 0.5 * torch.einsum("nab,nabc->nc", Ginv, dG)
+        Ginv = torch.linalg.inv(G.detach())                       # (N, d, d)
+        ginv_grad_phi = torch.einsum("nkl,nl->nk", Ginv, grad_phi.detach())
 
-        # Gamma^k_ij = 1/2 sum_l Ginv_kl (dG_jli + dG_ilj - dG_ijl)
-        T = (dG.permute(0, 3, 1, 2)                               # [n,i,j,l]=dG_jli
-             + dG.permute(0, 1, 3, 2)                             # [n,i,j,l]=dG_ilj
-             - dG)                                                # [n,i,j,l]=dG_ijl
-        gamma = 0.5 * torch.einsum("nkl,nijl->nkij", Ginv, T)     # (N, d, d, d)
-        return gamma, torch.einsum("nkl,nl->nk", Ginv, grad_phi)
+        units = torch.eye(d, dtype=q.dtype, device=q.device)[:, None, :].expand(d, N, d)
 
-    @staticmethod
-    def _omega(gamma, v):
-        """Return the matrix ``Omega(v)_ij = sum_k v_k Gamma^i_kj``, ``(N, d, d)``."""
-        return torch.einsum("nkij,ni->nkj", gamma, v)
+        def omega(v):
+            if vjp is None:                                       # G constant: Omega = 0
+                return torch.zeros(N, d, d, dtype=q.dtype, device=q.device)
+            Gv = (G @ v[..., None])[..., 0]                       # (N, d)
+            (jac,) = torch.autograd.grad(Gv, q, grad_outputs=units,
+                                         is_grads_batched=True, retain_graph=True)
+            J = jac.permute(1, 0, 2)                              # J_lj = d(Gv)_l/dq_j
+            (D,) = torch.autograd.grad(vjp, seed, grad_outputs=v, retain_graph=True)
+            S = D + J - J.transpose(-1, -2)
+            return 0.5 * torch.einsum("nkl,nlj->nkj", Ginv, S)
 
-    def _half_kick(self, gamma, ginv_grad_phi, v):
+        return ginv_grad_phi, omega
+
+    def _half_kick(self, omega, ginv_grad_phi, v):
         """Explicit half-kick (Lan et al. eq 12/14) at fixed geometry.
 
         Returns ``(v_out, dlogdet)`` with
         ``v_out = [I + (eps/2) Omega(v)]^-1 (v - (eps/2) G^-1 grad phi)`` and
         ``dlogdet = log det(I - (eps/2) Omega(v_out)) - log det(I + (eps/2) Omega(v))``
         (nan if either determinant is non-positive, tripping a divergence).
+        ``omega`` is the closure returned by :meth:`_geometry`.
         """
         d = v.shape[-1]
         eye = torch.eye(d, dtype=v.dtype, device=v.device)
         half = 0.5 * self.step_size.view(-1, 1, 1)
-        A = eye + half * self._omega(gamma, v)
+        A = eye + half * omega(v)
         rhs = v - 0.5 * self.step_size.unsqueeze(-1) * ginv_grad_phi
         v_out = torch.linalg.solve(A, rhs[..., None])[..., 0]
-        dlogdet = (torch.log(torch.linalg.det(eye - half * self._omega(gamma, v_out)))
+        dlogdet = (torch.log(torch.linalg.det(eye - half * omega(v_out)))
                    - torch.log(torch.linalg.det(A)))
         return v_out, dlogdet
 
@@ -275,11 +288,11 @@ class LMC(BaseSampler):
         """One explicit geodesic leapfrog step. Returns a new state carrying the
         endpoint position, velocity, and the accumulated Jacobian."""
         eps = self.step_size.unsqueeze(-1)                    # (N, 1)
-        gamma0, gphi0 = self._geometry(s.q)
-        v_half, ld0 = self._half_kick(gamma0, gphi0, s.v)     # eq (12)
+        gphi0, omega0 = self._geometry(s.q)
+        v_half, ld0 = self._half_kick(omega0, gphi0, s.v)     # eq (12)
         q_new = s.q + eps * v_half                            # eq (13)
-        gamma1, gphi1 = self._geometry(q_new)
-        v_new, ld1 = self._half_kick(gamma1, gphi1, v_half)   # eq (14)
+        gphi1, omega1 = self._geometry(q_new)
+        v_new, ld1 = self._half_kick(omega1, gphi1, v_half)   # eq (14)
         return LMCState(q_new, v_new, None, None, s.log_jac + ld0 + ld1)
 
     def accept(self, new, old):
