@@ -31,9 +31,9 @@ class HMCState:
     ----------
     q : Tensor, shape (N, d)
         Position in free unconstrained coordinates.
-    U : TemperedPotential
+    U : TemperedAffine
         Potential at ``q``.
-    grad : TemperedGradient
+    grad : TemperedAffine
         Gradient ``∂U/∂q`` at ``q``.
     p : Tensor, shape (N, d), or None
         Momentum, set by ``init_momentum`` and unset between transitions.
@@ -134,8 +134,7 @@ class HMC(BaseSampler):
 
     def _setup_mass(self, d, dtype, device):
         """Cholesky-factor the mass matrix (identity when unspecified) for a
-        ``d``-dim free space.  Called once per run from ``init``.
-        """
+        ``d``-dim free space."""
         if self._mass_matrix is None:
             M = torch.eye(d, dtype=dtype, device=device)
         else:
@@ -214,9 +213,8 @@ class HMC(BaseSampler):
     def accept(self, new, old):
         """Per-chain Metropolis accept/reject between the trajectory endpoint
         ``new`` and its start ``old``, plus bookkeeping and (while adapting) the
-        step-size update.  Returns the chosen state with potential / gradient
-        mixed per chain via their ``select`` and momentum unset -- the next
-        ``step`` samples it."""
+        step-size update.  Returns the chosen state with potential and gradient
+        mixed per chain and the momentum unset."""
         H_new = new.U.value + self._kinetic(new.p)
         H_old = old.U.value + self._kinetic(old.p)
         delta_H_raw = H_new - H_old

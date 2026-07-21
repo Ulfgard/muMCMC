@@ -1,10 +1,10 @@
 """Contract tests for the metric pipeline: ``space.push_forward_metric`` and the
-tempering-aware evaluation objects ``TemperedMetric`` / ``TemperedPotential``.
+tempering-aware evaluation objects ``TemperedMetric`` / ``TemperedAffine``.
 
 ``push_forward_metric`` restricts a constrained-space metric to the free block
 and scales by the diagonal Jacobian ``dθ/dz`` (elementwise transforms, so the
 free block of the push-forward is the push-forward of the free block).
-``TemperedMetric`` and ``TemperedPotential`` assemble the metric and potential
+``TemperedMetric`` and ``TemperedAffine`` assemble the metric and potential
 affinely in an inverse temperature; ``beta`` is slot-bound, so a moved
 configuration is retempered to its slot's temperature by ``reorder``/``select``
 alone.
@@ -13,7 +13,7 @@ import torch
 
 from muMCMC.spaces import (
     TemperedMetric,
-    TemperedPotential,
+    TemperedAffine,
     UnconstrainedSpace,
     UniformBoxSpace,
 )
@@ -141,21 +141,21 @@ def test_metric_select_keeps_temperature():
 
 
 # --------------------------------------------------------------------------- #
-#  TemperedPotential                                                          #
+#  TemperedAffine (potential)                                                 #
 # --------------------------------------------------------------------------- #
 
 def test_potential_value():
     torch.manual_seed(8)
     U_lik, U_base = torch.randn(4), torch.randn(4)
     beta = torch.tensor([0.0, 0.3, 0.7, 1.0])
-    assert torch.allclose(TemperedPotential(U_lik, U_base, beta).value, beta * U_lik + U_base)
+    assert torch.allclose(TemperedAffine(U_lik, U_base, beta).value, beta * U_lik + U_base)
 
 
 def test_potential_reorder_retempers():
     torch.manual_seed(9)
     U_lik, U_base = torch.randn(4), torch.randn(4)
     beta = torch.tensor([0.0, 0.3, 0.7, 1.0])
-    pot = TemperedPotential(U_lik, U_base, beta)
+    pot = TemperedAffine(U_lik, U_base, beta)
     perm = torch.tensor([2, 0, 3, 1])
     r = pot.reorder(perm)
     assert torch.allclose(r.value, beta * U_lik[perm] + U_base[perm])
@@ -165,8 +165,8 @@ def test_potential_reorder_retempers():
 def test_potential_select_shares_temperature():
     torch.manual_seed(10)
     beta = torch.tensor([0.2, 0.5, 0.9])
-    a = TemperedPotential(torch.randn(3), torch.randn(3), beta)
-    b = TemperedPotential(torch.randn(3), torch.randn(3), beta)
+    a = TemperedAffine(torch.randn(3), torch.randn(3), beta)
+    b = TemperedAffine(torch.randn(3), torch.randn(3), beta)
     mask = torch.tensor([True, False, True])
     c = a.select(mask, b)
     assert torch.allclose(c.value, torch.where(mask, a.value, b.value))

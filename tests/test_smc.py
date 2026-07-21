@@ -70,24 +70,42 @@ def _ess_at(u_lik, d):
 
 
 # --------------------------------------------------------------------------- #
-#  potential_likelihood: likelihood only                                      #
+#  tempered potential: likelihood-only affine part                            #
 # --------------------------------------------------------------------------- #
 
-def test_potential_likelihood_is_likelihood_only():
+def test_tempered_potential_lik_is_likelihood_only():
     lam, mu = 3.0, 2.0
     space = gaussian_1d_space()
     sampler = RMHMC(gaussian_1d(lam, mu), space, adapt_step_size=False)
     z = torch.tensor([[0.5], [-1.0], [2.0]])
 
-    u_lik = sampler.potential_likelihood(z)
+    potential, _ = sampler.evaluate_model(z, beta=1.0)
+    u_lik = potential.lik                              # temperature-scaled part
     assert u_lik.shape == (3,)
     assert torch.allclose(u_lik, 0.5 * lam * (z[..., 0] - mu) ** 2)
 
-    # evaluate_model's potential adds the N(0,1) prior (no Jacobian in the
-    # identity space): U - U_lik == -log prior == 1/2 z^2 + 1/2 log(2 pi).
-    potential, _ = sampler.evaluate_model(z, beta=1.0)
+    # at beta = 1 the base is the N(0,1) prior (no Jacobian in the identity
+    # space): value - lik == -log prior == 1/2 z^2 + 1/2 log(2 pi).
     u_prior = 0.5 * z[..., 0] ** 2 + 0.5 * math.log(2 * math.pi)
     assert torch.allclose(potential.value - u_lik, u_prior)
+
+
+def test_smc_reweight_is_grad_free_with_grad_requiring_model():
+    # A model closure holding a requires_grad parameter would, under the old
+    # potential_likelihood recompute, build a retained autograd graph that
+    # accumulates into log_evidence. Reading U_lik from the grad-free state
+    # avoids it.
+    torch.manual_seed(0)
+    scale = torch.tensor(3.0, requires_grad=True)
+
+    def model(theta):
+        U = 0.5 * scale * (theta[..., 0] - 2.0) ** 2
+        G = scale * torch.eye(1, dtype=theta.dtype).expand(*theta.shape[:-1], 1, 1)
+        return U, G
+
+    smc = make_smc(model, gaussian_1d_space(), num_mcmc_steps=3)
+    smc.run_smc(200, disable_progbar=True)
+    assert not smc._log_evidence.requires_grad
 
 
 # --------------------------------------------------------------------------- #

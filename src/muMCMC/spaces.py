@@ -1,17 +1,14 @@
 """
 Parameter spaces and their transforms.
 
-Each space exposes `prior_log_prob_vector`, operating on flat free vectors.
+Each space exposes ``prior_log_prob_vector``, operating on flat free vectors,
+and ``prior_metric``, returning the constrained-space metric contribution of
+the prior as a ``(d_full, d_full)`` SPD tensor, or None when there is no
+contribution.
 
-Each space exposes `prior_metric`, returning the constrained-space metric
-contribution of the prior as a (d_full, d_full) SPD tensor, or None when there
-is no contribution (uniform priors, or unconstrained spaces without an explicit
-prior metric).
-
-`push_forward_metric` pushes a constrained-space metric forward to the free
-unconstrained coordinates; `TemperedMetric` and `TemperedPotential` hold the
-pushed-forward metric and the potential affinely in an inverse temperature, so a
-driver can retemper a moved configuration by reordering alone.
+``push_forward_metric`` pushes a constrained-space metric forward to the free
+unconstrained coordinates.  ``TemperedAffine`` holds a quantity affinely in an
+inverse temperature.
 """
 
 from functools import cached_property
@@ -83,12 +80,12 @@ class transforms:
 
     @staticmethod
     def _box(p, p_prime, l, u):
-        """Helper for box <-> unconstrained transform.  Uses tanh:
-            p' = (u+l)/2 + (u-l)/2 * tanh(p)
-            p  = atanh( 2 (p' - (u+l)/2) / (u-l) )
-        Jacobian (in the unconstrained-to-constrained direction):
-            d p' / d p = (u-l)/2 * sech^2(p)
-        so log|d p'/d p| = log((u-l)/2) - 2 log|cosh(p)|.
+        """Box <-> unconstrained tanh transform.
+
+            p'            = (u+l)/2 + (u-l)/2 * tanh(p)
+            p             = atanh( 2 (p' - (u+l)/2) / (u-l) )
+            d p'/d p      = (u-l)/2 * sech^2(p)
+            log|d p'/d p| = log((u-l)/2) - 2 log|cosh(p)|
         """
         scale = (u - l) / 2.0
         log_diag_J = torch.log(scale) - 2.0 * torch.log(torch.cosh(p))
@@ -127,49 +124,85 @@ def _solve_triangular_vec(triag_mat: torch.Tensor, vec: torch.Tensor, upper: boo
     return torch.linalg.solve_triangular(triag_mat, vec[..., None], upper=upper)[..., 0]
 
 
-class TemperedMetric:
+class TemperedAffine:
     """
-    Free-space metric assembled affinely in an inverse temperature:
+    Quantity assembled affinely in an inverse temperature:
 
-        G_u(beta) = beta * A_lik + A_prior
+        value = beta * lik + base
 
-    where ``A_lik`` and ``A_prior`` are the likelihood and prior metrics already
-    pushed forward to free unconstrained coordinates (see
-    ``space.push_forward_metric``), dense ``(N, d, d)`` SPD tensors.  ``beta`` is
-    slot-bound: :meth:`reorder` and :meth:`select` permute or mix the ``A``
-    pieces while leaving ``beta`` in place, so a moved configuration is
-    retempered to its slot's temperature.
-
-    The Cholesky factor ``L`` of ``G_u(beta)`` is computed on first use, so a
-    swap that only reorders costs no factorization.  Operations follow from
-    ``G_u = L Lᵀ``.
+    ``lik`` is the temperature-scaled (likelihood) part and ``base`` the
+    temperature-free part (``None`` when absent).  ``lik`` and ``base`` share a
+    leading batch axis and may carry further trailing feature axes, over which
+    ``beta`` broadcasts.  ``beta`` is slot-bound: :meth:`select` and
+    :meth:`reorder` mix or permute ``lik``/``base`` along the batch axis while
+    leaving ``beta`` in place, so a moved configuration is retempered to its
+    slot's temperature.
 
     Parameters
     ----------
-    A_lik : Tensor (N, d, d)
-        Pushed-forward likelihood metric, scaled by ``beta``.
-    A_prior : Tensor (N, d, d) or None
-        Pushed-forward prior metric, untempered.
+    lik : Tensor, shape (N, *feat)
+        Temperature-scaled part.
+    base : Tensor, shape (N, *feat), or None
+        Temperature-free part.
     beta : float or Tensor
-        Inverse temperature scaling ``A_lik``.
+        Inverse temperature scaling ``lik``.
     """
 
-    def __init__(self, A_lik: torch.Tensor, A_prior, beta):
-        self.A_lik = A_lik
-        self.A_prior = A_prior
+    def __init__(self, lik: torch.Tensor, base, beta):
+        self.lik = lik
+        self.base = base
         self.beta = beta
+
+    def _beta_bcast(self):
+        """``beta`` reshaped to broadcast over ``lik``'s trailing feature axes."""
+        beta = self.beta
+        if torch.is_tensor(beta) and beta.ndim > 0:
+            beta = beta.reshape((-1,) + (1,) * (self.lik.dim() - 1))
+        return beta
+
+    @cached_property
+    def value(self) -> torch.Tensor:
+        v = self._beta_bcast() * self.lik
+        return v if self.base is None else v + self.base
+
+    def select(self, mask: torch.Tensor, other: "TemperedAffine") -> "TemperedAffine":
+        """This quantity where ``mask`` is True, ``other`` where False, per batch
+        element.  Both share the same temperature."""
+        m = mask.reshape(mask.shape + (1,) * (self.lik.dim() - mask.dim()))
+        return type(self)(
+            torch.where(m, self.lik, other.lik),
+            None if self.base is None else torch.where(m, self.base, other.base),
+            self.beta,
+        )
+
+    def reorder(self, perm: torch.Tensor) -> "TemperedAffine":
+        """Permute the batch axis: row ``i`` of the result is row ``perm[i]``.
+        ``beta`` is slot-bound and stays in place."""
+        return type(self)(
+            self.lik[perm],
+            None if self.base is None else self.base[perm],
+            self.beta,
+        )
+
+
+class TemperedMetric(TemperedAffine):
+    """
+    Free-space metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD
+    :attr:`value` whose operations are built from its Cholesky factor ``G = L Lᵀ``.
+
+    ``A_lik`` and ``A_prior`` (``lik`` and ``base``) are the likelihood and prior
+    metrics pushed forward to free unconstrained coordinates (see
+    ``space.push_forward_metric``). ``A_prior`` is ``None`` when the prior
+    contributes no metric.
+    """
 
     @cached_property
     def L(self) -> torch.Tensor:
-        """Lower-triangular Cholesky factor of ``G_u(beta)``, positive diagonal."""
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:     # per-chain: broadcast over (N, d, d)
-            beta = beta.reshape(-1, 1, 1)
-        G = beta * self.A_lik if self.A_prior is None else beta * self.A_lik + self.A_prior
-        return torch.linalg.cholesky(G)
+        """Lower-triangular Cholesky factor of :attr:`value`, positive diagonal."""
+        return torch.linalg.cholesky(self.value)
 
     def inv_metric_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """G_u⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
+        """G⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
         return _solve_triangular_vec(
             self.L.transpose(-2, -1),
             _solve_triangular_vec(self.L, v, upper=False),
@@ -177,123 +210,13 @@ class TemperedMetric:
         )
 
     def log_det_metric(self) -> torch.Tensor:
-        """log det G_u = 2 Σ log|diag L|."""
+        """log det G = 2 Σ log|diag L|."""
         return 2.0 * self.L.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)
 
     def sample_momentum(self) -> torch.Tensor:
-        """Sample p ~ N(0, G_u) via p = L ξ, ξ ~ N(0, I)."""
-        xi = torch.randn(self.A_lik.shape[:-1], dtype=self.A_lik.dtype, device=self.A_lik.device)
+        """Sample p ~ N(0, G) via p = L ξ, ξ ~ N(0, I)."""
+        xi = torch.randn(self.lik.shape[:-1], dtype=self.lik.dtype, device=self.lik.device)
         return (self.L @ xi[..., None])[..., 0].detach()
-
-    def select(self, mask: torch.Tensor, other: "TemperedMetric") -> "TemperedMetric":
-        """Per-chain select: this metric's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        m = mask.reshape(mask.shape + (1,) * (self.A_lik.dim() - mask.dim()))
-        return TemperedMetric(
-            torch.where(m, self.A_lik, other.A_lik),
-            None if self.A_prior is None else torch.where(m, self.A_prior, other.A_prior),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedMetric":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedMetric(
-            self.A_lik[perm],
-            None if self.A_prior is None else self.A_prior[perm],
-            self.beta,
-        )
-
-
-class TemperedPotential:
-    """
-    Potential assembled affinely in an inverse temperature:
-
-        U = beta * U_lik + U_base
-
-    with ``U_lik = -log p(data | theta)`` and ``U_base = U_prior - log|det J|``.
-    ``beta`` is slot-bound: :meth:`reorder` and :meth:`select` permute or mix
-    ``U_lik``/``U_base`` while leaving ``beta`` in place, so a moved configuration
-    is retempered to its slot's temperature.  ``value`` is the assembled ``(N,)``
-    potential.
-
-    Parameters
-    ----------
-    U_lik, U_base : Tensor (N,)
-        The temperature-scaled and temperature-free pieces of the potential.
-    beta : float or Tensor
-        Inverse temperature scaling ``U_lik``.
-    """
-
-    def __init__(self, U_lik: torch.Tensor, U_base: torch.Tensor, beta):
-        self.U_lik = U_lik
-        self.U_base = U_base
-        self.beta = beta
-
-    @cached_property
-    def value(self) -> torch.Tensor:
-        return self.beta * self.U_lik + self.U_base
-
-    def select(self, mask: torch.Tensor, other: "TemperedPotential") -> "TemperedPotential":
-        """Per-chain select: this potential's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        return TemperedPotential(
-            torch.where(mask, self.U_lik, other.U_lik),
-            torch.where(mask, self.U_base, other.U_base),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedPotential":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedPotential(self.U_lik[perm], self.U_base[perm], self.beta)
-
-
-class TemperedGradient:
-    """
-    Gradient of the potential assembled affinely in an inverse temperature:
-
-        g = beta * g_lik + g_base
-
-    with ``g_lik = ∂U_lik/∂z`` and ``g_base = ∂U_base/∂z``.  ``beta`` is
-    slot-bound, so :meth:`reorder` and :meth:`select` permute or mix
-    ``g_lik``/``g_base`` while leaving ``beta`` in place.  ``value`` is the
-    assembled ``(N, d)`` gradient.
-
-    Parameters
-    ----------
-    g_lik, g_base : Tensor, shape (N, d)
-        Temperature-scaled and temperature-free parts of ``∂U/∂z``.
-    beta : float or Tensor
-        Inverse temperature scaling ``g_lik``.
-    """
-
-    def __init__(self, g_lik: torch.Tensor, g_base: torch.Tensor, beta):
-        self.g_lik = g_lik
-        self.g_base = g_base
-        self.beta = beta
-
-    @cached_property
-    def value(self) -> torch.Tensor:
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:     # per-chain: broadcast over (N, d)
-            beta = beta.reshape(-1, 1)
-        return beta * self.g_lik + self.g_base
-
-    def select(self, mask: torch.Tensor, other: "TemperedGradient") -> "TemperedGradient":
-        """Per-chain select: this gradient's chains where ``mask`` is True,
-        ``other``'s where False.  Both share the same temperature."""
-        m = mask.reshape(mask.shape + (1,) * (self.g_lik.dim() - mask.dim()))
-        return TemperedGradient(
-            torch.where(m, self.g_lik, other.g_lik),
-            torch.where(m, self.g_base, other.g_base),
-            self.beta,
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "TemperedGradient":
-        """Permute chains: row ``i`` of the result is row ``perm[i]``.  ``beta``
-        is slot-bound and stays in place, retempering the moved configuration."""
-        return TemperedGradient(self.g_lik[perm], self.g_base[perm], self.beta)
 
 
 # ====================================================================== #
@@ -317,11 +240,8 @@ class UnconstrainedSpace:
             constrained coords as a (d_full, d_full) SPD tensor, accessed via
             ``prior_metric``.  Defaults to None (no contribution).
         fixed : dict[str, float] or None
-            Names to hold fixed (pinned to the given value in this
-            parameterization).  Fixed names are removed from the sampled
-            (free) space but spliced back for model evaluation, and their
-            row/column is projected out of the metric.  None / empty means
-            nothing fixed.
+            Names to hold fixed at the given value.  Removed from the free
+            space.  None or empty means nothing fixed.
         """
         self.names = list(names)
         self.priors = priors
@@ -338,8 +258,8 @@ class UnconstrainedSpace:
         name_to_idx = {yi: i for i, yi in enumerate(self.names)}
         self.free_indices = [name_to_idx[yi] for yi in self._free_names]
         self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
-        # Whether the fixed coordinates are the trailing ones: then the metric
-        # projection is the leading Cholesky block; otherwise a QR is used.
+        # True when fixed coords are trailing. Metric projection then uses the
+        # leading Cholesky block, else a QR.
         self._fixed_are_trailing = (
             len(self.fixed_indices) == 0
             or self.fixed_indices == list(range(self.d, self.d_full))
@@ -384,14 +304,13 @@ class UnconstrainedSpace:
         if self.priors is None:
             raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
         result = 0
-        # Sum over free names only: a fixed coordinate contributes a constant
-        # to the log-prior (irrelevant for sampling) and is absent from y.
+        # Sum over free names only. Fixed coords are absent from y.
         for yi in self._free_names:
             result += self.priors[yi].log_prob(y[yi]).squeeze(-1)
         return result
 
     def prior_log_prob_vector(self, theta_free):
-        """Vector form of prior_log_prob; zero if no prior is configured."""
+        """Prior log-density on a free vector, zero if no prior is configured."""
         if self.priors is None:
             return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
         return self.prior_log_prob(self.from_vector(theta_free))
@@ -403,14 +322,18 @@ class UnconstrainedSpace:
         return self.prior_metric_fn(theta_full)
         
     def push_forward_metric(self, G, theta_map):
-        """Push a constrained-space metric ``G`` (``(N, d_full, d_full)``) forward
-        to the free unconstrained coordinates: restrict to the free block and
-        scale by the diagonal Jacobian ``dθ/dz``.  ``theta_map`` is the z->θ map
-        (``map_to_constrained_vector``).  Returns the dense ``(N, d, d)`` metric.
+        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
+        block ``G_ff``.
 
-        The transform is elementwise (diagonal ``J``), so the free block of the
-        push-forward is the push-forward of the free block -- fixed coordinates
-        do not couple in.
+        Parameters
+        ----------
+        G : Tensor, shape (N, d_full, d_full)
+            Constrained-space metric.
+        theta_map : the z->θ map (``map_to_constrained_vector``).
+
+        Returns
+        -------
+        Tensor, shape (N, d, d)
         """
         dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
         fi = torch.as_tensor(self.free_indices, device=G.device)
@@ -422,10 +345,8 @@ class UnconstrainedSpace:
             raise ValueError("Unconstrained space without priors cannot be sampled from")
         samples = {}
         for yi in self._free_names:
-            # Each name is a single scalar coordinate, so a per-name prior is
-            # univariate.  reshape normalises a trailing singleton (e.g. a prior
-            # built as Normal(zeros(1), ones(1))) and rejects a multivariate
-            # prior, which the space cannot represent.
+            # Per-name prior is univariate. reshape normalises a trailing
+            # singleton and rejects a multivariate prior.
             samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
         return self.add_fixed(samples)
 
@@ -518,8 +439,7 @@ class UniformBoxSpace:
         return transforms.box(z_vec, self.l, self.u)
 
     def prior_log_prob(self, y):
-        # Returns the unnormalized log probability.  With no prior given,
-        # returns zero -- the uniform prior on the box.
+        # Unnormalized log-prior. Zero with no prior (uniform on the box).
         first = next(iter(y.values()))
         result = torch.zeros(first.shape, device=first.device, dtype=first.dtype)
         for yi in self.free_names:
@@ -539,14 +459,18 @@ class UniformBoxSpace:
         return self.prior_metric_fn(theta_full)
         
     def push_forward_metric(self, G, theta_map):
-        """Push a constrained-space metric ``G`` (``(N, d_full, d_full)``) forward
-        to the free unconstrained coordinates: restrict to the free block and
-        scale by the diagonal Jacobian ``dθ/dz``.  ``theta_map`` is the z->θ map
-        (``map_to_constrained_vector``).  Returns the dense ``(N, d, d)`` metric.
+        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
+        block ``G_ff``.
 
-        The transform is elementwise (diagonal ``J``), so the free block of the
-        push-forward is the push-forward of the free block -- fixed coordinates
-        do not couple in.
+        Parameters
+        ----------
+        G : Tensor, shape (N, d_full, d_full)
+            Constrained-space metric.
+        theta_map : the z->θ map (``map_to_constrained_vector``).
+
+        Returns
+        -------
+        Tensor, shape (N, d, d)
         """
         dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
         fi = torch.as_tensor(self.free_indices, device=G.device)
@@ -561,9 +485,8 @@ class UniformBoxSpace:
             samples = {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
             return self.add_fixed(samples)
 
-        # Per-coord rejection sampling: draw from the prior and resample
-        # anything outside its [l, u] so every draw lies in the box.  Coords
-        # are independent (one scalar column per name).
+        # Per-coord rejection sampling: draw from the prior, resample draws
+        # outside [l, u]. Coords are independent.
         dev, dt = self.l.device, self.l.dtype
         samples = {}
         for i, yi in enumerate(self.free_names):
