@@ -3,8 +3,8 @@
 A minimal library implementing HMC variants using pytorch. Samplers are batched
 and can thus handle parallel chains naturally.
 
-Currently implemented are  **Riemannian Manifold HMC** and **NUTS** samplers over constrained
-parameter spaces, built on PyTorch and Pyro.
+Currently implemented are  **Riemannian Manifold HMC**, **Euclidean HMC**, and
+**NUTS** samplers over constrained parameter spaces, built on PyTorch and Pyro.
 
 You write your model in **constrained** coordinates; the sampler works in an
 unconstrained space via a `space` object that owns the transform, the prior,
@@ -88,6 +88,32 @@ sampler = RMHMC(model, space, step_size=0.3, num_steps=8,
                 damping=0.8)                  # β < 1 for extra stability
 ```
 
+### HMC
+
+`HMC` is Euclidean Hamiltonian Monte Carlo with an explicit leapfrog and a
+constant mass matrix. It takes only the scalar likelihood potential (no metric,
+same contract as `NUTS`) and adapts the step size by dual averaging toward
+`target_accept_prob`:
+
+```python
+from muMCMC import HMC
+
+def logp(theta):
+    return 0.5 * (theta ** 2).sum(-1)
+
+sampler = HMC(logp, space, step_size=0.2, num_steps=5)
+samples = sampler.run_mcmc(
+    torch.zeros(2), num_samples=1000, num_warmup_steps=500, num_chains=4,
+)
+print(sampler.diagnostics()["accept_rate"])  # per-chain tensor, shape (4,)
+```
+
+The mass matrix `M` defaults to the identity; pass `mass_matrix=` a `(d,)`
+tensor for a diagonal `M` or a `(d, d)` SPD tensor for a dense one, over the
+free-parameter dimension `d`. The trajectory length is `step_size * num_steps`;
+too long a trajectory resonates on near-Gaussian targets, so tune `num_steps`
+alongside the step size.
+
 ### NUTS
 
 `NUTS` takes only the scalar likelihood potential (no metric):
@@ -127,6 +153,7 @@ indices) remains available via `sampler.mcmc.diagnostics()`.
 src/muMCMC/
     BaseSampler.py   # general base + own batched driver; PyroSampler subclass
     RMHMC.py         # Riemannian Manifold HMC (integrator + sampler)
+    HMC.py           # Euclidean HMC (explicit leapfrog, constant mass matrix)
     NUTS.py          # Pyro NUTS with constrained-space reparameterization
     spaces.py        # transforms, prior/metric pull-back, free/fixed split
     adapters.py      # dual-averaging + derivative-free (REINFORCE) optimizer

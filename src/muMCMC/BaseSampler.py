@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -10,7 +11,7 @@ import pyro
 from pyro.infer.mcmc import MCMC
 from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
 
-from .spaces import TemperedMetric, TemperedPotential
+from .spaces import TemperedMetric, TemperedPotential, TemperedGradient
 
 
 class BaseSampler(ABC):
@@ -68,7 +69,8 @@ class BaseSampler(ABC):
 
     def evaluate_model(
         self, z_free: torch.Tensor, beta: Optional[float] = None,
-    ) -> Tuple[TemperedPotential, Optional[TemperedMetric]]:
+        grad: bool = False,
+    ):
         """
         Posterior evaluation at the unconstrained free vector ``z`` as
         tempering-aware objects.
@@ -79,13 +81,16 @@ class BaseSampler(ABC):
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
               G_lik a (d_full, d_full) SPD metric in constrained coordinates.
 
-        Returns ``(potential, metric)``:
+        Returns ``(potential, metric)``, or ``(potential, metric, gradient)``
+        when ``grad`` is True:
 
           - :class:`TemperedPotential` with ``value = beta * U_lik + U_base``,
             ``U_base = U_prior - log|det dtheta/dz|``.
           - :class:`TemperedMetric` with ``G_u(beta) = beta * A_lik + A_prior``,
             the likelihood/prior metrics pushed forward to free unconstrained
             coordinates (``None`` when ``requires_metric`` is False).
+          - :class:`TemperedGradient` with ``value = ∂U/∂z``, returned only
+            when ``grad`` is True.  ``grad`` detaches all returned objects.
 
         Both own their inverse temperature and a ``reorder`` that retempers a
         moved configuration, so a caller keeping them across a temperature
@@ -97,27 +102,45 @@ class BaseSampler(ABC):
         """
         if beta is None:
             beta = self.beta
+        if grad:
+            z_free = z_free.detach().requires_grad_(True)
 
-        theta_map = self.space.map_to_constrained_vector(z_free)
-        theta_free = theta_map.mapped_point
-        theta_full = self._free_to_full(theta_free)
+        with torch.enable_grad() if grad else nullcontext():
+            theta_map = self.space.map_to_constrained_vector(z_free)
+            theta_free = theta_map.mapped_point
+            theta_full = self._free_to_full(theta_free)
 
-        result = self.potential_fn(theta_full)
+            result = self.potential_fn(theta_full)
+            if self.requires_metric:
+                u_likelihood, G_lik = result
+            else:
+                u_likelihood = result
+
+            U_base = -self.space.prior_log_prob_vector(theta_free) - theta_map.jacobian_log_det
+
+        metric = None
         if self.requires_metric:
-            u_likelihood, G_lik = result
-        else:
-            u_likelihood = result
+            G_prior = self.space.prior_metric(theta_full)
+            A_lik = self.space.push_forward_metric(G_lik, theta_map)
+            A_prior = None if G_prior is None else self.space.push_forward_metric(G_prior, theta_map)
+            metric = TemperedMetric(A_lik, A_prior, beta)
 
-        U_base = -self.space.prior_log_prob_vector(theta_free) - theta_map.jacobian_log_det
-        potential = TemperedPotential(u_likelihood, U_base, beta)
+        if not grad:
+            return TemperedPotential(u_likelihood, U_base, beta), metric
 
-        if not self.requires_metric:
-            return potential, None
+        def grad_of(out):
+            # U_base is constant in z with no prior and a volume-preserving
+            # transform, so guard the backward.
+            if not out.requires_grad:
+                return torch.zeros_like(z_free)
+            g, = torch.autograd.grad(out.sum(), z_free, retain_graph=True,
+                                     allow_unused=True)
+            return torch.zeros_like(z_free) if g is None else g
 
-        G_prior = self.space.prior_metric(theta_full)
-        A_lik = self.space.push_forward_metric(G_lik, theta_map)
-        A_prior = None if G_prior is None else self.space.push_forward_metric(G_prior, theta_map)
-        return potential, TemperedMetric(A_lik, A_prior, beta)
+        gradient = TemperedGradient(grad_of(u_likelihood).detach(),
+                                    grad_of(U_base).detach(), beta)
+        potential = TemperedPotential(u_likelihood.detach(), U_base.detach(), beta)
+        return potential, metric, gradient
 
     def potential_likelihood(self, z_free: torch.Tensor) -> torch.Tensor:
         """
