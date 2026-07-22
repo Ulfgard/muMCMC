@@ -1,10 +1,10 @@
 from typing import Callable, Optional
-from collections import OrderedDict
+import math
 
 import torch
 
-from .BaseSampler import BaseSampler
-from .adapters import DualAveraging
+from .HamiltonianSampler import HamiltonianSampler
+from .adapters import DualAveraging, NoAdaptation
 
 # =========================================================================== #
 #                                                                             #
@@ -13,7 +13,7 @@ from .adapters import DualAveraging
 #  Standard HMC with a position-independent mass matrix M.  The leapfrog is   #
 #  explicit and symplectic, so acceptance is the plain energy difference with #
 #  no Jacobian correction.  This is the constant-metric limit of RMHMC and    #
-#  shares the BaseSampler operator interface.                                 #
+#  shares the HamiltonianSampler transition machinery.                        #
 #                                                                             #
 #  The chain state carries q with the momentum p and the potential and its    #
 #  gradient as tempered objects.  A trajectory ends where the next one starts, #
@@ -25,7 +25,8 @@ from .adapters import DualAveraging
 
 
 class HMCState:
-    """Batched HMC state over ``(N,)`` chains.
+    """Batched HMC state over ``(N,)`` chains. Every field is config-bound, so
+    ``reorder`` permutes all of them.
 
     Parameters
     ----------
@@ -34,9 +35,10 @@ class HMCState:
     U : TemperedAffine
         Potential at ``q``.
     grad : TemperedAffine
-        Gradient ``∂U/∂q`` at ``q``.
+        Gradient ``dU/dq`` at ``q``.
     p : Tensor, shape (N, d), or None
-        Momentum, set by ``init_momentum`` and unset between transitions.
+        Momentum. Drawn by ``sample_momentum``; ``None`` only on the initial
+        state before the first step.
     """
 
     def __init__(self, q, U, grad, p=None):
@@ -50,6 +52,17 @@ class HMCState:
         return HMCState(self.q[perm], self.U.reorder(perm), self.grad.reorder(perm),
                         None if self.p is None else self.p[perm])
 
+    def select_accepted(self, accepted: torch.Tensor, other: "HMCState") -> "HMCState":
+        """Per-chain choice between this endpoint (where ``accepted``) and the
+        start ``other``."""
+        pick = accepted.unsqueeze(-1)
+        return HMCState(
+            torch.where(pick, self.q, other.q),
+            self.U.select(accepted, other.U),
+            self.grad.select(accepted, other.grad),
+            torch.where(pick, self.p, other.p),
+        )
+
 
 # =========================================================================== #
 #                                                                             #
@@ -57,12 +70,12 @@ class HMCState:
 #                                                                             #
 # =========================================================================== #
 
-class HMC(BaseSampler):
+class HMC(HamiltonianSampler):
     """Euclidean Hamiltonian Monte Carlo with an explicit leapfrog integrator.
 
     Samples ``q`` under the Hamiltonian
 
-        H(q, p) = U(q) + 1/2 pᵀ M⁻¹ p,
+        H(q, p) = U(q) + 1/2 pT M^-1 p,
 
     with ``U`` the full unconstrained potential assembled by ``BaseSampler``
     and ``M`` a constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The
@@ -108,27 +121,21 @@ class HMC(BaseSampler):
         da_gamma: float = 0.05,
         divergence_threshold: float = 100.0,
     ):
-        super().__init__(potential_fn=model_fn, space=space, requires_metric=False)
-
         if not 0.0 < target_accept_prob < 1.0:
             raise ValueError(
                 f"target_accept_prob must be in (0, 1), got {target_accept_prob}")
 
-        self._step_size_init       = step_size
-        self.step_size             = step_size
-        self.num_steps             = num_steps
-        self._mass_matrix          = mass_matrix
-        self._adapt_step_size      = adapt_step_size
-        self._target_accept        = target_accept_prob
-        self._da_gamma             = da_gamma
-        self._divergence_threshold = divergence_threshold
+        # The adapters work on the log step size; step_size = exp(adapter value).
+        log_eps = math.log(step_size)
+        if adapt_step_size:
+            adapter = DualAveraging(init=log_eps, gamma=da_gamma)
+        else:
+            adapter = NoAdaptation(init=log_eps)
+        super().__init__(model_fn, space, requires_metric=False, num_steps=num_steps,
+                         adapter=adapter, divergence_threshold=divergence_threshold)
 
-    @property
-    def trajectory_length(self):
-        """Mean step size times ``num_steps``."""
-        eps = self.step_size
-        eps = float(eps.mean()) if torch.is_tensor(eps) else eps
-        return eps * self.num_steps
+        self._mass_matrix   = mass_matrix
+        self._target_accept = target_accept_prob
 
     # ---- Mass matrix -------------------------------------------------------- #
 
@@ -142,170 +149,52 @@ class HMC(BaseSampler):
             if M.shape != (d, d):
                 raise ValueError(
                     f"mass_matrix must have shape ({d}, {d}), got {tuple(M.shape)}")
-        self._mass_chol = torch.linalg.cholesky(M)          # M = L Lᵀ
+        self._mass_chol = torch.linalg.cholesky(M)          # M = L LT
 
     def _sample_momentum(self, N, d, dtype, device):
         """Draw ``p ~ N(0, M)``, shape ``(N, d)``."""
         xi = torch.randn(N, d, dtype=dtype, device=device)
-        return (self._mass_chol @ xi[..., None])[..., 0]     # p = L ξ
+        return (self._mass_chol @ xi[..., None])[..., 0]     # p = L xi
 
     def _inv_mass_times(self, p):
-        """Return ``M⁻¹ p``, shape ``(N, d)``."""
+        """Return ``M^-1 p``, shape ``(N, d)``."""
         return torch.cholesky_solve(p[..., None], self._mass_chol)[..., 0]
 
     def _kinetic(self, p):
-        """Return ``1/2 pᵀ M⁻¹ p``, shape ``(N,)``."""
+        """Return ``1/2 pT M^-1 p``, shape ``(N,)``."""
         return 0.5 * (p * self._inv_mass_times(p)).sum(-1)
 
-    # ---- Operator interface (composed by run_mcmc) -------------------------- #
+    # ---- Hooks -------------------------------------------------------------- #
 
-    def init(self, q):
-        """Size the per-chain ``step_size``, mass matrix, adapter, and counters
-        from ``q``, arm adaptation, and return the initial :class:`HMCState`.
-        """
-        N, d = q.shape
-        dtype, device = q.dtype, q.device
-
-        self.step_size = torch.full((N,), float(self._step_size_init),
-                                    dtype=dtype, device=device)
-        self._setup_mass(d, dtype, device)
-
-        self._step = 0
-        self._accepted = torch.zeros(N, dtype=torch.long, device=device)
-        self._num_divergences = torch.zeros(N, dtype=torch.long, device=device)
-        self._reset_diagnostics()
-
-        self._adapting = self._adapt_step_size
-        if self._adapt_step_size:
-            self._adapter = DualAveraging(gamma=self._da_gamma)
-            self._adapter.prox_center = torch.log(self.step_size)
-            self._adapter.reset()
-
+    def build_initial_state(self, q):
+        """Set up the mass matrix and return the initial :class:`HMCState`."""
+        self._setup_mass(q.shape[1], q.dtype, q.device)
         U, _, grad = self.evaluate_model(q, grad=True)
         return HMCState(q, U, grad)
 
-    def step(self, s):
-        """One chain transition: sample momentum at ``s``, integrate
-        ``num_steps`` steps, then Metropolis accept/reject.  The returned state
-        has momentum unset (the next ``step`` samples it)."""
-        s = self.init_momentum(s)
-        new = s
-        for _ in range(self.num_steps):
-            new = self.integration_step(new)
-        return self.accept(new, s)
+    def sample_momentum(self, state):
+        """Draw the momentum ``p ~ N(0, M)`` on ``state``."""
+        N, d = state.q.shape
+        state.p = self._sample_momentum(N, d, state.q.dtype, state.q.device)
+        return state
 
-    def init_momentum(self, s):
-        """Resample the momentum ``p ~ N(0, M)`` on ``s`` and return it."""
-        N, d = s.q.shape
-        s.p = self._sample_momentum(N, d, s.q.dtype, s.q.device)
-        return s
-
-    def integration_step(self, s):
-        """One leapfrog step.  Returns a new state carrying the endpoint
-        position, momentum, and the tempered potential / gradient there."""
-        eps = self.step_size.unsqueeze(-1)          # (N, 1)
-        p = s.p - 0.5 * eps * s.grad.value
-        q = s.q + eps * self._inv_mass_times(p)
+    def integrate(self, state, step_size):
+        """One leapfrog step at ``step_size``. Returns a new state carrying the
+        endpoint position, momentum, and the tempered potential / gradient."""
+        eps = step_size.unsqueeze(-1)               # (N, 1)
+        p = state.p - 0.5 * eps * state.grad.value
+        q = state.q + eps * self._inv_mass_times(p)
         U, _, grad = self.evaluate_model(q, grad=True)
         p = p - 0.5 * eps * grad.value
         return HMCState(q, U, grad, p)
 
-    def accept(self, new, old):
-        """Per-chain Metropolis accept/reject between the trajectory endpoint
-        ``new`` and its start ``old``, plus bookkeeping and (while adapting) the
-        step-size update.  Returns the chosen state with potential and gradient
-        mixed per chain and the momentum unset."""
+    def acceptance_delta(self, new, old):
+        """``delta_H = H(new) - H(old)``; the endpoint potential is already on
+        ``new`` (evaluated by the last leapfrog step)."""
         H_new = new.U.value + self._kinetic(new.p)
         H_old = old.U.value + self._kinetic(old.p)
-        delta_H_raw = H_new - H_old
+        return H_new - H_old
 
-        is_divergent = (~torch.isfinite(delta_H_raw)) \
-            | (delta_H_raw > self._divergence_threshold)
-        # Clamp is for Metropolis-ratio safety only, not accounting.
-        delta_H = torch.where(torch.isfinite(delta_H_raw),
-                              delta_H_raw, delta_H_raw.new_full((), 300.0))
-        delta_H = delta_H.clamp(-300.0, 300.0)
-
-        N = new.q.shape[0]
-        accepted = torch.log(torch.rand(N, device=new.q.device, dtype=new.q.dtype)) < -delta_H
-        chosen_q = torch.where(accepted.unsqueeze(-1), new.q, old.q)
-        chosen_U = new.U.select(accepted, old.U)
-        chosen_grad = new.grad.select(accepted, old.grad)
-
-        # accept_prob = min(1, exp(-delta_H)), forced to 0 on divergence.
-        accept_prob = torch.exp(torch.clamp(-delta_H, max=0.0))
-        accept_prob = torch.where(is_divergent, torch.zeros_like(accept_prob), accept_prob)
-
-        self._bookkeep(accepted, delta_H, is_divergent, accept_prob)
-        return HMCState(chosen_q, chosen_U, chosen_grad)
-
-    def _reset_diagnostics(self):
-        """Zero the running per-chain energy summaries."""
-        N = self.step_size.shape[0]
-        dtype, device = self.step_size.dtype, self.step_size.device
-        z = torch.zeros(N, dtype=dtype, device=device)
-        self._delta_H_last    = z.clone()
-        self._delta_H_abs_sum = z.clone()
-        self._delta_H_abs_max = z.clone()
-
-    def _bookkeep(self, accepted, delta_H, is_divergent, accept_prob):
-        """Fold one transition into the per-chain counters and, while adapting,
-        step the dual-averaging step-size update.
-        """
-        dH = delta_H.detach()
-        self._delta_H_last     = dH
-        self._delta_H_abs_sum += dH.abs()
-        self._delta_H_abs_max  = torch.maximum(self._delta_H_abs_max, dH.abs())
-
-        self._accepted += accepted
-        self._num_divergences += is_divergent.long()
-        self._step += 1
-
-        if self._adapting:
-            # g = target - accept_prob feeds dual averaging on log(step_size).
-            g = self._target_accept - accept_prob
-            self._adapter.step(g)
-            self.step_size = torch.exp(self._adapter.get_state()[0])
-
-    def end_warmup(self):
-        """Freeze ``step_size`` to the dual-averaging running average, stop
-        adapting, and reset the counters for the sampling phase.
-        """
-        if self._adapt_step_size:
-            self.step_size = torch.exp(self._adapter.get_state()[1])
-        self._adapting = False
-        self._accepted = torch.zeros_like(self._accepted)
-        self._num_divergences = torch.zeros_like(self._num_divergences)
-        self._step = 0
-        self._reset_diagnostics()
-
-    def logging(self):
-        """Per-step ``eps`` / ``|dH|`` / ``acc. prob`` strings for the progress
-        bar.
-        """
-        if self._step == 0:
-            return {}
-        eps   = float(self.step_size.mean())
-        dH    = float(self._delta_H_last.abs().max())
-        accpr = float((self._accepted / self._step).mean())
-        return OrderedDict(
-            [
-                ("eps", "{:.2e}".format(eps)),
-                ("|dH|", "{:.2e}".format(dH)),
-                ("acc. prob", "{:.3f}".format(accpr)),
-            ]
-        )
-
-    def diagnostics(self):
-        """Per-chain ``(num_chains,)`` diagnostics: ``accept_rate``,
-        ``num_divergences``, ``step_size``, ``delta_H_abs_mean``,
-        ``delta_H_abs_max``.
-        """
-        steps = max(self._step, 1)
-        return {
-            "accept_rate": self._accepted / steps,
-            "num_divergences": self._num_divergences,
-            "step_size": self.step_size,
-            "delta_H_abs_mean": self._delta_H_abs_sum / steps,
-            "delta_H_abs_max":  self._delta_H_abs_max,
-        }
+    def adapt(self, accept_prob, delta_H):
+        """Dual averaging toward ``target_accept_prob``."""
+        self._step_size_adapter.update(self._target_accept - accept_prob)

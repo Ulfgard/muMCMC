@@ -1,12 +1,11 @@
 from typing import Callable, Tuple
-from collections import OrderedDict
 
 import torch
 import math
 
-from .BaseSampler import BaseSampler
+from .HamiltonianSampler import HamiltonianSampler
 from .spaces import TemperedMetric
-from .adapters import REINFORCEAdapter
+from .adapters import Reinforce, NoAdaptation
 
 # =========================================================================== #
 #                                                                              #
@@ -299,7 +298,10 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
 
 class RMHMCState:
     """
-    Working state of one RMHMC trajectory, batched over (N,) chains.
+    Working state of one RMHMC trajectory, batched over (N,) chains. Purely
+    config-bound: every field travels with the configuration, so ``reorder``
+    permutes all of them (the integrator's residual / iteration diagnostics are
+    slot-bound and live on the sampler instead).
 
     Attributes
     ----------
@@ -310,40 +312,34 @@ class RMHMCState:
         ``init`` / ``accept``, ``None`` after ``step``.
     metric : TemperedMetric or None
         Metric at ``q``. Set at ``init`` / ``accept``, ``None`` after ``step``.
-    max_residual : (N,) or None
-        Running max fixed-point residual over the current trajectory.
-    fp_iters : list of (N,)
-        Per-midpoint-step fixed-point iteration counts for the trajectory.
     """
 
-    def __init__(self, q, p=None, U=None, metric=None,
-                 max_residual=None, fp_iters=None):
+    def __init__(self, q, p=None, U=None, metric=None):
         self.q = q
         self.p = p
         self.U = U
         self.metric = metric
-        self.max_residual = max_residual
-        self.fp_iters = [] if fp_iters is None else fp_iters
 
     def reorder(self, perm):
         """Permute the batch elements by ``perm`` (an ``(N,)`` long index
-        tensor).
-
-        Returns a new state. Absent (None) fields stay None. ``max_residual``
-        and ``fp_iters`` are slot-bound diagnostics and are not permuted.
-
-        Parameters
-        ----------
-        perm : (N,) long
-            Slot ``i`` of the result carries the configuration from ``perm[i]``.
-        """
+        tensor): slot ``i`` of the result carries the configuration from
+        ``perm[i]``. Absent (None) fields stay None."""
         return RMHMCState(
-            q            = self.q[perm],
-            p            = None if self.p is None else self.p[perm],
-            U            = None if self.U is None else self.U.reorder(perm),
-            metric       = None if self.metric is None else self.metric.reorder(perm),
-            max_residual = self.max_residual,   # slot-bound: not permuted
-            fp_iters     = self.fp_iters,       # slot-bound: not permuted
+            q      = self.q[perm],
+            p      = None if self.p is None else self.p[perm],
+            U      = None if self.U is None else self.U.reorder(perm),
+            metric = None if self.metric is None else self.metric.reorder(perm),
+        )
+
+    def select_accepted(self, accepted, other):
+        """Per-chain choice between this endpoint (where ``accepted``) and the
+        start ``other``."""
+        pick = accepted.unsqueeze(-1)
+        return RMHMCState(
+            torch.where(pick, self.q, other.q),
+            torch.where(pick, self.p, other.p),
+            self.U.select(accepted, other.U),
+            self.metric.select(accepted, other.metric),
         )
 
 
@@ -351,13 +347,10 @@ class RMHMCState:
 #                                                                              #
 #  RMHMC sampler                                                               #
 #                                                                              #
-#  Operator interface composed by the driver:                                  #
-#      init(q) -> state   size per-chain step_size/adapter/counters and        #
-#                         return the initial chain state                       #
-#      step(s) -> state   one transition (num_steps leapfrogs + accept)        #
-#      end_warmup()       freeze step_size to the adapter average              #
-#  with integration_step / accept / _bookkeep as implementation detail.        #
-#  All chains run in one batched state.                                        #
+#  The transition machinery (init / step / accept / end_warmup / diagnostics)  #
+#  is inherited from HamiltonianSampler; RMHMC supplies the integrator and      #
+#  energy through the build_initial_state / sample_momentum / integrate /       #
+#  acceptance_delta / adapt hooks. All chains run in one batched state.         #
 #                                                                              #
 #  model_fn is specified in constrained space. BaseSampler adds the            #
 #  prior log-prob and prior metric and pushes the metric forward to free       #
@@ -370,7 +363,7 @@ class RMHMCState:
 #                                                                              #
 # =========================================================================== #
 
-class RMHMC(BaseSampler):
+class RMHMC(HamiltonianSampler):
     """
     Riemannian Manifold HMC with the implicit-midpoint integrator, sampling
     q ~ exp(−U(q)) under the position-dependent metric G(q) with Hamiltonian
@@ -430,8 +423,6 @@ class RMHMC(BaseSampler):
         damping: float = 1.0,
         divergence_threshold: float = 100.0
     ):
-        super().__init__(potential_fn=model_fn, space=space, requires_metric=True)
-
         # Resolve the string choice into a configured solver.
         if not 0.0 < damping <= 1.0:
             raise ValueError(f"damping must be in (0, 1], got {damping}")
@@ -446,253 +437,104 @@ class RMHMC(BaseSampler):
             raise ValueError(
                 f"unknown solver {solver!r}; expected 'picard' or 'anderson'")
 
-        self._step_size_init       = step_size       # scalar, tensorized per-chain in init()
-        self.step_size             = step_size
-        self.num_steps             = num_steps
-        self._adapt_step_size      = adapt_step_size
-        self._adaptation_sigma     = adaptation_sigma
-        self._fp_max_iter          = fp_max_iter
-        self._fp_tol               = fp_tol
-        self._divergence_threshold = divergence_threshold
+        # The adapters work on the log step size; step_size = exp(adapter value).
+        log_eps = math.log(step_size)
+        if adapt_step_size:
+            adapter = Reinforce(sigma=adaptation_sigma, init=log_eps)
+        else:
+            adapter = NoAdaptation(init=log_eps)
+        super().__init__(model_fn, space, requires_metric=True, num_steps=num_steps,
+                         adapter=adapter, divergence_threshold=divergence_threshold)
 
-    @property
-    def trajectory_length(self):
-        eps = self.step_size
-        eps = float(eps.mean()) if torch.is_tensor(eps) else eps
-        return eps * self.num_steps
+        self._fp_max_iter = fp_max_iter
+        self._fp_tol      = fp_tol
 
-    def init(self, q):
-        """Initialize a run and return the initial chain state.
+        # Solver diagnostics. Each transition contributes its worst substep;
+        # the means are then over transitions.
+        self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
+        self.register_diagnostic("residual_max",  lambda: self._residual_max)
+        self.register_diagnostic("fp_iters_mean", lambda: self._fp_iters_sum / max(self._step, 1))
+        self.register_diagnostic("fp_iters_max",  lambda: self._fp_iters_max)
+        self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
-        Sizes the per-chain ``step_size``, adapter, and diagnostic counters
-        from ``q``'s batch, arms adaptation (``_adapting = adapt_step_size``),
-        and builds the initial chain state at ``q`` (model evaluated, residual
-        accumulator zeroed). ``step`` samples the momentum.
-
-        Parameters
-        ----------
-        q : (N, d)
-            Initial positions.
-        """
-        N = q.shape[0]
-        dtype, device = q.dtype, q.device
-
-        # per-chain step size (N,)
-        self.step_size = torch.full((N,), float(self._step_size_init),
-                                    dtype=dtype, device=device)
-
-        # reset running statistics (per-chain where it matters)
-        self._step = 0
-        self._accepted = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
-        self._num_divergences = torch.zeros(N, dtype=torch.long, device=device)  # (N,) count
-        # Running per-chain integrator summaries (O(1) memory), folded in by
-        # _bookkeep each transition.
-        self._reset_diagnostics()
-
-        # arm adaptation, flipped off by end_warmup()
-        self._adapting = self._adapt_step_size
-        if self._adapt_step_size:
-            self._adapter = REINFORCEAdapter(N, self._adaptation_sigma)
-            self._adapter.prox_center = torch.log(self.step_size)   # (N,)
-            self._adapter.reset()
-
+    def build_initial_state(self, q):
+        """Evaluate the model at ``q`` and return the initial :class:`RMHMCState`
+        (momentum drawn later by :meth:`sample_momentum`). Seeds the
+        per-transition solver scratch so the sampler is usable right after init."""
+        z = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
+        self._step_residual = z.clone()
+        self._step_iters    = z.clone()
         with torch.no_grad():
             U, metric = self.evaluate_model(q)
-        s = RMHMCState(q, U=U, metric=metric)
-        s.max_residual = torch.zeros(N, dtype=dtype, device=device)
-        return s
+        return RMHMCState(q, U=U, metric=metric)
 
-    # ---- Operator interface (composed by run_mcmc) ---------------------- #
-    #
-    # init(q) -> step -> step -> ...  is the chain. Each step is one
-    # transition (num_steps integration substeps + accept). integration_step is
-    # the internal substep, not the transition.
+    def sample_momentum(self, state):
+        """Draw the momentum ``p ~ N(0, G(q))`` on ``state`` and reset the
+        per-transition solver scratch (worst residual / iteration count over the
+        transition's substeps), read by :meth:`acceptance_delta` and :meth:`adapt`."""
+        N = state.q.shape[0]
+        z = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
+        self._step_residual = z.clone()
+        self._step_iters    = z.clone()
+        state.p = state.metric.sample_momentum()
+        return state
 
-    def step(self, s):
-        """One chain transition: sample momentum at ``s``, integrate
-        ``num_steps`` steps, then Metropolis accept/reject. The returned state
-        has momentum unset (the next ``step`` samples it)."""
-        s = self.init_momentum(s)
-        new = s
-        for _ in range(self.num_steps):
-            new = self.integration_step(new)
-        return self.accept(new, s)
-
-    def init_momentum(self, s):
-        """Resample the momentum ``p ~ N(0, G(q))`` on ``s`` and return it."""
-        s.p = s.metric.sample_momentum()
-        return s
-
-    def integration_step(self, s):
-        """One implicit-midpoint substep. Returns a new state whose U/metric
-        are ``None`` and whose trajectory accumulators are carried forward."""
+    def integrate(self, state, step_size):
+        """One implicit-midpoint substep at ``step_size``, tracking the worst
+        fixed-point residual and iteration count over the transition's substeps
+        (read by :meth:`acceptance_delta` and :meth:`adapt`)."""
         q, p, fp_it, residual = _implicit_midpoint_step(
-            s.q, s.p, self.step_size,
-            self.evaluate_model,
-            self._fp_max_iter, self._fp_tol,
-            self._solver
-        )
-        out = RMHMCState(q, p)
-        out.max_residual = torch.maximum(s.max_residual, residual)
-        out.fp_iters = s.fp_iters + [fp_it]
-        return out
+            state.q, state.p, step_size, self.evaluate_model,
+            self._fp_max_iter, self._fp_tol, self._solver)
+        it = fp_it.to(step_size.dtype)
+        self._step_residual = torch.maximum(self._step_residual, residual)
+        self._step_iters    = torch.maximum(self._step_iters, it)
+        return RMHMCState(q, p)
 
-    def accept(self, new, old):
-        """Per-chain Metropolis accept/reject between the trajectory endpoint
-        ``new`` and its start ``old``, with bookkeeping and (while adapting)
-        the step-size update. Returns the chosen state with U/metric mixed per
-        chain via their ``select`` (no further model eval) and momentum
-        unset."""
+    def acceptance_delta(self, new, old):
+        """``delta_H = H(new) - H(old)``, forced to +inf where the trajectory's
+        fixed-point solve did not converge (max residual over ``fp_tol``): a
+        non-converged step is not a valid proposal and must be rejected even if
+        its energy change is small. Evaluates the endpoint potential/metric."""
         with torch.no_grad():
-            new.U, new.metric = self.evaluate_model(new.q)   # endpoint eval (1 model eval)
-
+            new.U, new.metric = self.evaluate_model(new.q)
         H_new = _hamiltonian(new.q, new.p, new.U.value, new.metric)   # (N,)
         H_old = _hamiltonian(old.q, old.p, old.U.value, old.metric)   # (N,)
-        delta_H_raw = H_new - H_old                                   # (N,)
+        delta = H_new - H_old
+        # Fold this transition's worst substep into the run-level summaries.
+        self._residual_sum = self._residual_sum + self._step_residual
+        self._residual_max = torch.maximum(self._residual_max, self._step_residual)
+        self._fp_iters_sum = self._fp_iters_sum + self._step_iters
+        self._fp_iters_max = torch.maximum(self._fp_iters_max, self._step_iters)
+        solve_failed = self._step_residual > self._fp_tol
+        return torch.where(solve_failed, delta.new_full((), float("inf")), delta)
 
-        # Divergence: raw delta_H non-finite or over threshold. Clamping below
-        # is for Metropolis-ratio safety only. It does not affect accounting.
-        is_divergent = (~torch.isfinite(delta_H_raw)) | (delta_H_raw > self._divergence_threshold)
-        delta_H = torch.where(torch.isfinite(delta_H_raw),
-                              delta_H_raw, delta_H_raw.new_full((), 300.0))
-        delta_H = delta_H.clamp(-300.0, 300.0)                   # (N,)
+    def adapt(self, accept_prob, delta_H):
+        """Derivative-free (REINFORCE) step-size adaptation from this transition's
+        energy error ``delta_H`` and worst solver residual / iteration count."""
+        # Cost f_t = -log(efficiency), lower = better step size. The efficiency is
+        # accepted travel per solver iteration -- exp(-|dH|) ~ accept prob times
+        # step_size ~ distance over num_iters ~ solver cost -- weighted by
+        # exp(-residual/step_size), an analogous acceptance term for the solver
+        # error. The eta floor (normalised by |log eta|) gives rare failures
+        # large weight.
+        eta = 1.e-3
+        num_iters       = self._step_iters
+        solver_penalty  = torch.exp(-self._step_residual / self.step_size)
+        delta_H_penalty = torch.exp(-delta_H.abs())
+        f_t = (-0.5 * torch.log(
+                    solver_penalty * delta_H_penalty * self.step_size / num_iters + eta
+               ) / abs(math.log(eta)))                                      # (N,)
+        self._step_size_adapter.update(f_t)
 
-        N = new.q.shape[0]
-        accepted = torch.log(torch.rand(N, device=new.q.device, dtype=new.q.dtype)) < -delta_H
-        chosen_q = torch.where(accepted.unsqueeze(-1), new.q, old.q)   # (N, d)
-
-        self._bookkeep(accepted, delta_H, is_divergent, new.max_residual, new.fp_iters)
-
-        # Mix U / metric per chain. Momentum left unset (sampled by step).
-        chosen_U      = new.U.select(accepted, old.U)
-        chosen_metric = new.metric.select(accepted, old.metric)
-        out = RMHMCState(chosen_q, None, chosen_U, chosen_metric)
-        out.max_residual = torch.zeros(N, dtype=chosen_q.dtype, device=chosen_q.device)
-        return out
-
-    def _reset_diagnostics(self):
-        """(Re)initialize the running per-chain integrator summaries to empty.
-
-        Every summary is an ``(N,)`` accumulator sized from ``step_size``.
-        """
+    def reset_extra_diagnostics(self):
+        """Zero the run-level solver summaries. The per-transition scratch
+        (``_step_residual`` / ``_step_iters``) is reset each transition in
+        :meth:`sample_momentum`, so it is left alone here."""
         N = self.step_size.shape[0]
-        dtype, device = self.step_size.dtype, self.step_size.device
-        z = torch.zeros(N, dtype=dtype, device=device)
-        self._delta_H_last     = z.clone()   # most recent delta_H          (logging |dH|)
-        self._delta_H_abs_sum  = z.clone()   # running sum of |delta_H|     (-> mean)
-        self._delta_H_abs_max  = z.clone()   # running max |delta_H|
-        self._residual_last    = z.clone()   # most recent max-residual     (logging |r|)
-        self._residual_sum     = z.clone()   # running sum of max-residual  (-> mean)
-        self._residual_max      = z.clone()  # running max max-residual
-        self._fp_iters_sum     = z.clone()   # running sum of per-transition mean iters (-> mean)
-        self._fp_iters_max     = z.clone()   # running max per-transition worst-substep iters
-
-    def _bookkeep(self, accepted, delta_H, is_divergent, max_residual, fp_iters):
-        # Fold this transition into the O(1) running per-chain summaries.
-        # Everything folded in is detached, so no per-step model graph is
-        # pinned across the run.
-        dH = delta_H.detach()                                         # (N,)
-        fp = torch.stack(fp_iters).to(self.step_size.dtype)           # (num_steps, N)
-        it_mean = fp.mean(0)                                          # (N,) per-substep mean
-        it_max  = fp.amax(0)                                          # (N,) worst substep
-
-        self._delta_H_last     = dH
-        self._delta_H_abs_sum += dH.abs()
-        self._delta_H_abs_max  = torch.maximum(self._delta_H_abs_max, dH.abs())
-        self._residual_last    = max_residual
-        self._residual_sum    += max_residual
-        self._residual_max     = torch.maximum(self._residual_max, max_residual)
-        self._fp_iters_sum    += it_mean
-        self._fp_iters_max     = torch.maximum(self._fp_iters_max, it_max)
-
-        self._accepted += accepted
-        self._step += 1
-        # per-chain divergence count (reset at end_warmup)
-        self._num_divergences += is_divergent.long()
-
-        # step-size adaptation (per chain), while the driver leaves us adapting
-        if self._adapting:
-            # mean fp iters per chain across the trajectory's midpoint steps
-            num_iters = it_mean                                        # (N,), computed above
-            eta = 1.e-3
-
-            # f_t is the per-step cost the adapter minimises (lower = better
-            # step size).  The bracketed product is a per-step efficiency:
-            #     delta_H_penalty * step_size / num_iters
-            # is accepted travel distance per solver iteration (exp(-|dH|) ~
-            # accept prob, step_size ~ distance, num_iters ~ solver cost),
-            # times solver_penalty = exp(-residual/step_size), an analogous
-            # acceptance term for the fixed-point solver error.  Taking -log of
-            # that product (floored at eta, normalised by |log eta|) turns the
-            # efficiency into a cost and gives rare solver/Metropolis failures
-            # large weight.
-            solver_penalty  = torch.exp(-max_residual / self.step_size)        # (N,)
-            delta_H_penalty = torch.exp(-delta_H.abs())                         # (N,)
-            f_t = (-0.5 * torch.log(
-                        solver_penalty * delta_H_penalty * self.step_size / num_iters + eta
-                   ) / abs(math.log(eta)))                                      # (N,)
-
-            self._adapter.step(f_t)
-            self.step_size = torch.exp(self._adapter.get_state()[0])            # (N,)
-
-    def end_warmup(self):
-        """Transition from warmup to sampling: freeze ``step_size`` to the
-        adapter's running average, stop adapting, and reset the diagnostic
-        counters for the sampling phase."""
-        if self._adapt_step_size:
-            # final step size = slow-moving average, per chain
-            self.step_size = torch.exp(self._adapter.get_state()[1])   # (N,)
-        self._adapting = False
-        # restart counters for the sampling phase
-        self._accepted = torch.zeros_like(self._accepted)
-        self._num_divergences = torch.zeros_like(self._num_divergences)
-        self._step = 0
-        self._reset_diagnostics()
-
-    def logging(self):
-        if self._step == 0:
-            return {}
-        # Reduce per-chain stats to scalar summaries for the progress bar:
-        # mean step size / accept prob, worst-chain |dH| and |r|.
-        eps   = float(self.step_size.mean())
-        dH    = float(self._delta_H_last.abs().max())
-        res   = float(self._residual_last.max())
-        accpr = float((self._accepted / self._step).mean())
-        return OrderedDict(
-            [
-                ("eps", "{:.2e}".format(eps)),
-                ("|dH|", "{:.2e}".format(dH)),
-                ("|r|", "{:.2e}".format(res)),
-                ("acc. prob", "{:.3f}".format(accpr)),
-            ]
-        )
-
-    def diagnostics(self):
-        """Per-chain diagnostics, each value a ``(num_chains,)`` tensor.
-
-        Returns
-        -------
-        accept_rate, num_divergences, step_size
-            Common schema.
-        delta_H_abs_mean, delta_H_abs_max
-            Mean / max ``|delta_H|`` over the current phase (reset at
-            ``end_warmup``).
-        residual_mean, residual_max
-            Mean / max fixed-point max-residual per transition.
-        fp_iters_mean, fp_iters_max
-            Mean per-substep iters / worst single substep.
-        """
-        steps = max(self._step, 1)
-        return {
-            "accept_rate": self._accepted / steps,    # (N,) per chain
-            "num_divergences": self._num_divergences,  # (N,) per-chain count
-            "step_size": self.step_size,              # (N,) per chain
-            # RMHMC-specific running summaries, (N,) each:
-            "delta_H_abs_mean": self._delta_H_abs_sum / steps,
-            "delta_H_abs_max":  self._delta_H_abs_max,
-            "residual_mean":    self._residual_sum / steps,
-            "residual_max":     self._residual_max,
-            "fp_iters_mean":    self._fp_iters_sum / steps,
-            "fp_iters_max":     self._fp_iters_max,
-        }
+        z = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
+        self._residual_sum = z.clone()
+        self._residual_max = z.clone()
+        self._fp_iters_sum = z.clone()
+        self._fp_iters_max = z.clone()
 

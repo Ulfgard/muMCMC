@@ -59,9 +59,9 @@ def test_constant_metric_reduces_to_hmc():
     sl.v = (torch.linalg.inv(M) @ p0[..., None])[..., 0]
     sl.log_jac = torch.zeros(2)
     for _ in range(6):
-        sh = hmc.integration_step(sh)
+        sh = hmc.integrate(sh, hmc.step_size)
     for _ in range(6):
-        sl = lmc.integration_step(sl)
+        sl = lmc.integrate(sl, lmc.step_size)
 
     assert torch.allclose(sl.q, sh.q, atol=1e-10)
     assert float(sl.log_jac.abs().max()) < 1e-12
@@ -70,14 +70,14 @@ def test_constant_metric_reduces_to_hmc():
 def _integrate(lmc, q, v, num_steps):
     s = LMCState(q.clone(), v.clone(), None, None, torch.zeros(q.shape[0]))
     for _ in range(num_steps):
-        s = lmc.integration_step(s)
+        s = lmc.integrate(s, lmc.step_size)
     return s
 
 
 def test_integrator_is_reversible():
     lmc = LMC(_curved_model, _space(), step_size=0.15, num_steps=8,
               adapt_step_size=False)
-    lmc.step_size = torch.tensor([0.15])
+    lmc.init(torch.zeros(1, 2))                   # arm the adapter at 0.15
     q0 = torch.tensor([[0.4, -0.3]])
     v0 = torch.tensor([[0.6, 0.2]])
 
@@ -91,7 +91,7 @@ def test_integrator_is_reversible():
 def test_log_jacobian_matches_finite_difference():
     lmc = LMC(_curved_model, _space(), step_size=0.15, num_steps=5,
               adapt_step_size=False)
-    lmc.step_size = torch.tensor([0.15])
+    lmc.init(torch.zeros(1, 2))                   # arm the adapter at 0.15
 
     def run(qv):
         s = _integrate(lmc, qv[:2].unsqueeze(0), qv[2:].unsqueeze(0), 5)
@@ -151,7 +151,7 @@ def _armed_geometry():
     with fixed positions/velocities the reference is checked against."""
     lmc = LMC(_curved_model, UnconstrainedSpace(NAMES), step_size=0.1,
               num_steps=1, adapt_step_size=False)
-    lmc.step_size = torch.full((3,), 0.1)
+    lmc.init(torch.zeros(3, 2))                   # arm the adapter at 0.1
     torch.manual_seed(0)
     return lmc, torch.randn(3, 2), torch.randn(3, 2)
 
@@ -201,3 +201,48 @@ def test_lmc_common_diagnostics_schema():
     for k in ("accept_rate", "num_divergences", "step_size"):
         assert torch.is_tensor(d[k]) and d[k].shape == (3,)
     assert d["num_divergences"].dtype == torch.long
+
+
+def test_lmc_endpoint_state_carries_no_autograd_graph():
+    """A model (and the Jacobian-carrying geometry) must not leak an autograd
+    graph into the sampler: endpoint U/metric and the accumulated delta_H
+    diagnostics must be detached (the log-Jacobian in particular flows into
+    delta_H), so the per-step graph is freed each step rather than accumulating."""
+    scale = torch.tensor(1.5, requires_grad=True)
+
+    def model_grad(theta):
+        U, G = _curved_model(theta)
+        return scale * U, scale * G
+
+    s = LMC(model_grad, _space(), step_size=0.2, num_steps=2, adapt_step_size=False)
+    state = s.init(torch.zeros(3, 2))
+    for _ in range(3):
+        state = s.step(state)
+
+    assert not s._delta_H_last.requires_grad
+    assert not s._delta_H_abs_sum.requires_grad and not s._delta_H_abs_max.requires_grad
+    assert not state.U.value.requires_grad
+    assert not state.metric.L.requires_grad
+    assert not state.v.requires_grad               # velocity carries no graph either
+
+
+def test_lmc_diagnostics_footprint_is_constant_over_steps():
+    """The running diagnostics are O(num_chains) accumulators, so their memory
+    footprint must not grow with the number of transitions."""
+    N = 3
+    summaries = ["_delta_H_last", "_delta_H_abs_sum", "_delta_H_abs_max"]
+
+    def footprint(sampler):
+        for name in summaries:
+            t = getattr(sampler, name)
+            assert isinstance(t, torch.Tensor) and t.shape == (N,)
+        return sum(getattr(sampler, name).numel() for name in summaries)
+
+    s = LMC(_curved_model, _space(), step_size=0.2, num_steps=3, adapt_step_size=False)
+    state = s.init(torch.zeros(N, 2))
+    state = s.step(state)
+    after_1 = footprint(s)
+    for _ in range(30):
+        state = s.step(state)
+    after_31 = footprint(s)
+    assert after_1 == after_31 == len(summaries) * N

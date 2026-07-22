@@ -133,3 +133,47 @@ def test_hmc_divergence_count_is_per_chain():
     nd = s.diagnostics()["num_divergences"]
     assert nd.shape == (3,) and nd.dtype == torch.long
     assert int(nd.sum()) > 0
+
+
+def test_hmc_endpoint_state_carries_no_autograd_graph():
+    """A model whose potential carries an autograd graph must not leak it into
+    the sampler: the endpoint U/grad and the accumulated delta_H diagnostics
+    must all be detached, so the per-step graph is freed each step instead of
+    accumulating over the run (CUDA OOM regression)."""
+    scale = torch.tensor(1.5, requires_grad=True)
+
+    def model_grad(theta):
+        return scale * _model(theta)
+
+    s = HMC(model_grad, _space(), step_size=0.2, num_steps=2, adapt_step_size=False)
+    state = s.init(torch.zeros(3, 2))
+    for _ in range(3):
+        state = s.step(state)
+
+    assert not s._delta_H_last.requires_grad
+    assert not s._delta_H_abs_sum.requires_grad and not s._delta_H_abs_max.requires_grad
+    assert not state.U.value.requires_grad
+    assert not state.grad.value.requires_grad
+    assert not state.p.requires_grad               # momentum carries no graph either
+
+
+def test_hmc_diagnostics_footprint_is_constant_over_steps():
+    """The running diagnostics are O(num_chains) accumulators, so their memory
+    footprint must not grow with the number of transitions."""
+    N = 3
+    summaries = ["_delta_H_last", "_delta_H_abs_sum", "_delta_H_abs_max"]
+
+    def footprint(sampler):
+        for name in summaries:
+            t = getattr(sampler, name)
+            assert isinstance(t, torch.Tensor) and t.shape == (N,)
+        return sum(getattr(sampler, name).numel() for name in summaries)
+
+    s = HMC(_model, _space(), step_size=0.2, num_steps=3)
+    state = s.init(torch.zeros(N, 2))
+    state = s.step(state)
+    after_1 = footprint(s)
+    for _ in range(30):
+        state = s.step(state)
+    after_31 = footprint(s)
+    assert after_1 == after_31 == len(summaries) * N

@@ -14,6 +14,7 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from .BaseSampler import BaseSampler, PyroSampler
+from .HamiltonianSampler import HamiltonianSampler
 from .RMHMC import RMHMC, RMHMCState
 from .HMC import HMC, HMCState
 from .LMC import LMC, LMCState
@@ -28,11 +29,12 @@ from .spaces import (
     UniformBoxSpace,
     transforms,
 )
-from .adapters import DualAveraging, REINFORCEAdapter
+from .adapters import DualAveraging, Reinforce, NoAdaptation
 
 __all__ = [
     "BaseSampler",
     "PyroSampler",
+    "HamiltonianSampler",
     "RMHMC",
     "RMHMCState",
     "HMC",
@@ -49,6 +51,7 @@ __all__ = [
     "UniformBoxSpace",
     "transforms",
     "DualAveraging",
-    "REINFORCEAdapter",
+    "Reinforce",
+    "NoAdaptation",
     "__version__",
 ]

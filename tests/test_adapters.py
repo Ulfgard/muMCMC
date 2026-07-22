@@ -9,7 +9,7 @@ step-size adapters:
   the minimiser, even with noisy subgradients.  It also claims to be byte-for-
   byte equal to ``pyro.ops.dual_averaging`` on scalar inputs, which we pin as a
   regression anchor.
-* ``REINFORCEAdapter`` is derivative-free: it minimises a Gaussian-smoothed
+* ``Reinforce`` is derivative-free: it minimises a Gaussian-smoothed
   objective from noisy *evaluations* only.  Most tests minimise the bounded,
   smooth f(x) = 1 - exp(-(x-a)**2/2) (min at x = a) at the default learning
   rate.  A steep/unbounded objective (e.g. x**2) can blow up at the default
@@ -20,7 +20,7 @@ import math
 import torch
 import pytest
 
-from muMCMC.adapters import DualAveraging, REINFORCEAdapter
+from muMCMC.adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)
 
@@ -120,7 +120,7 @@ def test_matches_pyro_dual_averaging_on_scalars():
 
 
 # ========================================================================== #
-#  REINFORCEAdapter                                                           #
+#  Reinforce                                                           #
 # ========================================================================== #
 
 def _bounded_objective(x, a):
@@ -131,7 +131,7 @@ def _bounded_objective(x, a):
 def _reinforce_minimise(target, steps, *, sigma=0.3, seed=0):
     torch.manual_seed(seed)
     n = target.shape[0]
-    ad = REINFORCEAdapter(n, sigma=sigma)
+    ad = Reinforce(n, sigma=sigma)
     ad.prox_center = torch.zeros(n)
     ad.reset()
     for _ in range(steps):
@@ -143,7 +143,7 @@ def _reinforce_minimise(target, steps, *, sigma=0.3, seed=0):
 def test_reset_round_trips_to_prox_center():
     # mu after reset is the prox-center; in adapter use that is log(step0).
     step0 = torch.tensor([0.05, 0.3, 1.7])
-    ad = REINFORCEAdapter(3, sigma=0.1)
+    ad = Reinforce(3, sigma=0.1)
     ad.prox_center = torch.log(step0)
     ad.reset()
     _, mu = ad.get_state()
@@ -152,7 +152,7 @@ def test_reset_round_trips_to_prox_center():
 
 def test_proposal_is_fixed_between_get_state_and_step():
     torch.manual_seed(0)
-    ad = REINFORCEAdapter(2, sigma=0.1)
+    ad = Reinforce(2, sigma=0.1)
     ad.prox_center = torch.zeros(2)
     ad.reset()
     x1, mu1 = ad.get_state()
@@ -166,7 +166,7 @@ def test_proposal_is_fixed_between_get_state_and_step():
 
 def test_first_step_initialises_baseline_to_observation():
     torch.manual_seed(0)
-    ad = REINFORCEAdapter(2, sigma=0.1)
+    ad = Reinforce(2, sigma=0.1)
     ad.reset()
     assert ad._g is None
     f0 = torch.tensor([0.5, 1.5])
@@ -195,7 +195,7 @@ def test_exposed_gamma_stabilises_unbounded_objective():
     # knob (larger gamma => gentler steps) makes it converge.
     torch.manual_seed(0)
     target = torch.tensor([1.0])
-    ad = REINFORCEAdapter(1, sigma=0.1, gamma=0.5)
+    ad = Reinforce(1, sigma=0.1, gamma=0.5)
     ad.prox_center = torch.zeros(1)
     ad.reset()
     for _ in range(4000):
@@ -210,7 +210,7 @@ def test_reinforce_perturbation_follows_prox_center_dtype():
     # Regression: eps is drawn on prox_center's device/dtype, not CPU/default,
     # so a GPU/float32 run does not mix devices in the score estimate. (Default
     # dtype here is float64; a float32 prox-center must produce float32 eps.)
-    ad = REINFORCEAdapter(3, sigma=0.1)
+    ad = Reinforce(3, sigma=0.1)
     ad.prox_center = torch.zeros(3, dtype=torch.float32)
     ad.reset()
     assert ad._eps.dtype == torch.float32
@@ -225,7 +225,7 @@ def test_reproducible_with_fixed_seed():
 
     def run():
         torch.manual_seed(7)
-        ad = REINFORCEAdapter(2, sigma=0.3)
+        ad = Reinforce(2, sigma=0.3)
         ad.prox_center = torch.zeros(2)
         ad.reset()
         for _ in range(200):
