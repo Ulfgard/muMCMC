@@ -12,10 +12,12 @@ Two things differ from the recursive oracle, both deliberate:
   2017, generalized criterion). This is what the checkpoint/batched form needs;
   the oracle's ``(q⁺−q⁻)·r`` form is equivalent in spirit but not identical, so
   the two trace different trajectories while sampling the same target.
-* **Whole subtrees are built before their U-turn is tested**, matching how the
-  batched kernel advances all chains in lockstep. Turns are found by brute force
-  over every balanced sub-span (the O(depth) checkpoint scheme is a later,
-  separately-validated optimisation).
+* **Leaves are streamed through an O(depth) checkpoint turn detector**
+  (:class:`_TurnChecker`) rather than stored and scanned. It maintains a stack of
+  completed balanced subtrees and tests each subtree's generalized U-turn the
+  moment it completes -- the scheme the batched kernel will use (with the stack
+  replaced by fixed level-indexed arrays). The brute-force ``_subtree_turns`` is
+  retained as the oracle it is validated against.
 
 The multinomial trajectory sampling (uniform merge within a subtree, biased
 progressive merge of each new subtree against the running tree) is identical to
@@ -47,7 +49,11 @@ def generalized_turn(rho: torch.Tensor, r_left: torch.Tensor,
 
 def _subtree_turns(ps_spatial) -> bool:
     """True if any balanced (dyadic) sub-span of the subtree U-turns. ``ps_spatial``
-    is the subtree's leaf momenta in trajectory order (minus -> plus)."""
+    is the subtree's leaf momenta in trajectory order (minus -> plus).
+
+    Reference (brute-force, O(2**depth) memory) turn detector. The streaming
+    :class:`_TurnChecker` below reproduces its decisions in O(depth) memory and is
+    validated against it; this is kept as that oracle."""
     n = len(ps_spatial)
     span = 2
     while span <= n:
@@ -58,6 +64,46 @@ def _subtree_turns(ps_spatial) -> bool:
                 return True
         span *= 2
     return False
+
+
+def _trailing_zeros(m: int) -> int:
+    """Number of trailing zero bits of ``m >= 1`` (the 2-adic valuation), i.e.
+    how many balanced subtrees complete when leaf ``m - 1`` is added."""
+    return (m & -m).bit_length() - 1
+
+
+class _TurnChecker:
+    """Streaming generalized-U-turn detector -- the O(depth) checkpoint scheme.
+
+    Leaves are fed in creation order via :meth:`add`. Completed balanced subtrees
+    are kept on a stack, each as ``[p_left, p_right, rho]`` (endpoint momenta and
+    summed momentum). Adding leaf ``n`` completes ``ν₂(n+1)`` subtrees -- pop that
+    many, merging each with the running node and testing its U-turn -- then push
+    the result. The stack holds at most ``depth + 1`` nodes, so memory is
+    O(depth·d) rather than O(2**depth·d).
+
+    ``generalized_turn`` is symmetric in its two endpoints, so feeding leaves in
+    creation order (rather than spatial order) gives the same decision; the batched
+    kernel will feed leaves the same way with the stack replaced by fixed
+    level-indexed arrays.
+    """
+
+    def __init__(self):
+        self._stack = []          # each: [p_left, p_right, rho]
+        self._n = 0               # leaves added so far
+
+    def add(self, p: torch.Tensor) -> bool:
+        """Fold in one leaf momentum; return True if a completing subtree U-turns."""
+        node_left, node_right, node_rho = p, p, p
+        turned = False
+        for _ in range(_trailing_zeros(self._n + 1)):
+            left_left, _left_right, left_rho = self._stack.pop()
+            node_left, node_rho = left_left, left_rho + node_rho
+            if generalized_turn(node_rho, node_left, node_right):
+                turned = True
+        self._stack.append([node_left, node_right, node_rho])
+        self._n += 1
+        return turned
 
 
 # --------------------------------------------------------------------------- #
@@ -84,14 +130,18 @@ class _Sub:
 
 def _build_subtree(potential_fn, q, p, grad, H0, v, depth, eps,
                    max_delta_H, gen) -> _Sub:
-    """Build ``2**depth`` leaves by leapfrogging in direction ``v`` from
-    ``(q, p, grad)``, stopping early on divergence."""
+    """Build up to ``2**depth`` leaves by leapfrogging in direction ``v`` from
+    ``(q, p, grad)``, stopping early on a divergence or a within-subtree U-turn.
+    Turns are detected incrementally by :class:`_TurnChecker`, so no per-leaf
+    history is stored."""
     n_leaves = 2 ** depth
     cur_q, cur_p, cur_grad = q, p, grad
-    created = []                                   # (q, p, grad) in creation order
+    checker = _TurnChecker()
+    far_q = far_p = far_grad = None                # frontier leaf on the extended side
     logw = None
     q_prop = None
     rho = None
+    turns = False
     sum_alpha, n_alpha = 0.0, 0
 
     for _ in range(n_leaves):
@@ -99,8 +149,9 @@ def _build_subtree(potential_fn, q, p, grad, H0, v, depth, eps,
         H = _hamiltonian(U, cur_p)
         delta = H - H0
         if (not torch.isfinite(H)) or bool(delta > max_delta_H):
-            far = created[-1] if created else (cur_q, cur_p, cur_grad)
-            return _Sub(far[0], far[1], far[2], q_prop, logw, rho,
+            if far_q is None:
+                far_q, far_p, far_grad = cur_q, cur_p, cur_grad
+            return _Sub(far_q, far_p, far_grad, q_prop, logw, rho,
                         turns=True, diverged=True,
                         sum_alpha=sum_alpha, n_alpha=n_alpha)
 
@@ -112,14 +163,14 @@ def _build_subtree(potential_fn, q, p, grad, H0, v, depth, eps,
         rho = cur_p.clone() if rho is None else rho + cur_p
         sum_alpha += float(torch.exp(torch.clamp(-delta, max=0.0)))
         n_alpha += 1
-        created.append((cur_q, cur_p, cur_grad))
+        far_q, far_p, far_grad = cur_q, cur_p, cur_grad
 
-    # Spatial (minus -> plus) order: creation order for v = +1, reversed for -1.
-    spatial = created if v == 1 else list(reversed(created))
-    ps_spatial = [pp for (_, pp, _) in spatial]
-    far = created[-1]                              # frontier leaf on the extended side
-    return _Sub(far[0], far[1], far[2], q_prop, logw, rho,
-                turns=_subtree_turns(ps_spatial), diverged=False,
+        if checker.add(cur_p):                     # a completing subtree U-turned
+            turns = True
+            break
+
+    return _Sub(far_q, far_p, far_grad, q_prop, logw, rho,
+                turns=turns, diverged=False,
                 sum_alpha=sum_alpha, n_alpha=n_alpha)
 
 

@@ -11,9 +11,18 @@ import pytest
 
 import nuts_iterative as it
 import nuts_reference as rec
-from nuts_iterative import generalized_turn, _subtree_turns
+from nuts_iterative import generalized_turn, _subtree_turns, _TurnChecker, _trailing_zeros
 
 torch.set_default_dtype(torch.float64)
+
+
+def _turns_via_checker(ps) -> bool:
+    """OR of the streaming checker over a full leaf-momentum sequence."""
+    c = _TurnChecker()
+    turned = False
+    for p in ps:
+        turned = c.add(p) or turned
+    return turned
 
 
 def _gaussian_potential(cov: torch.Tensor):
@@ -47,6 +56,33 @@ def test_subtree_turns_detects_reversal():
 
 def test_subtree_turns_single_leaf_never_turns():
     assert _subtree_turns([torch.tensor([1.0, 0.0])]) is False
+
+
+# --------------------------------------------------------------------------- #
+#  Streaming checkpoint checker vs brute-force oracle                          #
+# --------------------------------------------------------------------------- #
+
+def test_trailing_zeros():
+    assert [_trailing_zeros(m) for m in range(1, 9)] == [0, 1, 0, 2, 0, 1, 0, 3]
+
+
+def test_turn_checker_matches_bruteforce_on_crafted():
+    fwd = [torch.tensor([1.0, 0.0]) for _ in range(4)]
+    mixed = [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0]),
+             torch.tensor([-1.0, 0.0]), torch.tensor([-1.0, 0.0])]
+    assert _turns_via_checker(fwd) == _subtree_turns(fwd) is False
+    assert _turns_via_checker(mixed) == _subtree_turns(mixed) is True
+
+
+def test_turn_checker_matches_bruteforce_random():
+    # The O(depth) streaming detector must make the same decision as the
+    # brute-force scan on every random trajectory, at every depth.
+    gen = torch.Generator().manual_seed(0)
+    for depth in range(0, 7):
+        n = 2 ** depth
+        for _ in range(60):
+            ps = list(torch.randn(n, 3, generator=gen))
+            assert _turns_via_checker(ps) == _subtree_turns(ps)
 
 
 # --------------------------------------------------------------------------- #
