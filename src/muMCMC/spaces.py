@@ -274,12 +274,6 @@ class UnconstrainedSpace:
         name_to_idx = {yi: i for i, yi in enumerate(self.names)}
         self.free_indices = [name_to_idx[yi] for yi in self._free_names]
         self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
-        # True when fixed coords are trailing. Metric projection then uses the
-        # leading Cholesky block, else a QR.
-        self._fixed_are_trailing = (
-            len(self.fixed_indices) == 0
-            or self.fixed_indices == list(range(self.d, self.d_full))
-        )
 
     @property
     def d(self) -> int:
@@ -427,10 +421,6 @@ class UniformBoxSpace:
         self.free_indices = [name_to_idx[yi] for yi in self.free_names]
         self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
 
-        self._fixed_are_trailing = (
-            len(self.fixed_indices) == 0
-            or self.fixed_indices == list(range(self.d, self.d_full))
-        )
     def to_free_vector(self, samples):
         return torch.stack([samples[yi] for yi in self.free_names], dim=-1)
 

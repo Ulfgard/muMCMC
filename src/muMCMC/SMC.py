@@ -7,7 +7,7 @@ from typing import Dict
 import torch
 from tqdm.auto import tqdm
 
-from .BaseSampler import BaseSampler
+from .MCMCSampler import MCMCSampler
 
 
 def _systematic_resample(weights: torch.Tensor) -> torch.Tensor:
@@ -73,7 +73,7 @@ class SMC:
 
     Parameters
     ----------
-    sampler : BaseSampler
+    sampler : MCMCSampler
         The mutation kernel.
     ess_target : float
         Post-reweighting ESS as a fraction of the particle count, in (0, 1).
@@ -85,7 +85,7 @@ class SMC:
 
     def __init__(
         self,
-        sampler: BaseSampler,
+        sampler: MCMCSampler,
         *,
         ess_target: float = 0.5,
         num_mcmc_steps: int = 5,

@@ -172,7 +172,7 @@ indices) remains available via `sampler.mcmc.diagnostics()`.
 
 ```
 src/muMCMC/
-    BaseSampler.py   # general base + own batched driver; PyroSampler subclass
+    MCMCSampler.py   # general base + own batched driver; PyroSampler subclass
     RMHMC.py         # Riemannian Manifold HMC (integrator + sampler)
     HMC.py           # Euclidean HMC (explicit leapfrog, constant mass matrix)
     LMC.py           # explicit Lagrangian MC (velocity variant of RMHMC)

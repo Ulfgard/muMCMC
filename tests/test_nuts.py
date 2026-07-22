@@ -6,7 +6,7 @@ constrained-space reparameterization layered on top: the potential Pyro sees is
 
     U(z) = U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
 
-assembled in ``BaseSampler.evaluate_model``, plus the free/fixed splicing and the
+assembled in ``MCMCSampler.evaluate_model``, plus the free/fixed splicing and the
 output schema.  The statistical tests below (sample the prior; sample a flat
 target on a box and recover a *uniform* marginal) exercise exactly the prior and
 Jacobian terms that a future non-Pyro kernel would have to reproduce, so they

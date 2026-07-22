@@ -352,7 +352,7 @@ class RMHMCState:
 #  energy through the build_initial_state / sample_momentum / integrate /       #
 #  acceptance_delta / adapt hooks. All chains run in one batched state.         #
 #                                                                              #
-#  model_fn is specified in constrained space. BaseSampler adds the            #
+#  model_fn is specified in constrained space. MCMCSampler adds the           #
 #  prior log-prob and prior metric and pushes the metric forward to free       #
 #  unconstrained coordinates (spaces.push_forward_metric).                     #
 #                                                                              #
@@ -370,7 +370,7 @@ class RMHMC(HamiltonianSampler):
     H(q, p) = U(q) + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
 
     Runs in unconstrained space. The model is specified in constrained space
-    and pulled back by :meth:`BaseSampler.evaluate_model`.
+    and pulled back by :meth:`MCMCSampler.evaluate_model`.
 
     Parameters
     ----------
@@ -405,6 +405,20 @@ class RMHMC(HamiltonianSampler):
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence. Default 100.
+
+    Notes
+    -----
+    Unlike :class:`HMC` / :class:`LMC`, RMHMC exposes no ``target_accept_prob``.
+    The implicit-midpoint integrator can conserve energy over a wide range of
+    step sizes -- exactly, up to the fixed-point tolerance, on a Gaussian target
+    -- so acceptance is a poor thing to adapt against: whenever the solve
+    converges it saturates near 1 and carries almost no gradient on the step
+    size. The true knob is integrator accuracy, so the REINFORCE adapter instead
+    targets solver cost and energy error (residual and iteration count per
+    substep together with |delta_H|; see :meth:`adapt`). This keeps acceptance
+    close to 1 while steering the step size by how well the trajectory is
+    actually resolved; ``adaptation_sigma`` sets the exploration scale of that
+    search.
     """
 
     def __init__(

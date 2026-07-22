@@ -112,7 +112,7 @@ class LMC(HamiltonianSampler):
         E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,
 
     with ``U`` the full unconstrained potential and ``G`` the metric assembled
-    by ``BaseSampler``. The integrator is explicit (a linear solve per
+    by ``MCMCSampler``. The integrator is explicit (a linear solve per
     half-kick); acceptance carries the trajectory Jacobian ``det J``.
 
     User contract

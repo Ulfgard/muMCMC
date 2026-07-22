@@ -77,7 +77,7 @@ class HMC(HamiltonianSampler):
 
         H(q, p) = U(q) + 1/2 pT M^-1 p,
 
-    with ``U`` the full unconstrained potential assembled by ``BaseSampler``
+    with ``U`` the full unconstrained potential assembled by ``MCMCSampler``
     and ``M`` a constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The
     model is given in constrained coordinates and evaluated through the space
     pull-back.
