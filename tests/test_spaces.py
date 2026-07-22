@@ -117,6 +117,14 @@ def test_add_remove_fixed_round_trip():
     assert set(back) == {"a", "b"}
 
 
+def test_add_fixed_preserves_dtype():
+    # Fixed columns must match the samples' dtype, not the default dtype.
+    s = UnconstrainedSpace(NAMES, priors=_priors(), fixed={"c": 4.0})
+    free = {"a": torch.tensor([1.0], dtype=torch.float32),
+            "b": torch.tensor([3.0], dtype=torch.float32)}
+    assert s.add_fixed(free)["c"].dtype == torch.float32
+
+
 def test_add_fixed_is_noop_without_fixed():
     s = UnconstrainedSpace(NAMES, priors=_priors())
     free = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0]),
@@ -339,6 +347,15 @@ def test_box_to_from_vector_round_trip():
     back = s.from_vector(vec)
     for n in ["x", "y"]:
         assert torch.allclose(back[n], samples[n], atol=ATOL)
+
+
+def test_box_add_fixed_preserves_dtype():
+    # Regression: the box space must fill fixed columns in the samples' dtype,
+    # matching UnconstrainedSpace (it previously defaulted, dropping float32).
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (5.0, 5.0)}, ["x", "y"],
+                        device="cpu")
+    free = {"x": torch.tensor([0.3, -0.4], dtype=torch.float32)}
+    assert s.add_fixed(free)["y"].dtype == torch.float32
 
 
 def test_box_add_remove_fixed():

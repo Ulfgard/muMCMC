@@ -206,6 +206,20 @@ def test_exposed_gamma_stabilises_unbounded_objective():
     assert abs(float(mu) - 1.0) < 0.1
 
 
+def test_reinforce_perturbation_follows_prox_center_dtype():
+    # Regression: eps is drawn on prox_center's device/dtype, not CPU/default,
+    # so a GPU/float32 run does not mix devices in the score estimate. (Default
+    # dtype here is float64; a float32 prox-center must produce float32 eps.)
+    ad = REINFORCEAdapter(3, sigma=0.1)
+    ad.prox_center = torch.zeros(3, dtype=torch.float32)
+    ad.reset()
+    assert ad._eps.dtype == torch.float32
+    x, mu = ad.get_state()
+    assert x.dtype == torch.float32 and mu.dtype == torch.float32
+    ad.step(torch.zeros(3, dtype=torch.float32))
+    assert ad._eps.dtype == torch.float32
+
+
 def test_reproducible_with_fixed_seed():
     a = torch.tensor([1.0, -1.0])
 

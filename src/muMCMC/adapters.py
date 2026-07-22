@@ -107,12 +107,18 @@ class REINFORCEAdapter:
         self._dual       = DualAveraging(gamma=gamma)
         self._g          = None             # EMA baseline, None until first step
 
+    def _draw_eps(self) -> torch.Tensor:
+        """Draw a fresh ``(N,)`` perturbation ``eps ~ N(0, I)`` on
+        ``prox_center``'s device and dtype."""
+        pc = torch.as_tensor(self.prox_center)
+        return torch.randn(self.n, device=pc.device, dtype=pc.dtype)
+
     def reset(self):
         """Reset the estimate and draw the first perturbation."""
         self._dual.prox_center = self.prox_center    # (N,)
         self._dual.reset()
         self._g   = None
-        self._eps = torch.randn(self.n)     # (N,)
+        self._eps = self._draw_eps()        # (N,)
 
     def step(self, f_t: torch.Tensor):
         """Fold the objective value ``f_t`` (``(N,)``) at the current proposal
@@ -127,7 +133,7 @@ class REINFORCEAdapter:
         stat = (f_t - self._g) / self.sigma * self._eps
         self._dual.step(stat)
 
-        self._eps = torch.randn(self.n)
+        self._eps = self._draw_eps()
 
     def get_state(self):
         """Return ``(proposal, mu)``, both ``(N,)``: the point ``mu + sigma*eps``
