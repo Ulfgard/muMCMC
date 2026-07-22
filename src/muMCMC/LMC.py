@@ -1,10 +1,10 @@
-from typing import Callable, Optional
-from collections import OrderedDict
+from typing import Callable
+import math
 
 import torch
 
-from .BaseSampler import BaseSampler
-from .adapters import DualAveraging
+from .HamiltonianSampler import HamiltonianSampler
+from .adapters import DualAveraging, NoAdaptation
 
 # ============================================================================ #
 #  Lagrangian Monte Carlo  (explicit geodesic integrator)                      #
@@ -47,21 +47,23 @@ from .adapters import DualAveraging
 
 
 class LMCState:
-    """Batched LMC state over ``(N,)`` chains.
+    """Batched LMC state over ``(N,)`` chains. Every field is config-bound, so
+    ``reorder`` permutes all of them (``log_jac`` is the current config's
+    trajectory Jacobian, reset each transition).
 
     Parameters
     ----------
     q : Tensor, shape (N, d)
         Position in free unconstrained coordinates.
     v : Tensor, shape (N, d), or None
-        Velocity, set by ``init_momentum`` and unset between transitions.
+        Velocity. Drawn by ``sample_momentum``; ``None`` only on the initial
+        state before the first step.
     U : TemperedAffine or None
         Potential at ``q``.
     metric : TemperedMetric or None
         Metric at ``q``.
-    log_jac : Tensor, shape (N,)
-        Accumulated ``log det J`` over the current trajectory (``nan`` once a
-        half-kick determinant is non-positive).
+    log_jac : Tensor, shape (N,), or None
+        Accumulated ``log det J`` over the current trajectory.
     """
 
     def __init__(self, q, v=None, U=None, metric=None, log_jac=None):
@@ -72,14 +74,27 @@ class LMCState:
         self.log_jac = log_jac
 
     def reorder(self, perm: torch.Tensor) -> "LMCState":
-        """Reorder the batch elements by ``perm``. ``U`` and ``metric`` retemper;
-        ``log_jac`` is slot-bound and stays in place."""
+        """Reorder the batch elements by ``perm``. ``U`` and ``metric``
+        retemper."""
         return LMCState(
             self.q[perm],
             None if self.v is None else self.v[perm],
             None if self.U is None else self.U.reorder(perm),
             None if self.metric is None else self.metric.reorder(perm),
-            self.log_jac,
+            None if self.log_jac is None else self.log_jac[perm],
+        )
+
+    def select_accepted(self, accepted: torch.Tensor, other: "LMCState") -> "LMCState":
+        """Per-chain choice between this endpoint (where ``accepted``) and the
+        start ``other``; the Jacobian accumulator resets for the next step."""
+        pick = accepted.unsqueeze(-1)
+        z = torch.zeros(self.q.shape[0], dtype=self.q.dtype, device=self.q.device)
+        return LMCState(
+            torch.where(pick, self.q, other.q),
+            torch.where(pick, self.v, other.v),
+            self.U.select(accepted, other.U),
+            self.metric.select(accepted, other.metric),
+            z,
         )
 
 
@@ -89,7 +104,7 @@ class LMCState:
 #                                                                              #
 # =========================================================================== #
 
-class LMC(BaseSampler):
+class LMC(HamiltonianSampler):
     """Lagrangian Monte Carlo with an explicit geodesic integrator.
 
     Samples ``q`` in the velocity variable ``v = G(q)^-1 p`` under the energy
@@ -140,26 +155,20 @@ class LMC(BaseSampler):
         da_gamma: float = 0.05,
         divergence_threshold: float = 100.0,
     ):
-        super().__init__(potential_fn=model_fn, space=space, requires_metric=True)
-
         if not 0.0 < target_accept_prob < 1.0:
             raise ValueError(
                 f"target_accept_prob must be in (0, 1), got {target_accept_prob}")
 
-        self._step_size_init       = step_size
-        self.step_size             = step_size
-        self.num_steps             = num_steps
-        self._adapt_step_size      = adapt_step_size
-        self._target_accept        = target_accept_prob
-        self._da_gamma             = da_gamma
-        self._divergence_threshold = divergence_threshold
+        # The adapters work on the log step size; step_size = exp(adapter value).
+        log_eps = math.log(step_size)
+        if adapt_step_size:
+            adapter = DualAveraging(init=log_eps, gamma=da_gamma)
+        else:
+            adapter = NoAdaptation(init=log_eps)
+        super().__init__(model_fn, space, requires_metric=True, num_steps=num_steps,
+                         adapter=adapter, divergence_threshold=divergence_threshold)
 
-    @property
-    def trajectory_length(self):
-        """Mean step size times ``num_steps``."""
-        eps = self.step_size
-        eps = float(eps.mean()) if torch.is_tensor(eps) else eps
-        return eps * self.num_steps
+        self._target_accept = target_accept_prob
 
     # ---- Geometry ----------------------------------------------------------- #
 
@@ -211,20 +220,20 @@ class LMC(BaseSampler):
 
         return ginv_grad_phi, omega
 
-    def _half_kick(self, omega, ginv_grad_phi, v):
-        """Explicit half-kick (Lan et al. eq 12/14) at fixed geometry.
+    def _half_kick(self, omega, ginv_grad_phi, v, step_size):
+        """Explicit half-kick (Lan et al. eq 12/14) at fixed geometry and
+        per-chain ``step_size``.
 
         Returns ``(v_out, dlogdet)`` with
         ``v_out = [I + (eps/2) Omega(v)]^-1 (v - (eps/2) G^-1 grad phi)`` and
         ``dlogdet = log det(I - (eps/2) Omega(v_out)) - log det(I + (eps/2) Omega(v))``
         (nan if either determinant is non-positive, tripping a divergence).
-        ``omega`` is the closure returned by :meth:`_geometry`.
         """
         d = v.shape[-1]
         eye = torch.eye(d, dtype=v.dtype, device=v.device)
-        half = 0.5 * self.step_size.view(-1, 1, 1)
+        half = 0.5 * step_size.view(-1, 1, 1)
         A = eye + half * omega(v)
-        rhs = v - 0.5 * self.step_size.unsqueeze(-1) * ginv_grad_phi
+        rhs = v - 0.5 * step_size.unsqueeze(-1) * ginv_grad_phi
         v_out = torch.linalg.solve(A, rhs[..., None])[..., 0]
         dlogdet = (torch.log(torch.linalg.det(eye - half * omega(v_out)))
                    - torch.log(torch.linalg.det(A)))
@@ -235,156 +244,46 @@ class LMC(BaseSampler):
         Gv = (metric.value @ v[..., None])[..., 0]
         return U + 0.5 * (v * Gv).sum(-1) - 0.5 * metric.log_det_metric()
 
-    # ---- Operator interface (composed by run_mcmc) -------------------------- #
+    # ---- Hooks -------------------------------------------------------------- #
 
-    def init(self, q):
-        """Size the per-chain ``step_size``, adapter, and counters from ``q``,
-        arm adaptation, and return the initial :class:`LMCState`."""
-        N, d = q.shape
-        dtype, device = q.dtype, q.device
-
-        self.step_size = torch.full((N,), float(self._step_size_init),
-                                    dtype=dtype, device=device)
-        self._step = 0
-        self._accepted = torch.zeros(N, dtype=torch.long, device=device)
-        self._num_divergences = torch.zeros(N, dtype=torch.long, device=device)
-        self._reset_diagnostics()
-
-        self._adapting = self._adapt_step_size
-        if self._adapt_step_size:
-            self._adapter = DualAveraging(gamma=self._da_gamma)
-            self._adapter.prox_center = torch.log(self.step_size)
-            self._adapter.reset()
-
+    def build_initial_state(self, q):
+        """Evaluate the model at ``q`` and return the initial :class:`LMCState`
+        (velocity drawn later by :meth:`sample_momentum`)."""
         with torch.no_grad():
             U, metric = self.evaluate_model(q)
-        return LMCState(q, None, U, metric,
-                        torch.zeros(N, dtype=dtype, device=device))
+        return LMCState(q, None, U, metric)
 
-    def step(self, s):
-        """One chain transition: sample velocity at ``s``, integrate
-        ``num_steps`` steps, then Metropolis accept/reject. The returned state
-        has velocity unset (the next ``step`` samples it)."""
-        s = self.init_momentum(s)
-        new = s
-        for _ in range(self.num_steps):
-            new = self.integration_step(new)
-        return self.accept(new, s)
+    def sample_momentum(self, state):
+        """Draw the velocity ``v ~ N(0, G(q)^-1)`` on ``state`` and reset its
+        trajectory Jacobian accumulator."""
+        N = state.q.shape[0]
+        state.v = state.metric.inv_metric_times_vec(state.metric.sample_momentum())
+        state.log_jac = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
+        return state
 
-    def init_momentum(self, s):
-        """Resample the velocity ``v ~ N(0, G(q)^-1)`` on ``s`` and reset the
-        trajectory Jacobian accumulator; return ``s``."""
-        N = s.q.shape[0]
-        s.v = s.metric.inv_metric_times_vec(s.metric.sample_momentum())
-        s.log_jac = torch.zeros(N, dtype=s.q.dtype, device=s.q.device)
-        return s
-
-    def integration_step(self, s):
-        """One explicit geodesic leapfrog step. Returns a new state carrying the
-        endpoint position, velocity, and the accumulated Jacobian."""
-        eps = self.step_size.unsqueeze(-1)                    # (N, 1)
-        gphi0, omega0 = self._geometry(s.q)
-        v_half, ld0 = self._half_kick(omega0, gphi0, s.v)     # eq (12)
-        q_new = s.q + eps * v_half                            # eq (13)
+    def integrate(self, state, step_size):
+        """One explicit geodesic leapfrog step at ``step_size``. Returns a new
+        state carrying the endpoint position, velocity, and accumulated
+        Jacobian."""
+        eps = step_size.unsqueeze(-1)                         # (N, 1)
+        gphi0, omega0 = self._geometry(state.q)
+        v_half, ld0 = self._half_kick(omega0, gphi0, state.v, step_size)   # eq (12)
+        q_new = state.q + eps * v_half                        # eq (13)
         gphi1, omega1 = self._geometry(q_new)
-        v_new, ld1 = self._half_kick(omega1, gphi1, v_half)   # eq (14)
-        return LMCState(q_new, v_new, None, None, s.log_jac + ld0 + ld1)
+        v_new, ld1 = self._half_kick(omega1, gphi1, v_half, step_size)     # eq (14)
+        return LMCState(q_new, v_new, None, None, state.log_jac + ld0 + ld1)
 
-    def accept(self, new, old):
-        """Per-chain Metropolis accept/reject between the trajectory endpoint
-        ``new`` and its start ``old``, with the trajectory Jacobian folded in,
-        plus bookkeeping and (while adapting) the step-size update."""
+    def acceptance_delta(self, new, old):
+        """``delta = E(new) - E(old) - log det J``, evaluating the endpoint
+        potential/metric (which the integrator left unset). A non-positive
+        Jacobian factor makes ``log_jac`` (hence ``delta``) nan, so an unstable
+        step is caught by ``accept``'s non-finite branch."""
         with torch.no_grad():
             new.U, new.metric = self.evaluate_model(new.q)
-
         E_new = self._energy(new.U.value, new.metric, new.v)
         E_old = self._energy(old.U.value, old.metric, old.v)
-        delta_H_raw = E_new - E_old - new.log_jac                 # includes Jacobian
+        return E_new - E_old - new.log_jac
 
-        # A non-positive Jacobian factor makes log_jac (hence delta_H) nan, so an
-        # unstable step is caught by the non-finite branch.
-        is_divergent = (~torch.isfinite(delta_H_raw)) \
-            | (delta_H_raw > self._divergence_threshold)
-        delta_H = torch.where(torch.isfinite(delta_H_raw),
-                              delta_H_raw, delta_H_raw.new_full((), 300.0))
-        delta_H = delta_H.clamp(-300.0, 300.0)
-
-        N = new.q.shape[0]
-        accepted = torch.log(torch.rand(N, device=new.q.device, dtype=new.q.dtype)) < -delta_H
-        chosen_q = torch.where(accepted.unsqueeze(-1), new.q, old.q)
-        chosen_U = new.U.select(accepted, old.U)
-        chosen_metric = new.metric.select(accepted, old.metric)
-
-        accept_prob = torch.exp(torch.clamp(-delta_H, max=0.0))
-        accept_prob = torch.where(is_divergent, torch.zeros_like(accept_prob), accept_prob)
-
-        self._bookkeep(accepted, delta_H, is_divergent, accept_prob)
-        z = torch.zeros(N, dtype=chosen_q.dtype, device=chosen_q.device)
-        return LMCState(chosen_q, None, chosen_U, chosen_metric, z)
-
-    def _reset_diagnostics(self):
-        """Zero the running per-chain energy summaries."""
-        N = self.step_size.shape[0]
-        dtype, device = self.step_size.dtype, self.step_size.device
-        z = torch.zeros(N, dtype=dtype, device=device)
-        self._delta_H_last    = z.clone()
-        self._delta_H_abs_sum = z.clone()
-        self._delta_H_abs_max = z.clone()
-
-    def _bookkeep(self, accepted, delta_H, is_divergent, accept_prob):
-        """Fold one transition into the per-chain counters and, while adapting,
-        step the dual-averaging step-size update."""
-        dH = delta_H.detach()
-        self._delta_H_last     = dH
-        self._delta_H_abs_sum += dH.abs()
-        self._delta_H_abs_max  = torch.maximum(self._delta_H_abs_max, dH.abs())
-
-        self._accepted += accepted
-        self._num_divergences += is_divergent.long()
-        self._step += 1
-
-        if self._adapting:
-            # g = target - accept_prob feeds dual averaging on log(step_size)
-            g = self._target_accept - accept_prob
-            self._adapter.step(g)
-            self.step_size = torch.exp(self._adapter.get_state()[0])
-
-    def end_warmup(self):
-        """Freeze ``step_size`` to the dual-averaging running average, stop
-        adapting, and reset the counters for the sampling phase."""
-        if self._adapt_step_size:
-            self.step_size = torch.exp(self._adapter.get_state()[1])
-        self._adapting = False
-        self._accepted = torch.zeros_like(self._accepted)
-        self._num_divergences = torch.zeros_like(self._num_divergences)
-        self._step = 0
-        self._reset_diagnostics()
-
-    def logging(self):
-        """Per-step ``eps`` / ``|dH|`` / ``acc. prob`` strings for the progress
-        bar."""
-        if self._step == 0:
-            return {}
-        eps   = float(self.step_size.mean())
-        dH    = float(self._delta_H_last.abs().max())
-        accpr = float((self._accepted / self._step).mean())
-        return OrderedDict(
-            [
-                ("eps", "{:.2e}".format(eps)),
-                ("|dH|", "{:.2e}".format(dH)),
-                ("acc. prob", "{:.3f}".format(accpr)),
-            ]
-        )
-
-    def diagnostics(self):
-        """Per-chain ``(num_chains,)`` diagnostics: ``accept_rate``,
-        ``num_divergences``, ``step_size``, ``delta_H_abs_mean``,
-        ``delta_H_abs_max``."""
-        steps = max(self._step, 1)
-        return {
-            "accept_rate": self._accepted / steps,
-            "num_divergences": self._num_divergences,
-            "step_size": self.step_size,
-            "delta_H_abs_mean": self._delta_H_abs_sum / steps,
-            "delta_H_abs_max":  self._delta_H_abs_max,
-        }
+    def adapt(self, accept_prob, delta_H):
+        """Dual averaging toward ``target_accept_prob``."""
+        self._step_size_adapter.update(self._target_accept - accept_prob)

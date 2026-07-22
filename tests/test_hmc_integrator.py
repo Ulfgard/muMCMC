@@ -27,7 +27,7 @@ def _model(theta):
 
 def _armed(step_size, num_steps, mass_matrix=None):
     """An HMC and its initialized state, so the integrator can be driven
-    directly through ``integration_step``."""
+    directly through ``integrate``."""
     s = HMC(_model, _space(), step_size=step_size, num_steps=num_steps,
             mass_matrix=mass_matrix, adapt_step_size=False)
     q0 = torch.tensor([[0.3, -0.2], [0.1, 0.4]])   # two chains
@@ -36,7 +36,7 @@ def _armed(step_size, num_steps, mass_matrix=None):
 
 def _integrate(s, state, num_steps):
     for _ in range(num_steps):
-        state = s.integration_step(state)
+        state = s.integrate(state, s.step_size)
     return state
 
 

@@ -10,6 +10,7 @@ import torch
 import pytest
 
 from muMCMC.RMHMC import RMHMC, RMHMCState
+from muMCMC.adapters import Reinforce, NoAdaptation
 from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)
@@ -38,12 +39,11 @@ def make_sampler(model_fn=model_simple, *, adapt=False, **kw):
 
 
 def _endpoint(q_val, N):
-    """A bare endpoint state at a constant position, with the accumulators
-    accept()/_bookkeep expect already populated."""
+    """A bare endpoint state at a constant position (config-bound fields only;
+    the trajectory residual / iteration scratch lives on the sampler, zeroed by
+    init())."""
     s = RMHMCState(torch.full((N, D), float(q_val)))
     s.p = torch.zeros(N, D)
-    s.max_residual = torch.zeros(N)
-    s.fp_iters = [torch.zeros(N, dtype=torch.long)]
     return s
 
 
@@ -51,39 +51,38 @@ def _endpoint(q_val, N):
 #  init                                                                      #
 # ========================================================================== #
 
-def test_init_tensorises_step_size_and_resets_counters():
-    s = make_sampler(step_size=0.25, adapt=True, num_steps=4)
+def test_init_sizes_step_size_and_resets_counters():
+    s = make_sampler(step_size=0.25, adapt=False, num_steps=4)
     state = s.init(torch.zeros(5, D))
     assert s.step_size.shape == (5,)
     assert torch.allclose(s.step_size, torch.full((5,), 0.25))
     assert s._step == 0
     assert torch.equal(s._accepted, torch.zeros(5, dtype=torch.long))
     assert torch.equal(s._num_divergences, torch.zeros(5, dtype=torch.long))
-    assert s._adapting is True
-    # adapter seeded at log(step_size)
-    assert torch.allclose(s._adapter.prox_center, torch.log(s.step_size))
     # initial state is complete; step() samples the momentum
     assert state.U is not None and state.metric is not None
     assert state.p is None
-    assert torch.allclose(state.max_residual, torch.zeros(5))
+    # run-level solver summaries live on the sampler, zeroed
+    assert torch.allclose(s._residual_sum, torch.zeros(5))
+    assert torch.allclose(s._fp_iters_sum, torch.zeros(5))
 
 
-def test_init_without_adaptation_does_not_arm_adapter():
-    s = make_sampler(adapt=False)
-    s.init(torch.zeros(2, D))
-    assert s._adapting is False
+def test_init_selects_adapter_by_flag():
+    assert isinstance(make_sampler(adapt=True)._step_size_adapter, Reinforce)
+    assert isinstance(make_sampler(adapt=False)._step_size_adapter, NoAdaptation)
 
 
 # ========================================================================== #
 #  RMHMCState: reorder                                                       #
 # ========================================================================== #
 
-def test_reorder_permutes_config_but_not_slot_diagnostics():
+def test_reorder_permutes_config():
+    # The state is purely config-bound, so every field follows the permutation
+    # (the integrator's residual / iteration diagnostics are slot-bound and live
+    # on the sampler, not the state).
     s = make_sampler(model_qdep)
     state = s.init(torch.randn(3, D))             # q, U, metric present
     state.p = state.metric.sample_momentum()      # give it momentum, as step() would
-    state.max_residual = torch.tensor([1.0, 2.0, 3.0])
-    state.fp_iters = [torch.tensor([4, 5, 6])]
     perm = torch.tensor([2, 0, 1])
     r = state.reorder(perm)
 
@@ -93,9 +92,6 @@ def test_reorder_permutes_config_but_not_slot_diagnostics():
     # metric travels with the configuration (log-det follows the permutation)
     assert torch.allclose(r.metric.log_det_metric(),
                           state.metric.log_det_metric()[perm])
-    # integrator diagnostics are slot-bound: NOT permuted
-    assert torch.equal(r.max_residual, state.max_residual)
-    assert r.fp_iters is state.fp_iters
 
 
 def test_reorder_leaves_absent_fields_none():
@@ -138,7 +134,33 @@ def test_accept_counts_divergence_over_threshold():
     assert torch.equal(s._num_divergences, torch.ones(2, dtype=torch.long))
 
 
-def test_accept_leaves_momentum_unset():
+def test_accept_counts_large_energy_drop_as_divergence():
+    # Divergence is on |delta_H|: a huge energy *drop* (not only a rise) is
+    # numerically suspect and must register, even though it is accepted.
+    s = make_sampler(adapt=False, num_steps=1, divergence_threshold=100.0)
+    old = s.init(torch.full((2, D), 50.0))        # high energy
+    old.p = torch.zeros_like(old.q)
+    new = _endpoint(0.0, N=2)                      # delta_H << -100
+    out = s.accept(new, old)
+    assert torch.allclose(out.q, new.q)           # accepted (energy dropped)
+    assert torch.equal(s._num_divergences, torch.ones(2, dtype=torch.long))
+
+
+def test_failed_solve_is_rejected_even_when_energy_matches():
+    # A fixed-point solve that did not converge (max residual over fp_tol) is not
+    # a valid proposal: it must be rejected and counted divergent even when the
+    # energy change is small. acceptance_delta forces +inf for those chains.
+    s = make_sampler(adapt=False, num_steps=1, fp_tol=1e-8)
+    old = s.init(torch.zeros(2, D))
+    old.p = old.metric.sample_momentum()
+    new = _endpoint(0.0, N=2)                      # same position: delta_H ~ 0
+    s._step_residual = torch.full((2,), 1e-3)      # solve failed (>> fp_tol)
+    out = s.accept(new, old)
+    assert torch.allclose(out.q, old.q)           # rejected despite small |delta_H|
+    assert torch.equal(s._num_divergences, torch.ones(2, dtype=torch.long))
+
+
+def test_accept_returns_complete_state():
     torch.manual_seed(0)
     s = make_sampler(adapt=False, num_steps=1)
     old = s.init(torch.zeros(3, D))
@@ -146,8 +168,7 @@ def test_accept_leaves_momentum_unset():
     new = _endpoint(0.5, N=3)
     out = s.accept(new, old)
     assert out.U is not None and out.metric is not None
-    assert out.p is None                          # sampled by the next step()
-    assert torch.allclose(out.max_residual, torch.zeros(3))
+    assert out.p is not None                      # momentum carried; resampled next step
 
 
 # ========================================================================== #
@@ -158,13 +179,13 @@ def test_step_runs_exactly_num_steps_integration_steps():
     s = make_sampler(adapt=False, num_steps=4)
     state = s.init(torch.zeros(2, D))
     calls = {"n": 0}
-    original = s.integration_step
+    original = s.integrate
 
-    def counting(x):
+    def counting(x, step_size):
         calls["n"] += 1
-        return original(x)
+        return original(x, step_size)
 
-    s.integration_step = counting
+    s.integrate = counting
     s.step(state)
     assert calls["n"] == 4
 
@@ -173,9 +194,8 @@ def test_step_returns_complete_state():
     s = make_sampler(adapt=False, num_steps=3)
     state = s.init(torch.zeros(2, D))
     out = s.step(state)
-    assert out.U is not None and out.metric is not None and out.p is None
+    assert out.U is not None and out.metric is not None and out.p is not None
     assert out.q.shape == (2, D)
-    assert torch.allclose(out.max_residual, torch.zeros(2))
 
 
 # ========================================================================== #
@@ -188,8 +208,7 @@ def test_end_warmup_freezes_to_adapter_average_and_resets():
     for _ in range(5):
         state = s.step(state)
     s.end_warmup()
-    assert s._adapting is False
-    assert torch.allclose(s.step_size, torch.exp(s._adapter.get_state()[1]))
+    assert torch.allclose(s.step_size, torch.exp(s._step_size_adapter.get_state()[1]))
     assert torch.equal(s._accepted, torch.zeros(2, dtype=torch.long))
     assert torch.equal(s._num_divergences, torch.zeros(2, dtype=torch.long))
     assert s._step == 0
@@ -206,28 +225,20 @@ def test_end_warmup_without_adaptation_keeps_step_size():
     for _ in range(3):
         state = s.step(state)
     s.end_warmup()
-    assert s._adapting is False
     assert torch.allclose(s.step_size, torch.full((2,), 0.37))
     assert s._step == 0
 
 
 # ========================================================================== #
-#  trajectory_length / logging                                              #
+#  logging                                                                   #
 # ========================================================================== #
-
-def test_trajectory_length_scalar_and_tensor_step_size():
-    s = make_sampler(step_size=0.2, num_steps=5)
-    assert abs(s.trajectory_length - 1.0) < 1e-12        # scalar before init
-    s.init(torch.zeros(2, D))
-    assert abs(s.trajectory_length - 1.0) < 1e-12        # mean over (N,) after
-
 
 def test_logging_empty_before_steps_then_populated():
     s = make_sampler(adapt=False, num_steps=2)
     state = s.init(torch.zeros(2, D))
     assert s.logging() == {}                              # _step == 0
     s.step(state)
-    assert set(s.logging()) == {"eps", "|dH|", "|r|", "acc. prob"}
+    assert set(s.logging()) == {"eps", "acc. prob", "|r|"}
 
 
 # ========================================================================== #
@@ -300,7 +311,7 @@ def test_endpoint_state_carries_no_autograd_graph():
     assert not s._delta_H_abs_sum.requires_grad and not s._delta_H_abs_max.requires_grad
     assert not state.U.value.requires_grad
     assert not state.metric.L.requires_grad
-    assert state.p is None                        # momentum is a within-step transient
+    assert not state.p.requires_grad               # momentum carries no graph either
 
 
 def test_diagnostics_footprint_is_constant_over_steps():
@@ -310,7 +321,7 @@ def test_diagnostics_footprint_is_constant_over_steps():
     unbounded and fragmented the heap)."""
     N, num_steps = 3, 4
     summaries = ["_delta_H_last", "_delta_H_abs_sum", "_delta_H_abs_max",
-                 "_residual_last", "_residual_sum", "_residual_max",
+                 "_step_residual", "_step_iters", "_residual_sum", "_residual_max",
                  "_fp_iters_sum", "_fp_iters_max"]
 
     def footprint(sampler):

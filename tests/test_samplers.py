@@ -15,7 +15,7 @@ from muMCMC import (
     NUTS,
     UnconstrainedSpace,
     DualAveraging,
-    REINFORCEAdapter,
+    Reinforce,
 )
 
 torch.set_default_dtype(torch.float64)
@@ -124,7 +124,7 @@ def test_dual_averaging_no_update_roundtrip():
 
 def test_reinforce_adapter_no_update_roundtrip():
     step_size0 = torch.tensor([0.05, 0.3, 1.7, 0.9])
-    ad = REINFORCEAdapter(4, sigma=0.1)
+    ad = Reinforce(4, sigma=0.1)
     ad.prox_center = torch.log(step_size0)
     ad.reset()
     frozen = torch.exp(ad.get_state()[1])
