@@ -110,6 +110,74 @@ def test_log_jacobian_matches_finite_difference():
 
 
 # --------------------------------------------------------------------------- #
+#  geometry: Omega and the force term, pinned to an independent reference      #
+# --------------------------------------------------------------------------- #
+#
+# The integrator tests above check the *Metropolis machinery* -- reversibility,
+# the self-consistent log-Jacobian, the constant-metric reduction to HMC.  None
+# of them pins the *curvature* terms: a flipped sign in Omega's antisymmetric
+# part (D + J - J^T) or in the force's +1/2 log det G leaves the map reversible
+# and its Jacobian self-consistent, so LMC still samples the right target under
+# Metropolis correction -- only with lower acceptance.  The constant-metric
+# reduction cannot see them either (both vanish when G is constant).  These
+# tests compare Omega and the force against an independent reference that
+# materialises the rank-3 dG the production code deliberately avoids, so a wrong
+# curvature fails here instead of silently costing acceptance.
+
+
+def _geometry_reference(model, q_row, v_row):
+    """Independent ``Omega(q, v)`` and ``G^-1 grad phi`` at one point ``(d,)``.
+
+    Builds the full third-order derivative ``dG[a, b, c] = d G_ab / d q_c`` by
+    autograd (the direct route ``_geometry`` sidesteps), then assembles
+    ``Omega = 1/2 G^-1 (D + J - J^T)`` with ``J_lj = d(G v)_l / d q_j`` and
+    ``D_lj = (v . grad) G_lj``, and the force ``G^-1 grad(U + 1/2 log det G)``.
+    """
+    G_of   = lambda x: model(x.unsqueeze(0))[1][0]
+    phi_of = lambda x: (model(x.unsqueeze(0))[0]
+                        + 0.5 * torch.logdet(model(x.unsqueeze(0))[1]))[0]
+    G  = G_of(q_row)
+    dG = torch.autograd.functional.jacobian(G_of, q_row)          # (d, d, d)
+    J  = torch.einsum("lkj,k->lj", dG, v_row)                     # d(G v)_l / d q_j
+    D  = torch.einsum("ljc,c->lj", dG, v_row)                     # (v . grad) G
+    omega = 0.5 * torch.linalg.solve(G, D + J - J.transpose(-1, -2))
+    force = torch.linalg.solve(G, torch.autograd.functional.jacobian(phi_of, q_row))
+    return omega, force
+
+
+def _armed_geometry():
+    """An LMC over an identity, prior-free space (so ``phi = U + 1/2 log det G``
+    isolates the geometry and the free metric is exactly the model's ``G``),
+    with fixed positions/velocities the reference is checked against."""
+    lmc = LMC(_curved_model, UnconstrainedSpace(NAMES), step_size=0.1,
+              num_steps=1, adapt_step_size=False)
+    lmc.step_size = torch.full((3,), 0.1)
+    torch.manual_seed(0)
+    return lmc, torch.randn(3, 2), torch.randn(3, 2)
+
+
+def test_omega_matches_christoffel_reference():
+    # Pins Omega's antisymmetric assembly: a flipped or dropped J^T term is
+    # invisible to reversibility and to the self-consistent log-Jacobian.
+    lmc, q, v = _armed_geometry()
+    _, omega = lmc._geometry(q)
+    om_prod = omega(v)
+    for i in range(q.shape[0]):
+        om_ref, _ = _geometry_reference(_curved_model, q[i], v[i])
+        assert torch.allclose(om_prod[i], om_ref, atol=1e-9)
+
+
+def test_force_matches_reference_including_logdet_term():
+    # Pins G^-1 grad(U + 1/2 log det G): the metric inverse (not G) and the
+    # +1/2 log det G sign, neither of which the constant-metric reduction sees.
+    lmc, q, v = _armed_geometry()
+    force_prod, _ = lmc._geometry(q)
+    for i in range(q.shape[0]):
+        _, force_ref = _geometry_reference(_curved_model, q[i], v[i])
+        assert torch.allclose(force_prod[i], force_ref, atol=1e-9)
+
+
+# --------------------------------------------------------------------------- #
 #  sampler                                                                    #
 # --------------------------------------------------------------------------- #
 
