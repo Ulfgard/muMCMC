@@ -149,9 +149,25 @@ class TemperedAffine:
     """
 
     def __init__(self, lik: torch.Tensor, base, beta):
-        self.lik = lik
-        self.base = base
-        self.beta = beta
+        self._lik = lik
+        self._base = base
+        self._beta = beta
+
+    # Read-only: ``value`` (and ``TemperedMetric.L``) are cached_property, so a
+    # post-construction mutation of these inputs would silently return a stale
+    # result. Retempering/mixing goes through reorder/select, which build fresh
+    # objects instead of mutating in place.
+    @property
+    def lik(self):
+        return self._lik
+
+    @property
+    def base(self):
+        return self._base
+
+    @property
+    def beta(self):
+        return self._beta
 
     def _beta_bcast(self):
         """``beta`` reshaped to broadcast over ``lik``'s trailing feature axes."""
@@ -521,10 +537,10 @@ class UniformBoxSpace:
 
     def add_fixed(self, samples):
         samples = samples.copy()
-        batch_shape = (next(iter(samples.values()))).shape
-        device = (next(iter(samples.values()))).device
+        ref = next(iter(samples.values()))
         for yi in self.fixed.keys():
-            samples[yi] = self.fixed[yi] * torch.ones(batch_shape, device=device)
+            samples[yi] = self.fixed[yi] * torch.ones(
+                ref.shape, device=ref.device, dtype=ref.dtype)
         return samples
 
     def point_inside(self, y):

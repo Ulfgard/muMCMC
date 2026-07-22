@@ -9,6 +9,7 @@ affinely in an inverse temperature; ``beta`` is slot-bound, so a moved
 configuration is retempered to its slot's temperature by ``reorder``/``select``
 alone.
 """
+import pytest
 import torch
 
 from muMCMC.spaces import (
@@ -160,6 +161,20 @@ def test_potential_reorder_retempers():
     r = pot.reorder(perm)
     assert torch.allclose(r.value, beta * U_lik[perm] + U_base[perm])
     assert r.beta is beta
+
+
+def test_tempered_inputs_are_read_only():
+    # value / L are cached_property; the lik/base/beta inputs must be read-only
+    # so a stray in-place mutation cannot silently return a stale cached value.
+    m = TemperedMetric(_rand_spd(3, 2), _rand_spd(3, 2), 1.0)
+    _ = m.L                                        # populate the cache
+    for attr in ("lik", "base", "beta"):
+        with pytest.raises(AttributeError):
+            setattr(m, attr, None)
+    p = TemperedAffine(torch.randn(4), torch.randn(4), 0.5)
+    _ = p.value
+    with pytest.raises(AttributeError):
+        p.beta = 2.0
 
 
 def test_potential_select_shares_temperature():
