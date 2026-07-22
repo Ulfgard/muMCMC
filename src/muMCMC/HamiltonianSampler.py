@@ -1,6 +1,5 @@
 from abc import abstractmethod
 from typing import Callable
-from collections import OrderedDict
 
 import torch
 
@@ -68,18 +67,15 @@ class HamiltonianSampler(MCMCSampler):
         self._step_size_adapter    = adapter
         self._divergence_threshold = divergence_threshold
 
-        # Diagnostics returned by diagnostics(): key -> callable giving an (N,)
-        # tensor, evaluated on each call. Subclasses add entries in __init__.
-        self._diagnostics = {}
+        # The diagnostics / logging registries live on MCMCSampler; here we just
+        # populate them. Subclasses add further entries from their own __init__.
         self.register_diagnostic("accept_rate",      lambda: self._accepted / max(self._step, 1))
         self.register_diagnostic("num_divergences",  lambda: self._num_divergences)
         self.register_diagnostic("step_size",        lambda: self.step_size)
         self.register_diagnostic("delta_H_abs_mean", lambda: self._delta_H_abs_sum / max(self._step, 1))
         self.register_diagnostic("delta_H_abs_max",  lambda: self._delta_H_abs_max)
 
-        # Progress-bar entries: key -> callable giving a preformatted string.
-        # Kept minimal; subclasses add the ones that matter for them.
-        self._logging = {}
+        # Progress-bar entries; kept minimal, subclasses add what matters to them.
         self.register_logging("eps",       lambda: "{:.2e}".format(float(self.step_size.mean())))
         self.register_logging("acc. prob", lambda: "{:.3f}".format(float((self._accepted / max(self._step, 1)).mean())))
 
@@ -143,30 +139,6 @@ class HamiltonianSampler(MCMCSampler):
         self._num_divergences = torch.zeros_like(self._num_divergences)
         self._step = 0
         self._reset_diagnostics()
-
-    # ---- diagnostics / logging registries ----------------------------------- #
-
-    def register_diagnostic(self, key, fn):
-        """Add a per-chain diagnostic: ``key`` -> ``fn()`` returning an ``(N,)``
-        tensor, evaluated on each :meth:`diagnostics` call. Call from a
-        subclass ``__init__``."""
-        self._diagnostics[key] = fn
-
-    def register_logging(self, key, fn):
-        """Add a progress-bar entry: ``key`` -> ``fn()`` returning a preformatted
-        string, evaluated each step. Call from a subclass ``__init__``."""
-        self._logging[key] = fn
-
-    def diagnostics(self):
-        """Per-chain ``(num_chains,)`` diagnostics from the registry."""
-        return {key: fn() for key, fn in self._diagnostics.items()}
-
-    def logging(self):
-        """Progress-bar entries from the registry (empty before the first
-        step)."""
-        if self._step == 0:
-            return {}
-        return OrderedDict((key, fn()) for key, fn in self._logging.items())
 
     # ---- internal ----------------------------------------------------------- #
 

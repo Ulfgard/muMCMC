@@ -48,6 +48,14 @@ class MCMCSampler(ABC):
         self.requires_metric = requires_metric
         self.beta = 1.0   # inverse temperature
 
+        # Diagnostics / progress-bar registries: key -> callable evaluated on
+        # each diagnostics() / logging() call. Empty by default (so both return
+        # ``{}``); a subclass populates them from its __init__ via register_*.
+        # Insertion order is preserved, which fixes the progress-bar column
+        # order.
+        self._diagnostics = {}
+        self._logging = {}
+
     def evaluate_model(
         self, z_free: torch.Tensor, beta: Optional[float] = None,
         grad: bool = False,
@@ -138,16 +146,30 @@ class MCMCSampler(ABC):
         )
         return self.space.map_to_unconstrained_vector(theta_free).mapped_point
 
-    def logging(self) -> dict:
-        """Per-step statistics for the progress bar, as a dict of short
-        preformatted strings (e.g. ``{"eps": "1.6e-01", "acc. prob": "0.99"}``).
-        Default ``{}``."""
-        return {}
+    # ---- diagnostics / logging registries ----------------------------------- #
+
+    def register_diagnostic(self, key: str, fn: Callable) -> None:
+        """Add a per-chain diagnostic: ``key`` -> ``fn()`` returning an ``(N,)``
+        tensor, evaluated on each :meth:`diagnostics` call. Call from a subclass
+        ``__init__``."""
+        self._diagnostics[key] = fn
+
+    def register_logging(self, key: str, fn: Callable) -> None:
+        """Add a progress-bar entry: ``key`` -> ``fn()`` returning a preformatted
+        string, evaluated on each :meth:`logging` call. Call from a subclass
+        ``__init__``."""
+        self._logging[key] = fn
 
     def diagnostics(self) -> dict:
-        """Post-run per-chain diagnostics (acceptance rate, divergences, ...).
-        Default ``{}``."""
-        return {}
+        """Post-run per-chain diagnostics (acceptance rate, divergences, ...)
+        from the registry. Default ``{}`` when nothing is registered."""
+        return {key: fn() for key, fn in self._diagnostics.items()}
+
+    def logging(self) -> dict:
+        """Per-step progress-bar statistics from the registry, as a dict of short
+        preformatted strings (e.g. ``{"eps": "1.6e-01", "acc. prob": "0.99"}``).
+        Default ``{}`` when nothing is registered."""
+        return {key: fn() for key, fn in self._logging.items()}
 
     # ---- operator interface (composed by the batched run_mcmc) -------------- #
 

@@ -233,10 +233,12 @@ def test_end_warmup_without_adaptation_keeps_step_size():
 #  logging                                                                   #
 # ========================================================================== #
 
-def test_logging_empty_before_steps_then_populated():
+def test_logging_reports_registry_entries():
     s = make_sampler(adapt=False, num_steps=2)
     state = s.init(torch.zeros(2, D))
-    assert s.logging() == {}                              # _step == 0
+    # Registry is populated at construction, so logging() reports its keys as
+    # soon as init has sized the state -- same contract before and after a step.
+    assert set(s.logging()) == {"eps", "acc. prob", "|r|"}
     s.step(state)
     assert set(s.logging()) == {"eps", "acc. prob", "|r|"}
 
