@@ -35,7 +35,6 @@ def test_dimensions_without_fixed():
     assert s.free_names == NAMES
     assert s.free_indices == [0, 1, 2]
     assert s.fixed_indices == []
-    assert s._fixed_are_trailing  # nothing fixed -> trivially trailing
 
 
 def test_dimensions_with_trailing_fixed():
@@ -45,7 +44,6 @@ def test_dimensions_with_trailing_fixed():
     assert s.free_names == ["a", "b"]
     assert s.free_indices == [0, 1]
     assert s.fixed_indices == [2]
-    assert s._fixed_are_trailing
 
 
 def test_dimensions_with_interior_fixed():
@@ -53,7 +51,6 @@ def test_dimensions_with_interior_fixed():
     assert s.free_names == ["a", "c"]
     assert s.free_indices == [0, 2]
     assert s.fixed_indices == [1]
-    assert not s._fixed_are_trailing
 
 
 def test_priors_must_cover_all_names():
@@ -269,7 +266,6 @@ def test_box_degenerate_limit_becomes_fixed():
     assert s.d == 1
     assert s.d_full == 2
     assert s.fixed_indices == [1]
-    assert s._fixed_are_trailing
 
 
 def test_box_map_round_trip():

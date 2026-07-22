@@ -1,6 +1,6 @@
 """Tests for the parallel tempering sampler.
 
-PT is a BaseSampler driven by the inherited ``run_mcmc``; ``num_chains`` is the
+PT is an MCMCSampler driven by the inherited ``run_mcmc``; ``num_chains`` is the
 number of independent ladders.  Statistical-recovery tests: a conjugate Gaussian
 (posterior moments + evidence against the closed form) and -- the point of PT --
 a well-separated bimodal target, whose target chain must show both modes because

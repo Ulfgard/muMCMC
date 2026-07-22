@@ -1,4 +1,4 @@
-"""Tests for ``BaseSampler`` -- the shared posterior assembly and batched driver.
+"""Tests for ``MCMCSampler`` -- the shared posterior assembly and batched driver.
 
 Two responsibilities live here, independent of any concrete sampler:
 
@@ -24,7 +24,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC.BaseSampler import BaseSampler
+from muMCMC.MCMCSampler import MCMCSampler
 from muMCMC.spaces import UnconstrainedSpace, UniformBoxSpace, transforms
 
 torch.set_default_dtype(torch.float64)
@@ -41,7 +41,7 @@ class _State:
         self.q = q
 
 
-class _RecordingSampler(BaseSampler):
+class _RecordingSampler(MCMCSampler):
     def __init__(self, space, potential_fn=None, *, requires_metric=False, delta=1.0):
         super().__init__(
             potential_fn=potential_fn

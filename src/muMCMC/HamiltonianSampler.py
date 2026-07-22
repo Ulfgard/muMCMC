@@ -1,9 +1,10 @@
+from abc import abstractmethod
 from typing import Callable
 from collections import OrderedDict
 
 import torch
 
-from .BaseSampler import BaseSampler
+from .MCMCSampler import MCMCSampler
 
 # =========================================================================== #
 #                                                                             #
@@ -30,13 +31,13 @@ from .BaseSampler import BaseSampler
 # =========================================================================== #
 
 
-class HamiltonianSampler(BaseSampler):
+class HamiltonianSampler(MCMCSampler):
     """Base class for the explicit-integrator HMC-family samplers.
 
     Parameters
     ----------
     model_fn : callable
-        Model potential in constrained coordinates (see ``BaseSampler``).
+        Model potential in constrained coordinates (see ``MCMCSampler``).
     space : object
         Parameter space (priors, transform, free/fixed split).
     requires_metric : bool
@@ -193,37 +194,42 @@ class HamiltonianSampler(BaseSampler):
 
     # ---- hooks the subclass overrides --------------------------------------- #
 
+    @abstractmethod
     def build_initial_state(self, q):
         """Hook, called by :meth:`init`. Return the initial chain state at
         positions ``q`` (model evaluated; momentum drawn later by
         :meth:`step`)."""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     def sample_momentum(self, state):
         """Hook, called at the start of each :meth:`step`. Draw a fresh momentum
         on ``state`` (and reset any per-transition scratch); return ``state``."""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     def integrate(self, state, step_size):
         """Hook, called ``num_steps`` times per :meth:`step`. Advance ``state``
         by one integrator substep at the per-chain ``step_size``; return the new
         state."""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     def acceptance_delta(self, new, old):
         """Hook, called by :meth:`accept`. Return the per-chain Metropolis
         exponent (accept with probability ``min(1, exp(-delta))``), including
         any Jacobian correction; a non-finite value forces rejection. Must also
         populate ``new.U`` (and ``new.metric``) so the selected state carries
         them."""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     def adapt(self, accept_prob, delta_H):
         """Hook, called by :meth:`accept` each transition. Feed the step-size
         adapter (and any other warmup adaptation) with this transition's
         ``accept_prob`` / ``delta_H``. A finalized adapter ignores the update,
         so this is a no-op after warmup."""
-        raise NotImplementedError
+        ...
 
     def reset_extra_diagnostics(self):
         """Hook, called by :meth:`init` and :meth:`end_warmup`. Override to

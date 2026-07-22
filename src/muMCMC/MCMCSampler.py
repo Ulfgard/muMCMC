@@ -14,14 +14,15 @@ from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
 from .spaces import TemperedMetric, TemperedAffine
 
 
-class BaseSampler(ABC):
+class MCMCSampler(ABC):
     """Base class for MCMC samplers.
 
-    Operator interface: ``init(q)`` returns the initial state, ``step(s)``
-    performs one transition, ``end_warmup()`` switches from warmup to sampling.
-    ``run_mcmc`` drives the interface and returns constrained-space samples.
-    Optional hooks ``logging`` (per-step progress-bar stats) and ``diagnostics``
-    (post-run per-chain summaries) default to ``{}``.
+    Operator interface (abstract): ``init(q)`` returns the initial state,
+    ``step(s)`` performs one transition, ``end_warmup()`` switches from warmup
+    to sampling. ``run_mcmc`` is the batched driver that composes them and
+    returns constrained-space samples. Optional hooks ``logging`` (per-step
+    progress-bar stats) and ``diagnostics`` (post-run per-chain summaries)
+    default to ``{}``.
 
     Parameters
     ----------
@@ -148,6 +149,24 @@ class BaseSampler(ABC):
         Default ``{}``."""
         return {}
 
+    # ---- operator interface (composed by the batched run_mcmc) -------------- #
+
+    @abstractmethod
+    def init(self, z_free: torch.Tensor):
+        """Return the initial batched chain state at the unconstrained free
+        positions ``z_free`` (shape ``(num_chains, d)``)."""
+        ...
+
+    @abstractmethod
+    def step(self, state):
+        """Advance the batched chain state by one transition and return it."""
+        ...
+
+    @abstractmethod
+    def end_warmup(self) -> None:
+        """Switch from warmup to sampling, freezing any warmup adaptation."""
+        ...
+
     def run_mcmc(
         self,
         initial_params: torch.Tensor,
@@ -217,8 +236,8 @@ class BaseSampler(ABC):
         return self.space.add_fixed(self.space.from_vector(theta_free_all))
 
 
-class PyroSampler(BaseSampler):
-    """BaseSampler specialization running through Pyro's ``MCMC`` driver.
+class PyroSampler(MCMCSampler):
+    """MCMCSampler specialization running through Pyro's ``MCMC`` driver.
 
     For kernels that are Pyro ``MCMCKernel`` s (e.g. NUTS). Provides the scalar
     ``_pyro_potential`` bridge and a ``run_mcmc`` built on
@@ -230,6 +249,24 @@ class PyroSampler(BaseSampler):
     def kernel(self) -> MCMCKernel:
         """The Pyro ``MCMCKernel`` driven by Pyro's ``MCMC``."""
         ...
+
+    # Sampling runs through Pyro's ``MCMC`` (see ``run_mcmc``), not the batched
+    # ``init``/``step``/``end_warmup`` interface, so these satisfy the abstract
+    # contract only to keep the Pyro-backed samplers instantiable. Transitional:
+    # they go away when the Pyro tether is cut for a native kernel.
+    _NO_BATCHED_IFACE = (
+        "PyroSampler samples through Pyro's MCMC driver; the batched operator "
+        "interface (init/step/end_warmup) is not used."
+    )
+
+    def init(self, z_free: torch.Tensor):
+        raise NotImplementedError(self._NO_BATCHED_IFACE)
+
+    def step(self, state):
+        raise NotImplementedError(self._NO_BATCHED_IFACE)
+
+    def end_warmup(self) -> None:
+        raise NotImplementedError(self._NO_BATCHED_IFACE)
 
     # ===================================================================== #
     # A bound method, not a closure, so Pyro can pickle it when spawning

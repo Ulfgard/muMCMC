@@ -1,6 +1,6 @@
 from typing import Callable
  
-from .BaseSampler import PyroSampler
+from .MCMCSampler import PyroSampler
 import pyro
 import pyro.infer.mcmc
 from pyro.infer.mcmc.mcmc_kernel import MCMCKernel

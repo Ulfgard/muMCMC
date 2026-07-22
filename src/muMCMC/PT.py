@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .BaseSampler import BaseSampler
+from .MCMCSampler import MCMCSampler
 
 
 # ===================================================================== #
@@ -35,9 +35,9 @@ class _PTState:
         return self.inner.q.reshape(self.L, self.K, -1)[:, -1, :]   # target chain, beta=betas[-1]
 
 
-class PT(BaseSampler):
+class PT(MCMCSampler):
     """
-    Parallel tempering wrapping a :class:`BaseSampler` exploration kernel.
+    Parallel tempering wrapping a :class:`MCMCSampler` exploration kernel.
 
     Replica k targets ``pi_{beta_k}(theta) ~ prior(theta) * p(data|theta)**beta_k``
     (``beta = 1`` posterior, ``beta = 0`` prior). Each step explores every replica
@@ -54,13 +54,13 @@ class PT(BaseSampler):
 
     Parameters
     ----------
-    sampler : BaseSampler
+    sampler : MCMCSampler
         Exploration kernel.
     betas : torch.Tensor
         Increasing 1-D inverse temperatures. Target chain is ``betas[-1]``.
     """
 
-    def __init__(self, sampler: BaseSampler, betas: torch.Tensor):
+    def __init__(self, sampler: MCMCSampler, betas: torch.Tensor):
         super().__init__(sampler.potential_fn, sampler.space,
                          requires_metric=sampler.requires_metric)
         self.sampler = sampler

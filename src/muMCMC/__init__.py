@@ -13,7 +13,7 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
-from .BaseSampler import BaseSampler, PyroSampler
+from .MCMCSampler import MCMCSampler, PyroSampler
 from .HamiltonianSampler import HamiltonianSampler
 from .RMHMC import RMHMC, RMHMCState
 from .HMC import HMC, HMCState
@@ -32,7 +32,7 @@ from .spaces import (
 from .adapters import DualAveraging, Reinforce, NoAdaptation
 
 __all__ = [
-    "BaseSampler",
+    "MCMCSampler",
     "PyroSampler",
     "HamiltonianSampler",
     "RMHMC",
