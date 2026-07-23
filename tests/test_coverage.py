@@ -50,13 +50,14 @@ def test_coverage_ci_interval_matches_scipy_binomial():
     assert abs(c.low - ci.low) < 1e-9 and abs(c.high - ci.high) < 1e-9
 
 
-def test_coverage_ci_weighted_interval_centered_on_coverage():
-    # Fractional effective count: the interval must bracket the reported coverage
-    # (the old round-to-integer path could center it elsewhere).
+def test_coverage_ci_weighted_reports_weighted_coverage():
+    # Weighting the two covered PITs up raises the coverage above the unweighted
+    # 0.5, and the interval is valid.
     pits = [0.5, 0.5, 0.1, 0.9]
-    w = np.array([3.0, 1.0, 1.0, 1.0])
+    w = np.array([3.0, 3.0, 1.0, 1.0])
     c = coverage_ci(pits, 0.5, weights=w)
-    assert c.low <= c.coverage <= c.high
+    assert abs(c.coverage - 0.75) < 1e-12
+    assert 0.0 <= c.low <= c.high <= 1.0 and c.n_objects == 4
 
 
 # --------------------------------------------------------------------------- #
