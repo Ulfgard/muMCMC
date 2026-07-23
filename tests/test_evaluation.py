@@ -65,6 +65,27 @@ def _posterior_samples(x, names, K, n, seed=0):
     return {name: z[..., i] for i, name in enumerate(names)}
 
 
+def _linear_gaussian_model(x_obs, sigma):
+    """y=(y0,y1), prior N(0,I), likelihood N(x_obs; y0+y1, sigma^2).
+
+    A small sigma makes the sum y0+y1 tightly determined, so the posterior is
+    strongly correlated and each coordinate is individually predictive. Returns
+    (sampler, names, mu_post, Sigma_post).
+    """
+    names = ["y0", "y1"]
+    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    const = 0.5 * math.log(2 * math.pi * sigma ** 2)
+
+    def potential_fn(theta):                      # U_lik = -log N(x_obs; y0+y1, sigma^2)
+        return 0.5 * (x_obs - theta.sum(-1)) ** 2 / sigma ** 2 + const
+
+    sampler = _Sampler(space, potential_fn)
+    a = torch.tensor([1.0, 1.0])
+    Sigma_post = torch.linalg.inv(torch.eye(2) + torch.outer(a, a) / sigma ** 2)
+    mu_post = Sigma_post @ (a * x_obs / sigma ** 2)
+    return sampler, names, mu_post, Sigma_post
+
+
 # --------------------------------------------------------------------------- #
 #  BAR core                                                                    #
 # --------------------------------------------------------------------------- #
@@ -141,9 +162,8 @@ def test_log_posterior_matches_gaussian_posterior():
 def test_log_posterior_marginal_matches_gaussian_marginal():
     # Conjugate Gaussian: the posterior N(x/2, I/2) factorizes, so the marginal
     # over a subset of coordinates is N(x_a/2, I_a/2). Marginalize one coord out
-    # of three via prior Monte Carlo.
+    # of three via the conditional-Gaussian importance sampler.
     x = torch.tensor([1.0, -0.5, 0.5])
-    d = x.shape[0]
     sampler, names, _ = _gaussian_model(x)
     samples = _posterior_samples(x, names, K=4, n=2000, seed=16)
     ev = PosteriorEvaluation(sampler, samples,
@@ -153,17 +173,41 @@ def test_log_posterior_marginal_matches_gaussian_marginal():
     torch.manual_seed(18)
     ya = x[:2] / 2.0 + 0.3 * torch.randn(16, 2)
     y_dict = {a[0]: ya[:, 0], a[1]: ya[:, 1]}
-    torch.manual_seed(19)                          # prior MC draws
-    lp = ev.log_posterior(y_dict, n_marginal=40000)
+    lp, ess = ev.log_posterior(y_dict, n_marginal=5000, return_ess=True,
+                               generator=torch.Generator().manual_seed(19))
 
     true = torch.distributions.MultivariateNormal(
         x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2))
     lp_true = true.log_prob(ya)
 
-    # The marginalized-block integral is a shared constant across query points,
-    # so differences are exact and the absolute offset is small.
-    assert torch.allclose(lp - lp[0], lp_true - lp_true[0], atol=1e-6)
-    assert abs(float((lp - lp_true).mean())) < 0.05
+    # The posterior-informed proposal is near exact here, so the estimate is
+    # tight pointwise and the weight ESS is a large fraction of the draws.
+    assert torch.max(torch.abs(lp - lp_true)) < 0.05
+    assert float(ess.min()) > 0.5 * 5000
+
+
+def test_log_posterior_marginal_correlated_predictive_block():
+    # Marginalize the predictive, correlated coordinate y1. The prior would be a
+    # poor proposal, but the q̂ conditional tracks y1 ~ x_obs - y0, so the weight
+    # ESS stays high and the marginal matches N(mu_post[0], Sigma_post[00]).
+    x_obs, sigma = 1.5, 0.3
+    sampler, names, mu_post, Sigma_post = _linear_gaussian_model(x_obs, sigma)
+
+    g = torch.Generator().manual_seed(30)
+    L = torch.linalg.cholesky(Sigma_post)
+    zc = mu_post + torch.randn(4, 4000, 2, generator=g) @ L.T
+    samples = {names[i]: zc[..., i] for i in range(2)}
+    ev = PosteriorEvaluation(sampler, samples,
+                             generator=torch.Generator().manual_seed(31))
+
+    sd0 = Sigma_post[0, 0].sqrt()
+    y0 = mu_post[0] + torch.linspace(-1.5, 1.5, 12) * sd0
+    lp, ess = ev.log_posterior({"y0": y0}, n_marginal=8000, return_ess=True,
+                               generator=torch.Generator().manual_seed(32))
+    lp_true = torch.distributions.Normal(mu_post[0], sd0).log_prob(y0)
+
+    assert torch.max(torch.abs(lp - lp_true)) < 0.1
+    assert float(ess.min()) > 0.3 * 8000
 
 
 def test_log_posterior_marginal_requires_a_name():

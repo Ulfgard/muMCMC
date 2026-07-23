@@ -97,7 +97,8 @@ def _fit_gaussian(z: torch.Tensor, jitter: float) -> torch.distributions.Multiva
 
 def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
                   jitter: float = 1e-6, generator: Optional[torch.Generator] = None,
-                  log_target_z: Optional[torch.Tensor] = None) -> float:
+                  log_target_z: Optional[torch.Tensor] = None,
+                  q: Optional[torch.distributions.MultivariateNormal] = None) -> float:
     """BAR log-evidence of ``exp(log_target)`` from its draws ``z`` (shape ``(n, d)``).
 
     Fits a full-covariance normal ``q̂`` to ``z``, draws ``n_q`` points from it,
@@ -118,6 +119,8 @@ def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
     log_target_z : Tensor, optional
         Precomputed ``log_target(z)``. Pass it to avoid re-evaluating an
         expensive target on the input draws.
+    q : MultivariateNormal, optional
+        A ``q̂`` already fitted to ``z``. Pass it to avoid refitting.
 
     Returns
     -------
@@ -125,7 +128,8 @@ def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
         BAR estimate of ``log ∫ f``.
     """
     n, d = z.shape
-    q = _fit_gaussian(z, jitter)
+    if q is None:
+        q = _fit_gaussian(z, jitter)
     n0 = n if n_q is None else int(n_q)
     eps = torch.randn(n0, d, dtype=z.dtype, device=z.device, generator=generator)
     z_q = q.loc + eps @ q.scale_tril.mT
@@ -199,10 +203,15 @@ class PosteriorEvaluation:
         # the pooled estimate, the per-chain estimates, and the W diagnostic.
         self._log_f_post = self._log_target(self._z.reshape(K * n, d))
 
+        # Joint q̂ over all coordinates, fitted once. Drives the pooled estimate,
+        # the W diagnostic, and the conditional proposal for marginals.
+        self._q_pool = _fit_gaussian(self._z.reshape(K * n, d), jitter)
+
         # Main estimate: BAR on the pooled draws over all chains.
         self._log_evidence = _bar_gaussian(
             self._z.reshape(K * n, d), self._log_target, n_q=self._n0,
-            jitter=jitter, generator=generator, log_target_z=self._log_f_post)
+            jitter=jitter, generator=generator, log_target_z=self._log_f_post,
+            q=self._q_pool)
 
     def _log_target(self, z: torch.Tensor) -> torch.Tensor:
         """``log f(z) = −evaluate_model(z).value`` for a batch ``(N, d)``."""
@@ -214,7 +223,8 @@ class PosteriorEvaluation:
         return self._log_evidence
 
     def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None,
-                      generator: Optional[torch.Generator] = None) -> torch.Tensor:
+                      generator: Optional[torch.Generator] = None,
+                      return_ess: bool = False):
         """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
 
         Vectorized over the batch axis of ``y``. Returns the density with respect
@@ -230,11 +240,15 @@ class PosteriorEvaluation:
             log p(y_a|x) = log_prior(y_a) − logZ
                            + log E_{y_b ~ p(y_b)}[ p(x | y_a, y_b) ] .
 
-        The expectation is a Monte Carlo average over ``n_marginal`` draws of
-        ``y_b`` from the prior, so its cost is ``batch × n_marginal`` likelihood
-        evaluations. Prior sampling scales where quadrature does not, and the
-        marginal error is bounded by the posterior variance already present in
-        ``logZ``, so on the order of the posterior sample size is enough.
+        The inner expectation is estimated by importance sampling. There are no
+        samples from the conditional ``p(y_b | x, y_a)``, so a bridge is out and
+        importance sampling is the honest choice. The proposal is the joint
+        ``q̂`` (fitted to the posterior in the constructor) conditioned on ``y_a``,
+        a posterior-informed proposal that tracks the likelihood peak as ``y_a``
+        moves, which matters most when the marginalized block is the predictive
+        one. ``return_ess`` reports the effective sample size of the importance
+        weights per query point, the signal that the proposal covers the
+        integrand, so a strained marginal is visible rather than silently wrong.
 
         Parameters
         ----------
@@ -242,11 +256,18 @@ class PosteriorEvaluation:
             Constrained query points keyed by free name. All free names gives the
             full density, a subset gives the marginal over those names.
         n_marginal : int, optional
-            Prior draws for the marginal expectation. Default is the number of
-            posterior draws. Unused when every free name is present.
+            Importance draws for the marginal expectation. Default is the number
+            of posterior draws. Unused when every free name is present.
         generator : torch.Generator, optional
-            RNG for the marginal prior draws, for reproducibility. Unused when
-            every free name is present.
+            RNG for the marginal draws, for reproducibility. Unused when every
+            free name is present.
+        return_ess : bool
+            If True, also return the per-query-point weight ESS (``None`` for the
+            exact full-support density).
+
+        Returns
+        -------
+        Tensor, or (Tensor, Tensor | None) when ``return_ess``.
         """
         excluded = [name for name in self.space.free_names if name not in y]
         if not excluded:
@@ -255,37 +276,82 @@ class PosteriorEvaluation:
             value = self.sampler.evaluate_model(z)[0].value
             jac = self.space.map_to_constrained_vector(z).jacobian_log_det
             # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
-            return -value - jac - self.log_evidence
+            log_post = -value - jac - self.log_evidence
+            return (log_post, None) if return_ess else log_post
 
-        return self._log_marginal_posterior(y, excluded, n_marginal, generator)
+        log_post, ess = self._log_marginal_posterior(y, excluded, n_marginal, generator)
+        return (log_post, ess) if return_ess else log_post
 
     def _log_marginal_posterior(self, y: dict, excluded: list,
                                 n_marginal: Optional[int],
-                                generator: Optional[torch.Generator]) -> torch.Tensor:
-        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out."""
-        provided = [name for name in self.space.free_names if name in y]
-        if not provided:
+                                generator: Optional[torch.Generator]):
+        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out.
+
+        Importance-samples ``y_b`` from the joint ``q̂`` conditioned on ``y_a`` and
+        reweights by the pushed-forward prior. Returns ``(log_post, ess)``.
+        """
+        free_names = self.space.free_names
+        a_idx = [i for i, name in enumerate(free_names) if name in y]
+        b_idx = [i for i, name in enumerate(free_names) if name not in y]
+        if not a_idx:
             raise ValueError("log_posterior needs at least one free name in y")
+        a_names = [free_names[i] for i in a_idx]
+        b_names = [free_names[i] for i in b_idx]
 
-        M = y[provided[0]].shape[0]
+        M = y[a_names[0]].shape[0]
         S = self._n1 if n_marginal is None else int(n_marginal)
+        d = self._d
+        dtype, device = self._z.dtype, self._z.device
+        a_t = torch.tensor(a_idx, device=device)
+        b_t = torch.tensor(b_idx, device=device)
 
-        # Draw the excluded block from its prior and pair every query point with
-        # every draw on an (M, S) grid.
-        prior = self.space.sample(S, generator=generator)
-        grid = {}
-        for name in provided:
-            grid[name] = y[name].reshape(M, 1).expand(M, S)
-        for name in excluded:
-            grid[name] = prior[name].reshape(1, S).expand(M, S)
+        # Query y_a -> unconstrained z_a. The transform is elementwise, so fill
+        # the b block with any interior placeholder (the image of z = 0) and keep
+        # only the a coordinates of the result.
+        y0 = self.space.from_vector(
+            self.space.map_to_constrained_vector(torch.zeros(d, dtype=dtype, device=device)).mapped_point)
+        full = {name: y[name] for name in a_names}
+        for name in b_names:
+            full[name] = y0[name].expand(M)
+        z_a = self.space.map_to_unconstrained_vector(
+            self.space.to_free_vector(full)).mapped_point[:, a_t]        # (M, |a|)
 
-        theta_free = self.space.to_free_vector(grid).reshape(M * S, self._d)
-        z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
-        loglik = self._tempered_loglik(z).reshape(M, S)
+        # Conditional Gaussian q(z_b | z_a) from the pooled joint fit.
+        mu, Sigma = self._q_pool.loc, self._q_pool.covariance_matrix
+        mu_a, mu_b = mu[a_t], mu[b_t]
+        S_aa = Sigma[a_t[:, None], a_t]
+        S_ab = Sigma[a_t[:, None], b_t]
+        S_bb = Sigma[b_t[:, None], b_t]
+        A = torch.linalg.solve(S_aa, S_ab)                              # Σ_aa⁻¹ Σ_ab
+        mu_cond = mu_b + (z_a - mu_a) @ A                               # (M, |b|)
+        S_cond = S_bb - S_ab.mT @ A
+        S_cond = S_cond + self._jitter * torch.eye(len(b_idx), dtype=dtype, device=device)
+        L_cond = torch.linalg.cholesky(S_cond)
+        q_b = torch.distributions.MultivariateNormal(mu_cond.unsqueeze(1), scale_tril=L_cond)
 
-        # log E_prior[ p(x|y_a,y_b) ] = logsumexp_s loglik(y_a, y_b_s) − log S.
-        log_integral = torch.logsumexp(loglik, dim=1) - math.log(S)
-        return self.space.prior_log_prob(y) + log_integral - self.log_evidence
+        # Draw z_b ~ q(.|z_a) and assemble the full unconstrained points.
+        eps = torch.randn(S, len(b_idx), dtype=dtype, device=device, generator=generator)
+        z_b = mu_cond.unsqueeze(1) + eps @ L_cond.mT                    # (M, S, |b|)
+        z_full = torch.empty(M, S, d, dtype=dtype, device=device)
+        z_full[..., a_t] = z_a[:, None, :].expand(M, S, len(a_idx))
+        z_full[..., b_t] = z_b
+        z_flat = z_full.reshape(M * S, d)
+
+        # Importance weights: log[ p(x|y_a,y_b) · p(y_b) · |dy_b/dz_b| / q(z_b|z_a) ].
+        tmap = self.space.map_to_constrained_vector(z_flat)
+        y_full = tmap.mapped_point
+        jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, S)
+        prior_b = self.space.prior_log_prob(
+            {name: y_full[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, S)
+        loglik = self._tempered_loglik(z_flat).reshape(M, S)
+        log_q = q_b.log_prob(z_b)                                       # (M, S)
+        log_w = loglik + prior_b + jac_b - log_q
+
+        log_integral = torch.logsumexp(log_w, dim=1) - math.log(S)
+        log_post = self.space.prior_log_prob(y) + log_integral - self.log_evidence
+        ess = torch.exp(2 * torch.logsumexp(log_w, dim=1)
+                        - torch.logsumexp(2 * log_w, dim=1))
+        return log_post, ess
 
     def _tempered_loglik(self, z: torch.Tensor) -> torch.Tensor:
         """``beta·loglik(z) = −beta·U_lik``, the tempered log-likelihood."""
@@ -327,8 +393,7 @@ class PosteriorEvaluation:
           estimate.
         """
         z_flat = self._z.reshape(self._n1, self._d)
-        q = _fit_gaussian(z_flat, self._jitter)
-        Wp = (self._log_f_post - q.log_prob(z_flat)).double()
+        Wp = (self._log_f_post - self._q_pool.log_prob(z_flat)).double()
         probs = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99],
                              dtype=torch.float64)
         percentiles = {float(p): float(v)
