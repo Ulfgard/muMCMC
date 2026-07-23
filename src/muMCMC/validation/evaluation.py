@@ -194,8 +194,9 @@ class PosteriorEvaluation:
         K, n, d = theta_free.shape
         self._n_chains, self._n_per_chain, self._d = K, n, d
 
-        # Unconstrained draws grouped by chain.
-        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
+        # Unconstrained draws grouped by chain. Detached so the cached draws (and
+        # everything derived from them: log f, q̂) never carry an autograd graph.
+        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point.detach()
         self._n1 = K * n
         self._n0 = K * n if n_q is None else int(n_q)
 

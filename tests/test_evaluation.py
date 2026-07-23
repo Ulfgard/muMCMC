@@ -300,6 +300,19 @@ def test_diagnostics_single_chain_omits_se():
     assert d["per_chain_log_evidence"].shape == (1,)
 
 
+def test_posterior_evaluation_detaches_accumulated_tensors():
+    # grad-requiring draws must not leave an autograd graph on the cached tensors.
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=2, n=500, seed=60)
+    samples = {k: v.requires_grad_(True) for k, v in samples.items()}
+    ev = PosteriorEvaluation(sampler, samples,
+                             generator=torch.Generator().manual_seed(61))
+    assert not ev._z.requires_grad
+    assert not ev._log_f_post.requires_grad
+    assert not ev._q_pool.loc.requires_grad
+
+
 def test_bar_gaussian_matches_pooled_estimate():
     # The free-standing core on the pooled draws reproduces log_evidence.
     x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])

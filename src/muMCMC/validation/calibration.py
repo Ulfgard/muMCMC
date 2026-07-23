@@ -17,6 +17,17 @@ import numpy as np
 from scipy.stats import binom, binomtest
 
 
+def _as_numpy(x):
+    """Float64 numpy view of ``x``, detaching a torch tensor (and moving it off
+    device) first so a grad-carrying statistic does not error or leak a graph.
+    Duck-typed to avoid importing torch here."""
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "cpu"):
+        x = x.cpu()
+    return np.asarray(x, dtype=np.float64)
+
+
 def _ess(trace, method):
     """arviz effective sample size of a ``(chains, draws)`` trace."""
     import arviz as az
@@ -113,8 +124,7 @@ class Calibration:
         importance weight for reweighting the test set); discarded objects drop
         their weight with them. Equal weights give the unweighted result.
         """
-        traces = {n: np.asarray(f(samples), dtype=np.float64)
-                  for n, f in self.statistics.items()}
+        traces = {n: _as_numpy(f(samples)) for n, f in self.statistics.items()}
         truths = {n: float(f(truth)) for n, f in self.statistics.items()}
 
         if self._thin is True:

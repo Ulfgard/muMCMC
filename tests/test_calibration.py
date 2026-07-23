@@ -107,6 +107,16 @@ def test_overconfident_breaches_band_and_undercovers():
     assert not (c.low <= c.target <= c.high)
 
 
+def test_calibration_accepts_grad_statistics():
+    # a statistic returning a grad-carrying torch tensor must not error; the
+    # accumulated ranks are plain ints.
+    import torch
+    cal = Calibration({"y0": _coord(0)}, L=50, thin=False)
+    cal.add(torch.randn(2, 100, 1, requires_grad=True), torch.zeros(1))
+    assert cal.n_objects == 1
+    assert isinstance(cal.ranks("y0")[0], np.integer)
+
+
 def test_calibration_thin_true_uses_arviz():
     # smoke test of the arviz thinning path on iid draws (ESS ~ n -> tau ~ 1).
     cal = Calibration({"y0": _coord(0)}, L=50, thin=True)
