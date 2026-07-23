@@ -222,6 +222,39 @@ class PosteriorEvaluation:
         """BAR estimate of ``log p(x)``, pooled over all chains."""
         return self._log_evidence
 
+    @cached_property
+    def entropy(self) -> float:
+        """Posterior entropy ``H[p(y|x)] = logZ − E_post[loglik] − E_post[log_prior]``,
+        a plain Monte Carlo average over the draws (w.r.t. ``dy``)."""
+        z = self._z.reshape(self._n1, self._d)
+        theta_free = self.space.map_to_constrained_vector(z).mapped_point
+        loglik = self._tempered_loglik(z)
+        log_prior = self.space.prior_log_prob_vector(theta_free)
+        return self.log_evidence - float(loglik.mean()) - float(log_prior.mean())
+
+    def information_gain(self, y_star: dict, *, target_ess: Optional[float] = None,
+                         max_marginal: Optional[int] = None, prior_weight: float = 0.5,
+                         generator: Optional[torch.Generator] = None,
+                         return_ess: bool = False):
+        """``log[ p(y*|x) / p(y*) ]`` at constrained points ``y*``.
+
+        With every free name present this is ``loglik(y*) − logZ`` (the prior
+        cancels). With a subset present the rest is marginalized out, giving the
+        marginal information gain ``log ∫ p(x|y*_a,y_b) p(y_b) dy_b − logZ`` by the
+        same importance sampler as :meth:`log_posterior`.
+        """
+        excluded = [name for name in self.space.free_names if name not in y_star]
+        if not excluded:
+            z = self.space.map_to_unconstrained_vector(
+                self.space.to_free_vector(y_star)).mapped_point
+            ig = self._tempered_loglik(z) - self.log_evidence
+            return (ig, None) if return_ess else ig
+
+        log_post, ess = self._log_marginal_posterior(
+            y_star, excluded, target_ess, max_marginal, prior_weight, generator)
+        ig = log_post - self.space.prior_log_prob(y_star)
+        return (ig, ess) if return_ess else ig
+
     def log_posterior(self, y: dict, *, target_ess: Optional[float] = None,
                       max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                       generator: Optional[torch.Generator] = None,

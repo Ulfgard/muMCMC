@@ -313,3 +313,117 @@ def test_bar_gaussian_matches_pooled_estimate():
     z = ev._z.reshape(-1, d)
     est = _bar_gaussian(z, ev._log_target, generator=torch.Generator().manual_seed(15))
     assert abs(est - ev.log_evidence) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
+#  Derived quantities: entropy and information gain                           #
+# --------------------------------------------------------------------------- #
+
+def test_entropy_matches_gaussian():
+    # Posterior N(x/2, I/2) has entropy 0.5 d (1 + log pi).
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    d = x.shape[0]
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=8, n=4000, seed=40)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(41))
+    H_true = 0.5 * d * (1.0 + math.log(math.pi))
+    assert abs(ev.entropy - H_true) < 0.05
+
+
+def test_information_gain_matches_gaussian():
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    d = x.shape[0]
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=8, n=4000, seed=42)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(43))
+
+    ys = x / 2.0 + 0.5 * torch.randn(16, d, generator=torch.Generator().manual_seed(44))
+    ig = ev.information_gain({n: ys[:, i] for i, n in enumerate(names)})
+    post = torch.distributions.MultivariateNormal(x / 2.0, 0.5 * torch.eye(d)).log_prob(ys)
+    prior = torch.distributions.MultivariateNormal(torch.zeros(d), torch.eye(d)).log_prob(ys)
+    ig_true = post - prior
+    # loglik is exact, so differences are exact; logZ error is the small offset.
+    assert torch.allclose(ig - ig[0], ig_true - ig_true[0], atol=1e-9)
+    assert abs(float((ig - ig_true).mean())) < 0.05
+
+
+def test_marginal_information_gain_matches_gaussian():
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=4, n=2000, seed=45)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(46))
+
+    ya = x[:2] / 2.0 + 0.2 * torch.randn(8, 2, generator=torch.Generator().manual_seed(47))
+    ig = ev.information_gain({names[0]: ya[:, 0], names[1]: ya[:, 1]},
+                             max_marginal=20000, generator=torch.Generator().manual_seed(48))
+    post = torch.distributions.MultivariateNormal(x[:2] / 2.0, 0.5 * torch.eye(2)).log_prob(ya)
+    prior = torch.distributions.MultivariateNormal(torch.zeros(2), torch.eye(2)).log_prob(ya)
+    assert torch.max(torch.abs(ig - (post - prior))) < 0.1
+
+
+# --------------------------------------------------------------------------- #
+#  Hardening: bimodal posterior and sticky (autocorrelated) chains            #
+# --------------------------------------------------------------------------- #
+
+def _bimodal_model(m, s, sigma0, w):
+    """1D: space prior N(0, sigma0), target f = w N(m,s) + (1-w) N(-m,s), logZ=0.
+
+    U_lik = log_prior - log f cancels the space prior in evaluate_model, so the
+    unnormalized posterior is exactly f (which integrates to 1).
+    """
+    space = UnconstrainedSpace(["y"], priors={"y": Normal(0.0, sigma0)})
+    prior, cp, cm = Normal(0.0, sigma0), Normal(m, s), Normal(-m, s)
+
+    def potential_fn(theta):
+        y = theta[..., 0]
+        log_f = torch.logaddexp(math.log(w) + cp.log_prob(y),
+                                math.log(1 - w) + cm.log_prob(y))
+        return prior.log_prob(y) - log_f
+
+    return _Sampler(space, potential_fn)
+
+
+def _bimodal_samples(m, s, w, K, n, seed):
+    g = torch.Generator().manual_seed(seed)
+    sign = torch.where(torch.rand(K, n, generator=g) < w, 1.0, -1.0)
+    return {"y": sign * m + s * torch.randn(K, n, generator=g)}
+
+
+def test_log_evidence_bimodal_single_gaussian_q():
+    # Bimodal posterior, single-Gaussian q̂ fitted across both modes. BAR still
+    # recovers logZ = 0 (q̂ quality is variance, not bias).
+    m, s, sigma0, w = 3.0, 0.5, 5.0, 0.6
+    sampler = _bimodal_model(m, s, sigma0, w)
+    samples = _bimodal_samples(m, s, w, K=8, n=4000, seed=50)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(51))
+    se = ev.diagnostics["log_evidence_se"]
+    assert abs(ev.log_evidence) < max(3.0 * se, 0.05)
+
+
+def _sticky(draws, stay_prob, seed):
+    """Carry each draw forward with probability stay_prob (an autocorrelated
+    chain with the same stationary distribution)."""
+    g = torch.Generator().manual_seed(seed)
+    K, n, _ = draws.shape
+    out = draws.clone()
+    stay = torch.rand(K, n, generator=g) < stay_prob
+    for t in range(1, n):
+        out[:, t] = torch.where(stay[:, t][:, None], out[:, t - 1], draws[:, t])
+    return out
+
+
+def test_log_evidence_sticky_chain_unbiased_and_honest_se():
+    # Stay-probability 0.98 (g ~ 99). The point estimate stays unbiased and the
+    # per-chain SE inflates relative to iid, tracking the real replicate spread.
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    sampler, names, logZ_true = _gaussian_model(x)
+    iid = _posterior_samples(x, names, K=16, n=3000, seed=52)
+    base = torch.stack([iid[n] for n in names], dim=-1)
+    sticky = _sticky(base, 0.98, seed=53)
+    sticky_samples = {n: sticky[..., i] for i, n in enumerate(names)}
+
+    ev_iid = PosteriorEvaluation(sampler, iid, generator=torch.Generator().manual_seed(54))
+    ev = PosteriorEvaluation(sampler, sticky_samples, generator=torch.Generator().manual_seed(55))
+    se = ev.diagnostics["log_evidence_se"]
+    assert abs(ev.log_evidence - logZ_true) < 3.0 * se
+    assert se > 1.5 * ev_iid.diagnostics["log_evidence_se"]
