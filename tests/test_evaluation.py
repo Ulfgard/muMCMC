@@ -183,7 +183,35 @@ def test_log_posterior_marginal_matches_gaussian_marginal():
     # The posterior-informed proposal is near exact here, so the estimate is
     # tight pointwise and the weight ESS is a large fraction of the draws.
     assert torch.max(torch.abs(lp - lp_true)) < 0.05
-    assert float(ess.min()) > 0.5 * 5000
+    assert float(ess.min()) > 0.3 * 5000
+
+
+def test_log_posterior_marginal_consistent_across_prior_weight():
+    # The defensive mixture is unbiased for every prior_weight: pure conditional
+    # (0), 50/50 (0.5), and pure prior (1) all recover the analytic marginal.
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=4, n=2000, seed=20)
+    ev = PosteriorEvaluation(sampler, samples,
+                             generator=torch.Generator().manual_seed(21))
+    ya = x[:2] / 2.0 + 0.2 * torch.randn(8, 2, generator=torch.Generator().manual_seed(22))
+    y_dict = {names[0]: ya[:, 0], names[1]: ya[:, 1]}
+    lp_true = torch.distributions.MultivariateNormal(
+        x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2)).log_prob(ya)
+
+    for alpha in (0.0, 0.5, 1.0):
+        lp = ev.log_posterior(y_dict, n_marginal=20000, prior_weight=alpha,
+                              generator=torch.Generator().manual_seed(23))
+        assert torch.max(torch.abs(lp - lp_true)) < 0.1, alpha
+
+
+def test_log_posterior_prior_weight_out_of_range_raises():
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=2, n=500, seed=24)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(25))
+    with pytest.raises(ValueError):
+        ev.log_posterior({names[0]: torch.zeros(3)}, prior_weight=1.5)
 
 
 def test_log_posterior_marginal_correlated_predictive_block():

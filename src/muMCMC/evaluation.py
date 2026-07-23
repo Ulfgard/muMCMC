@@ -223,51 +223,32 @@ class PosteriorEvaluation:
         return self._log_evidence
 
     def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None,
+                      prior_weight: float = 0.5,
                       generator: Optional[torch.Generator] = None,
                       return_ess: bool = False):
-        """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
+        """``log p(y|x)`` at constrained points ``y``, a density w.r.t. ``dy``.
 
-        Vectorized over the batch axis of ``y``. Returns the density with respect
-        to the constrained measure ``dy``.
-
-        The set of names present in ``y`` selects the marginal. With every free
-        name present the full posterior density is exact,
-
-            log p(y|x) = loglik(y) + log_prior(y) − logZ .
-
-        With a subset present the complementary block ``y_b`` is marginalized out,
-
-            log p(y_a|x) = log_prior(y_a) − logZ
-                           + log E_{y_b ~ p(y_b)}[ p(x | y_a, y_b) ] .
-
-        The inner expectation is estimated by importance sampling. There are no
-        samples from the conditional ``p(y_b | x, y_a)``, so a bridge is out and
-        importance sampling is the honest choice. The proposal is the joint
-        ``q̂`` (fitted to the posterior in the constructor) conditioned on ``y_a``,
-        a posterior-informed proposal that tracks the likelihood peak as ``y_a``
-        moves, which matters most when the marginalized block is the predictive
-        one. ``return_ess`` reports the effective sample size of the importance
-        weights per query point, the signal that the proposal covers the
-        integrand, so a strained marginal is visible rather than silently wrong.
+        The free names present in ``y`` select the marginal. All names gives the
+        exact full density ``loglik(y) + log_prior(y) − logZ``. A subset gives the
+        marginal over those names, integrating the rest out by importance
+        sampling from a mixture of the prior and the joint ``q̂`` conditioned on
+        ``y_a`` (``prior_weight`` is the mixture weight on the prior).
 
         Parameters
         ----------
         y : dict[str, Tensor]
             Constrained query points keyed by free name. All free names gives the
-            full density, a subset gives the marginal over those names.
+            full density, a subset the marginal over those names.
         n_marginal : int, optional
-            Importance draws for the marginal expectation. Default is the number
-            of posterior draws. Unused when every free name is present.
+            Importance draws for a marginal. Default is the posterior draw count.
+        prior_weight : float
+            Mixture weight on the prior component, in ``[0, 1]``. ``0`` is the pure
+            conditional proposal, ``1`` plain prior sampling.
         generator : torch.Generator, optional
-            RNG for the marginal draws, for reproducibility. Unused when every
-            free name is present.
+            RNG for the marginal draws.
         return_ess : bool
             If True, also return the per-query-point weight ESS (``None`` for the
-            exact full-support density).
-
-        Returns
-        -------
-        Tensor, or (Tensor, Tensor | None) when ``return_ess``.
+            exact full density).
         """
         excluded = [name for name in self.space.free_names if name not in y]
         if not excluded:
@@ -279,17 +260,17 @@ class PosteriorEvaluation:
             log_post = -value - jac - self.log_evidence
             return (log_post, None) if return_ess else log_post
 
-        log_post, ess = self._log_marginal_posterior(y, excluded, n_marginal, generator)
+        log_post, ess = self._log_marginal_posterior(
+            y, excluded, n_marginal, prior_weight, generator)
         return (log_post, ess) if return_ess else log_post
 
     def _log_marginal_posterior(self, y: dict, excluded: list,
-                                n_marginal: Optional[int],
+                                n_marginal: Optional[int], alpha: float,
                                 generator: Optional[torch.Generator]):
-        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out.
-
-        Importance-samples ``y_b`` from the joint ``q̂`` conditioned on ``y_a`` and
-        reweights by the pushed-forward prior. Returns ``(log_post, ess)``.
-        """
+        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out by
+        mixture importance sampling. Returns ``(log_post, ess)``."""
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"defensive_fraction must be in [0, 1], got {alpha}")
         free_names = self.space.free_names
         a_idx = [i for i, name in enumerate(free_names) if name in y]
         b_idx = [i for i, name in enumerate(free_names) if name not in y]
@@ -329,23 +310,49 @@ class PosteriorEvaluation:
         L_cond = torch.linalg.cholesky(S_cond)
         q_b = torch.distributions.MultivariateNormal(mu_cond.unsqueeze(1), scale_tril=L_cond)
 
-        # Draw z_b ~ q(.|z_a) and assemble the full unconstrained points.
-        eps = torch.randn(S, len(b_idx), dtype=dtype, device=device, generator=generator)
-        z_b = mu_cond.unsqueeze(1) + eps @ L_cond.mT                    # (M, S, |b|)
+        # Draw z_b from the defensive mixture: n_prior points from the prior and
+        # n_cond from the conditional q(.|z_a).
+        n_prior = int(round(alpha * S))
+        n_cond = S - n_prior
+        blocks = []
+        if n_cond > 0:
+            eps = torch.randn(n_cond, len(b_idx), dtype=dtype, device=device, generator=generator)
+            blocks.append(mu_cond.unsqueeze(1) + eps @ L_cond.mT)       # (M, n_cond, |b|)
+        if n_prior > 0:
+            # Prior draws of the b block, shared across query points.
+            prior = self.space.sample(n_prior, generator=generator)
+            full_p = {name: y0[name].expand(n_prior) for name in a_names}
+            for name in b_names:
+                full_p[name] = prior[name]
+            z_bp = self.space.map_to_unconstrained_vector(
+                self.space.to_free_vector(full_p)).mapped_point[:, b_t]  # (n_prior, |b|)
+            blocks.append(z_bp[None].expand(M, n_prior, len(b_idx)))
+        z_b = torch.cat(blocks, dim=1)                                  # (M, S, |b|)
+
         z_full = torch.empty(M, S, d, dtype=dtype, device=device)
         z_full[..., a_t] = z_a[:, None, :].expand(M, S, len(a_idx))
         z_full[..., b_t] = z_b
         z_flat = z_full.reshape(M * S, d)
 
-        # Importance weights: log[ p(x|y_a,y_b) · p(y_b) · |dy_b/dz_b| / q(z_b|z_a) ].
+        # Prior density pushed to z, and the conditional density, at every draw.
         tmap = self.space.map_to_constrained_vector(z_flat)
         y_full = tmap.mapped_point
         jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, S)
         prior_b = self.space.prior_log_prob(
             {name: y_full[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, S)
+        log_pi = prior_b + jac_b                                        # log prior density in z
+        log_qc = q_b.log_prob(z_b)                                      # (M, S)
+
+        # Mixture density with the actual sampling fractions (deterministic
+        # mixture), and weights w = p(x|y_a,y_b) · p(y_b) · |dy_b/dz_b| / q_mix.
+        terms = []
+        if n_prior > 0:
+            terms.append(math.log(n_prior / S) + log_pi)
+        if n_cond > 0:
+            terms.append(math.log(n_cond / S) + log_qc)
+        log_qmix = terms[0] if len(terms) == 1 else torch.logaddexp(terms[0], terms[1])
         loglik = self._tempered_loglik(z_flat).reshape(M, S)
-        log_q = q_b.log_prob(z_b)                                       # (M, S)
-        log_w = loglik + prior_b + jac_b - log_q
+        log_w = loglik + log_pi - log_qmix
 
         log_integral = torch.logsumexp(log_w, dim=1) - math.log(S)
         log_post = self.space.prior_log_prob(y) + log_integral - self.log_evidence
