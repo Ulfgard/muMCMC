@@ -9,6 +9,28 @@ contribution.
 ``push_forward_metric`` pushes a constrained-space metric forward to the free
 unconstrained coordinates.  ``TemperedAffine`` holds a quantity affinely in an
 inverse temperature.
+
+Prior contract
+--------------
+The prior ``p(y)`` is assumed to (a) **factorize** over the parameter names and
+(b) be a **normalized** density over the free coordinates.  Both are relied on
+by anything that reads ``log p(x) = log ∫ p(x|y) p(y) dy`` as an evidence:
+factorization lets a marginal drop the integrated-out names cleanly, and a
+missing normalizer shifts the evidence by exactly that constant.
+
+Factorization also fixes the marginal interface: ``prior_log_prob`` is keyed on
+*which* free names are present in its argument.  Passing every free name returns
+the full log-prior; passing a subset returns the marginal log-prior over that
+subset (the sum of just those factors).  The footgun is that a name accidentally
+dropped from the argument silently yields a marginal rather than an error -- an
+accepted cost of keeping the interface a single dict-in method.
+
+A space normalizes any prior it *defines itself* -- e.g. the implicit uniform of
+a bounded box contributes ``-log(u_i - l_i)`` per coordinate.  User-supplied
+per-name priors are taken as given: the caller is responsible for their
+normalization, and in particular an explicit prior is **not** renormalized for
+truncation to a box.  Detecting an unnormalized prior is out of scope for the
+current interface, so it is a documented precondition rather than a checked one.
 """
 
 from functools import cached_property
@@ -311,12 +333,20 @@ class UnconstrainedSpace:
         return transforms.identity(z_vec)
 
     def prior_log_prob(self, y):
+        """Factorized log-prior over the free names present in ``y``.
+
+        Passing every free name gives the full log-prior; passing a subset gives
+        the marginal log-prior over that subset -- valid because the prior
+        factorizes over names.  Footgun: a name accidentally dropped from ``y``
+        silently yields a marginal instead of raising."""
         if self.priors is None:
             raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
+        names = [yi for yi in self._free_names if yi in y]
+        if not names:
+            raise ValueError("y contains none of the free parameter names")
         result = 0
-        # Sum over free names only. Fixed coords are absent from y.
-        for yi in self._free_names:
-            result += self.priors[yi].log_prob(y[yi]).squeeze(-1)
+        for yi in names:
+            result = result + self.priors[yi].log_prob(y[yi]).squeeze(-1)
         return result
 
     def prior_log_prob_vector(self, theta_free):
@@ -421,6 +451,19 @@ class UniformBoxSpace:
         self.free_indices = [name_to_idx[yi] for yi in self.free_names]
         self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
 
+        # Per-coordinate normalizer of the box prior. A free coordinate with no
+        # explicit prior is uniform on [l_i, u_i] and contributes -log(u_i - l_i)
+        # to its normalized log-density. Kept per name so a marginal prior over a
+        # subset of names sums only the provided coordinates' constants, and so
+        # the full prior integrates to 1 over the box (a well-defined evidence
+        # needs this). A constant offset in the potential does not affect
+        # sampling. Explicit priors are taken as given and carry no entry.
+        self._uniform_log_norm = {
+            yi: float(-torch.log(self.u[i] - self.l[i]))
+            for i, yi in enumerate(self.free_names)
+            if yi not in self.priors
+        }
+
     def to_free_vector(self, samples):
         return torch.stack([samples[yi] for yi in self.free_names], dim=-1)
 
@@ -445,17 +488,29 @@ class UniformBoxSpace:
         return transforms.box(z_vec, self.l, self.u)
 
     def prior_log_prob(self, y):
-        # Unnormalized log-prior. Zero with no prior (uniform on the box).
+        """Factorized, box-normalized log-prior over the free names present in
+        ``y``.
+
+        Coordinates without an explicit prior are uniform on ``[l_i, u_i]`` and
+        contribute ``-log(u_i - l_i)``; explicit per-coordinate priors are added
+        as given (not renormalized for truncation to the box).  Passing every
+        free name gives the full log-prior; passing a subset gives the marginal
+        log-prior over that subset (the prior factorizes over names).  Footgun: a
+        name accidentally dropped from ``y`` silently yields a marginal."""
         first = next(iter(y.values()))
-        result = torch.zeros(first.shape, device=first.device, dtype=first.dtype)
-        for yi in self.free_names:
+        names = [yi for yi in self.free_names if yi in y]
+        if not names:
+            raise ValueError("y contains none of the free parameter names")
+        log_norm = sum(self._uniform_log_norm[yi]
+                       for yi in names if yi not in self.priors)
+        result = torch.full(first.shape, float(log_norm),
+                            device=first.device, dtype=first.dtype)
+        for yi in names:
             if yi in self.priors:
                 result = result + self.priors[yi].log_prob(y[yi]).squeeze(-1)
         return result
 
     def prior_log_prob_vector(self, theta_free):
-        if not self.priors:
-            return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
         return self.prior_log_prob(self.from_vector(theta_free))
 
     def prior_metric(self, theta_full):
