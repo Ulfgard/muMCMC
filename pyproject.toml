@@ -29,7 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7.0"]
+# arviz backs the ESS thinning in validation.coverage; it is imported lazily, so
+# the core library does not require it.
+validation = ["arviz>=0.15"]
+test = ["pytest>=7.0", "arviz>=0.15"]
 
 [project.urls]
 Homepage = "https://github.com/Ulfgard/muMCMC"
