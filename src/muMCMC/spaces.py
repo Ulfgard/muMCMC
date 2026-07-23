@@ -13,23 +13,23 @@ inverse temperature.
 Prior contract
 --------------
 The prior ``p(y)`` is assumed to (a) **factorize** over the parameter names and
-(b) be a **normalized** density over the free coordinates.  Both are relied on
-by anything that reads ``log p(x) = log ∫ p(x|y) p(y) dy`` as an evidence:
-factorization lets a marginal drop the integrated-out names cleanly, and a
-missing normalizer shifts the evidence by exactly that constant.
+(b) be a **normalized** density over the free coordinates. Both are relied on by
+anything that reads ``log p(x) = log ∫ p(x|y) p(y) dy`` as an evidence.
+Factorization lets a marginal drop the integrated-out names cleanly. A missing
+normalizer shifts the evidence by exactly that constant.
 
-Factorization also fixes the marginal interface: ``prior_log_prob`` is keyed on
-*which* free names are present in its argument.  Passing every free name returns
-the full log-prior; passing a subset returns the marginal log-prior over that
-subset (the sum of just those factors).  The footgun is that a name accidentally
-dropped from the argument silently yields a marginal rather than an error -- an
+Factorization also fixes the marginal interface. ``prior_log_prob`` is keyed on
+*which* free names are present in its argument. Passing every free name returns
+the full log-prior. Passing a subset returns the marginal log-prior over that
+subset, the sum of just those factors. The footgun is that a name accidentally
+dropped from the argument silently yields a marginal rather than an error, an
 accepted cost of keeping the interface a single dict-in method.
 
-A space normalizes any prior it *defines itself* -- e.g. the implicit uniform of
-a bounded box contributes ``-log(u_i - l_i)`` per coordinate.  User-supplied
-per-name priors are taken as given: the caller is responsible for their
-normalization, and in particular an explicit prior is **not** renormalized for
-truncation to a box.  Detecting an unnormalized prior is out of scope for the
+A space normalizes any prior it *defines itself*. For example the implicit
+uniform of a bounded box contributes ``-log(u_i - l_i)`` per coordinate.
+User-supplied per-name priors are taken as given. The caller is responsible for
+their normalization, and in particular an explicit prior is **not** renormalized
+for truncation to a box. Detecting an unnormalized prior is out of scope for the
 current interface, so it is a documented precondition rather than a checked one.
 """
 
@@ -335,9 +335,9 @@ class UnconstrainedSpace:
     def prior_log_prob(self, y):
         """Factorized log-prior over the free names present in ``y``.
 
-        Passing every free name gives the full log-prior; passing a subset gives
-        the marginal log-prior over that subset -- valid because the prior
-        factorizes over names.  Footgun: a name accidentally dropped from ``y``
+        Passing every free name gives the full log-prior. Passing a subset gives
+        the marginal log-prior over that subset, valid because the prior
+        factorizes over names. Footgun: a name accidentally dropped from ``y``
         silently yields a marginal instead of raising."""
         if self.priors is None:
             raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
@@ -492,11 +492,12 @@ class UniformBoxSpace:
         ``y``.
 
         Coordinates without an explicit prior are uniform on ``[l_i, u_i]`` and
-        contribute ``-log(u_i - l_i)``; explicit per-coordinate priors are added
-        as given (not renormalized for truncation to the box).  Passing every
-        free name gives the full log-prior; passing a subset gives the marginal
-        log-prior over that subset (the prior factorizes over names).  Footgun: a
-        name accidentally dropped from ``y`` silently yields a marginal."""
+        contribute ``-log(u_i - l_i)``. Explicit per-coordinate priors are added
+        as given (not renormalized for truncation to the box). Passing every free
+        name gives the full log-prior. Passing a subset gives the marginal
+        log-prior over that subset, since the prior factorizes over names.
+        Footgun: a name accidentally dropped from ``y`` silently yields a
+        marginal."""
         first = next(iter(y.values()))
         names = [yi for yi in self.free_names if yi in y]
         if not names:

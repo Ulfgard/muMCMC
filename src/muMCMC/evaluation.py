@@ -7,11 +7,11 @@ sampler, and the space's prior ``p(y)``, this module estimates
     log p(y|x) = loglik(y) + log p(y) − log p(x)   (``log_posterior``)
 
 The evidence uses BAR (Bennett acceptance ratio, as reverse logistic
-regression).  Work happens in the sampler's unconstrained coordinates ``z``,
+regression). Work happens in the sampler's unconstrained coordinates ``z``,
 where ``sampler.evaluate_model(z).value`` is exactly ``−log f(z)`` for the
 unnormalized posterior density ``f(z) = p(x|y(z)) p(y(z)) |dy/dz|`` whose
-integral over ``z`` is the evidence.  A Gaussian reference ``q̂`` is fitted to
-the ``z``-draws; with the log-ratio
+integral over ``z`` is the evidence. A Gaussian reference ``q̂`` is fitted to
+the ``z``-draws. With the log-ratio
 
     W(z) = log f(z) − log q̂(z) = −evaluate_model(z).value − log q̂(z)
 
@@ -24,12 +24,12 @@ evaluated on the posterior draws (``n1`` of them) and on ``n0`` draws from
 the root is unique and always brackets.
 
 The evidence is reparameterization-invariant, so the ``z``-space value equals
-the ``y``-space integral.  Everything uses the sampler's current ``beta``; a
+the ``y``-space integral. Everything uses the sampler's current ``beta``. A
 tempered sampler yields the corresponding tempered evidence, which is the
 caller's choice.
 
 The prior is assumed proper and normalized (see the prior contract in
-``spaces``); an unnormalized prior shifts ``log p(x)`` by its missing constant.
+``spaces``). An unnormalized prior shifts ``log p(x)`` by its missing constant.
 """
 from __future__ import annotations
 
@@ -52,9 +52,9 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
 
         b* ∈ [ log(n1/n0) − W_max ,  log(n1/n0) − W_min ]
 
-    (equivalently ``log p(x) ∈ [W_min, W_max]``).  A small ``pad`` makes the sign
-    change strict and absorbs the all-equal-``W`` degenerate case; the root is
-    then refined by ``scipy.optimize.brentq``.
+    (equivalently ``log p(x) ∈ [W_min, W_max]``). A small ``pad`` makes the sign
+    change strict and absorbs the degenerate case where every ``W`` is equal. The
+    root is then refined by ``scipy.optimize.brentq``.
 
     Parameters
     ----------
@@ -84,33 +84,34 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
 class PosteriorEvaluation:
     """Evidence and posterior density from posterior draws.
 
-    Precomputes and caches the quantities shared by the estimators -- the
-    unconstrained draws, the fitted reference ``q̂``, and the BAR log-ratios --
-    so that :attr:`log_evidence`, :meth:`log_posterior`, and :attr:`diagnostics`
-    reuse them without recomputation.
+    Estimates the log-evidence ``log Z`` of the density the sampler targets and
+    the posterior log-density ``log p(y|x)`` that follows from it. When that
+    density is a valid posterior ``p(x|y) p(y)``, ``log Z`` is exactly the model
+    evidence ``log p(x)``. Otherwise it is the log normalizer of whatever
+    unnormalized density the sampler was run on.
+
+    The estimator is BAR (Bennett acceptance ratio, Bennett 1976), cast as
+    reverse logistic regression (Geyer 1994). A reference ``q̂`` is fitted to the
+    draws as a full-covariance normal in the sampler's unconstrained coordinates,
+    and ``log Z`` is the intercept discriminating the draws from samples of
+    ``q̂``. Fitting ``q̂`` on the same draws leaves the estimator consistent. The
+    quality of the normal fit sets the variance, not the limit.
 
     Parameters
     ----------
     sampler : MCMCSampler
-        The sampler that drew ``samples``.  Supplies ``evaluate_model`` and
-        ``space``; its current ``beta`` sets the temperature of the evidence.
+        The sampler that drew ``samples``. Supplies ``evaluate_model`` and
+        ``space``. Its current ``beta`` sets the temperature of the evidence.
     samples : dict[str, Tensor]
         Constrained draws keyed by free parameter name, as returned by
-        ``run_mcmc`` (grouped by chain, shape ``(num_chains, num_samples)``; a
-        single ungrouped axis ``(num_samples,)`` is also accepted).
+        ``run_mcmc`` (grouped by chain, shape ``(num_chains, num_samples)``). A
+        single ungrouped axis ``(num_samples,)`` is also accepted.
     n_q : int, optional
-        Number of ``q̂`` draws ``n0``.  Default: the number of posterior draws.
+        Number of ``q̂`` draws ``n0``. Default is the number of posterior draws.
     jitter : float
         Diagonal loading added to the fitted covariance for a stable Cholesky.
     generator : torch.Generator, optional
         RNG for the ``q̂`` draws, for reproducibility.
-
-    Notes
-    -----
-    v1 fits a full-covariance Gaussian ``q̂`` to the pooled draws and reuses all
-    draws for both the fit and the estimate; the reuse bias is ``≈ p / (2
-    n_eff)`` for a ``p``-parameter ``q̂``.  ``q̂`` quality affects variance, not
-    consistency.
     """
 
     def __init__(
@@ -167,14 +168,14 @@ class PosteriorEvaluation:
     def log_posterior(self, y: dict) -> torch.Tensor:
         """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
 
-        Vectorized over the batch axis of ``y``.  Returns the density with
-        respect to the constrained measure ``dy``.  v1 requires all free names;
-        the marginal over a name subset is planned for v2.
+        Vectorized over the batch axis of ``y``. Returns the density with
+        respect to the constrained measure ``dy``. v1 requires all free names.
+        The marginal over a name subset is planned for v2.
         """
         missing = [name for name in self.space.free_names if name not in y]
         if missing:
             raise NotImplementedError(
-                f"log_posterior needs all free names; missing {missing}. "
+                f"log_posterior needs all free names, missing {missing}. "
                 "Marginalizing over a name subset is planned for v2."
             )
         theta_free = self.space.to_free_vector(y)
@@ -195,11 +196,11 @@ class PosteriorEvaluation:
     def diagnostics(self) -> dict:
         """Scalar diagnostics for automated gating.
 
-        - ``W_percentiles``: percentiles of ``W`` on the posterior draws; a heavy
+        - ``W_percentiles``: percentiles of ``W`` on the posterior draws. A heavy
           upper tail means ``q̂`` misses posterior mass.
         - ``per_chain_log_evidence``: per-chain ``logZ`` (shape ``(K,)``).
         - ``log_evidence_se``: standard error of the pooled estimate from the
-          per-chain spread (``NaN`` for a single chain); absorbs autocorrelation.
+          per-chain spread, ``NaN`` for a single chain. Absorbs autocorrelation.
         - ``n1``, ``n0``: raw posterior and ``q̂`` draw counts.
         """
         probs = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99],
