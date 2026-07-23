@@ -14,7 +14,7 @@ rank, and any other statistic works the same way.
 from collections import namedtuple
 
 import numpy as np
-from scipy.stats import binom
+from scipy.stats import binom, binomtest
 
 
 def _ess(trace, method):
@@ -26,6 +26,8 @@ def _ess(trace, method):
 
 SBCHistogram = namedtuple(
     "SBCHistogram", ["counts", "bin_edges", "expected", "low", "high", "n_objects"])
+
+Coverage = namedtuple("Coverage", ["coverage", "low", "high", "target", "n_objects"])
 
 
 def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
@@ -77,7 +79,9 @@ class Calibration:
     thinning factor (taken once, as the largest over the statistics), so every
     statistic uses ~independent draws. An object that cannot supply ``L`` draws
     that far apart is discarded and counted in :attr:`n_discarded`.
-    :meth:`sbc_histogram` reads the accumulated ranks of a statistic.
+    :meth:`coverage` reads the central-interval coverage at a level and
+    :meth:`sbc_histogram` the full rank histogram, both from the accumulated
+    ranks of a statistic.
 
     Parameters
     ----------
@@ -140,6 +144,44 @@ class Calibration:
     def ranks(self, name):
         """Accumulated SBC ranks for statistic ``name`` (shape ``(n_objects,)``)."""
         return np.array(self._ranks[name], dtype=int)
+
+    def coverage(self, name, level, *, confidence=0.95):
+        """Empirical central-``level`` coverage for statistic ``name``.
+
+        The fraction of objects whose rank falls in the central-``level`` band
+        (``rank / L in [alpha/2, 1 - alpha/2]``), with an exact Clopper-Pearson
+        interval over the objects. ``target`` is the discrete-uniform reference
+        ``p_L``: the coverage a calibrated sampler produces at this finite ``L``
+        (it tends to ``level`` as ``L`` grows). Compare the coverage to ``target``,
+        not to ``level`` -- that is how the finite-draw (ESS) uncertainty of the
+        ranks enters, as a shift of the reference rather than a wider interval.
+
+        Parameters
+        ----------
+        name : str
+            Statistic to score.
+        level : float
+            Nominal central-interval level, in ``(0, 1)``.
+        confidence : float
+            Confidence level of the Clopper-Pearson interval.
+
+        Returns
+        -------
+        Coverage
+            ``(coverage, low, high, target, n_objects)``.
+        """
+        r = self.ranks(name)
+        M = r.size
+        alpha = 1.0 - level
+        lo_edge, hi_edge = alpha / 2.0, 1.0 - alpha / 2.0
+        grid = np.arange(self.L + 1) / self.L
+        target = float(np.mean((grid >= lo_edge) & (grid <= hi_edge)))
+        if M == 0:
+            return Coverage(float("nan"), float("nan"), float("nan"), target, 0)
+        pit = r / self.L
+        k = int(np.count_nonzero((pit >= lo_edge) & (pit <= hi_edge)))
+        ci = binomtest(k, M).proportion_ci(confidence_level=confidence, method="exact")
+        return Coverage(k / M, float(ci.low), float(ci.high), target, M)
 
     def sbc_histogram(self, name, *, n_bins=None, confidence=0.99):
         """SBC rank histogram + band for statistic ``name``, as an

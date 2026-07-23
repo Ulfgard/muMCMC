@@ -8,7 +8,7 @@ the rank histogram inside the band while an overconfident posterior breaches it.
 import numpy as np
 
 from muMCMC.validation import Calibration
-from muMCMC.validation.calibration import _sbc_histogram, SBCHistogram
+from muMCMC.validation.calibration import _sbc_histogram, SBCHistogram, Coverage
 
 
 def _coord(k):
@@ -66,6 +66,33 @@ def test_calibration_uniform_under_calibration():
     h = cal.sbc_histogram("y0", n_bins=10)
     outside = int(np.sum((h.counts < h.low) | (h.counts > h.high)))
     assert outside <= 1
+
+
+def test_coverage_matches_target_under_calibration():
+    # calibrated draws -> coverage at each level sits at the finite-L target p_L,
+    # which for L=99 is within 0.02 of the nominal level.
+    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
+    rng = np.random.default_rng(20)
+    for _ in range(1500):
+        cal.add(rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+    for level in (0.5, 0.75, 0.95):
+        c = cal.coverage("y0", level)
+        assert isinstance(c, Coverage) and c.n_objects == 1500
+        assert abs(c.target - level) < 0.02
+        assert abs(c.coverage - c.target) < 0.04       # a few binomial SE at M=1500
+        assert c.low <= c.coverage <= c.high
+
+
+def test_coverage_flags_overconfident_posterior():
+    # posterior too narrow: the central interval misses the truth far more often,
+    # so coverage falls well below the target and the target leaves the interval.
+    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
+    rng = np.random.default_rng(21)
+    for _ in range(1000):
+        cal.add(0.5 * rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+    c = cal.coverage("y0", 0.95)
+    assert c.coverage < c.target - 0.05
+    assert not (c.low <= c.target <= c.high)
 
 
 def test_calibration_flags_overconfident_posterior():
