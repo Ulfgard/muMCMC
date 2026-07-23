@@ -19,7 +19,7 @@ from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
 from muMCMC.spaces import UnconstrainedSpace
-from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_gaussian
+from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_evidence
 
 torch.set_default_dtype(torch.float64)
 
@@ -310,10 +310,10 @@ def test_posterior_evaluation_detaches_accumulated_tensors():
                              generator=torch.Generator().manual_seed(61))
     assert not ev._z.requires_grad
     assert not ev._log_f_post.requires_grad
-    assert not ev._q_pool.loc.requires_grad
+    assert not ev._q_pool.means.requires_grad
 
 
-def test_bar_gaussian_matches_pooled_estimate():
+def test_bar_evidence_matches_pooled_estimate():
     # The free-standing core on the pooled draws reproduces log_evidence.
     x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
     d = x.shape[0]
@@ -324,7 +324,7 @@ def test_bar_gaussian_matches_pooled_estimate():
 
     # Same seed, same draws, same fit -> reproduces the pooled estimate exactly.
     z = ev._z.reshape(-1, d)
-    est = _bar_gaussian(z, ev._log_target, generator=torch.Generator().manual_seed(15))
+    est = _bar_evidence(z, ev._log_target, generator=torch.Generator().manual_seed(15))
     assert abs(est - ev.log_evidence) < 1e-6
 
 
@@ -411,6 +411,38 @@ def test_log_evidence_bimodal_single_gaussian_q():
     ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(51))
     se = ev.diagnostics["log_evidence_se"]
     assert abs(ev.log_evidence) < max(3.0 * se, 0.05)
+
+
+def test_log_evidence_bimodal_mixture_reduces_se():
+    # On the same bimodal posterior a 2-component q̂ fits each mode instead of
+    # bridging them, so BAR stays unbiased and its per-chain SE drops.
+    m, s, sigma0, w = 3.0, 0.5, 5.0, 0.6
+    sampler = _bimodal_model(m, s, sigma0, w)
+    samples = _bimodal_samples(m, s, w, K=8, n=4000, seed=56)
+    ev1 = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(57))
+    ev2 = PosteriorEvaluation(sampler, samples, n_components=2,
+                              generator=torch.Generator().manual_seed(57))
+    se2 = ev2.diagnostics["log_evidence_se"]
+    assert abs(ev2.log_evidence) < max(3.0 * se2, 0.05)
+    assert se2 < ev1.diagnostics["log_evidence_se"]
+
+
+def test_log_posterior_marginal_mixture_q():
+    # The mixture conditional path (n_components=2) recovers the analytic marginal
+    # on the conjugate Gaussian, matching the single-component result.
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=4, n=2000, seed=58)
+    ev = PosteriorEvaluation(sampler, samples, n_components=2,
+                             generator=torch.Generator().manual_seed(59))
+    ya = x[:2] / 2.0 + 0.3 * torch.randn(16, 2, generator=torch.Generator().manual_seed(60))
+    y_dict = {names[0]: ya[:, 0], names[1]: ya[:, 1]}
+    lp, ess = ev.log_posterior(y_dict, max_marginal=8000, return_ess=True,
+                               generator=torch.Generator().manual_seed(61))
+    lp_true = torch.distributions.MultivariateNormal(
+        x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2)).log_prob(ya)
+    assert torch.max(torch.abs(lp - lp_true)) < 0.05
+    assert float(ess.min()) > 0.3 * 8000
 
 
 def _sticky(draws, stay_prob, seed):
