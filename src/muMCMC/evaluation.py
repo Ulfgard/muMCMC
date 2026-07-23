@@ -222,8 +222,8 @@ class PosteriorEvaluation:
         """BAR estimate of ``log p(x)``, pooled over all chains."""
         return self._log_evidence
 
-    def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None,
-                      prior_weight: float = 0.5,
+    def log_posterior(self, y: dict, *, target_ess: Optional[float] = None,
+                      max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                       generator: Optional[torch.Generator] = None,
                       return_ess: bool = False):
         """``log p(y|x)`` at constrained points ``y``, a density w.r.t. ``dy``.
@@ -232,15 +232,20 @@ class PosteriorEvaluation:
         exact full density ``loglik(y) + log_prior(y) − logZ``. A subset gives the
         marginal over those names, integrating the rest out by importance
         sampling from a mixture of the prior and the joint ``q̂`` conditioned on
-        ``y_a`` (``prior_weight`` is the mixture weight on the prior).
+        ``y_a`` (``prior_weight`` is the mixture weight on the prior). Draws are
+        added until every query point reaches ``target_ess`` or ``max_marginal``
+        draws are spent.
 
         Parameters
         ----------
         y : dict[str, Tensor]
             Constrained query points keyed by free name. All free names gives the
             full density, a subset the marginal over those names.
-        n_marginal : int, optional
-            Importance draws for a marginal. Default is the posterior draw count.
+        target_ess : float, optional
+            Per-query-point weight ESS to reach before stopping. Default draws
+            ``max_marginal`` in one shot.
+        max_marginal : int, optional
+            Cap on importance draws. Default is the posterior draw count.
         prior_weight : float
             Mixture weight on the prior component, in ``[0, 1]``. ``0`` is the pure
             conditional proposal, ``1`` plain prior sampling.
@@ -261,16 +266,16 @@ class PosteriorEvaluation:
             return (log_post, None) if return_ess else log_post
 
         log_post, ess = self._log_marginal_posterior(
-            y, excluded, n_marginal, prior_weight, generator)
+            y, excluded, target_ess, max_marginal, prior_weight, generator)
         return (log_post, ess) if return_ess else log_post
 
     def _log_marginal_posterior(self, y: dict, excluded: list,
-                                n_marginal: Optional[int], alpha: float,
-                                generator: Optional[torch.Generator]):
+                                target_ess: Optional[float], max_marginal: Optional[int],
+                                alpha: float, generator: Optional[torch.Generator]):
         """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out by
-        mixture importance sampling. Returns ``(log_post, ess)``."""
+        mixture importance sampling, drawn adaptively. Returns ``(log_post, ess)``."""
         if not 0.0 <= alpha <= 1.0:
-            raise ValueError(f"defensive_fraction must be in [0, 1], got {alpha}")
+            raise ValueError(f"prior_weight must be in [0, 1], got {alpha}")
         free_names = self.space.free_names
         a_idx = [i for i, name in enumerate(free_names) if name in y]
         b_idx = [i for i, name in enumerate(free_names) if name not in y]
@@ -278,9 +283,9 @@ class PosteriorEvaluation:
             raise ValueError("log_posterior needs at least one free name in y")
         a_names = [free_names[i] for i in a_idx]
         b_names = [free_names[i] for i in b_idx]
+        na, nb = len(a_idx), len(b_idx)
 
         M = y[a_names[0]].shape[0]
-        S = self._n1 if n_marginal is None else int(n_marginal)
         d = self._d
         dtype, device = self._z.dtype, self._z.device
         a_t = torch.tensor(a_idx, device=device)
@@ -299,65 +304,72 @@ class PosteriorEvaluation:
 
         # Conditional Gaussian q(z_b | z_a) from the pooled joint fit.
         mu, Sigma = self._q_pool.loc, self._q_pool.covariance_matrix
-        mu_a, mu_b = mu[a_t], mu[b_t]
-        S_aa = Sigma[a_t[:, None], a_t]
-        S_ab = Sigma[a_t[:, None], b_t]
-        S_bb = Sigma[b_t[:, None], b_t]
-        A = torch.linalg.solve(S_aa, S_ab)                              # Σ_aa⁻¹ Σ_ab
-        mu_cond = mu_b + (z_a - mu_a) @ A                               # (M, |b|)
-        S_cond = S_bb - S_ab.mT @ A
-        S_cond = S_cond + self._jitter * torch.eye(len(b_idx), dtype=dtype, device=device)
-        L_cond = torch.linalg.cholesky(S_cond)
+        A = torch.linalg.solve(Sigma[a_t[:, None], a_t], Sigma[a_t[:, None], b_t])
+        mu_cond = mu[b_t] + (z_a - mu[a_t]) @ A                          # (M, |b|)
+        S_cond = Sigma[b_t[:, None], b_t] - Sigma[a_t[:, None], b_t].mT @ A
+        L_cond = torch.linalg.cholesky(S_cond + self._jitter * torch.eye(nb, dtype=dtype, device=device))
         q_b = torch.distributions.MultivariateNormal(mu_cond.unsqueeze(1), scale_tril=L_cond)
 
-        # Draw z_b from the defensive mixture: n_prior points from the prior and
-        # n_cond from the conditional q(.|z_a).
-        n_prior = int(round(alpha * S))
-        n_cond = S - n_prior
-        blocks = []
-        if n_cond > 0:
-            eps = torch.randn(n_cond, len(b_idx), dtype=dtype, device=device, generator=generator)
-            blocks.append(mu_cond.unsqueeze(1) + eps @ L_cond.mT)       # (M, n_cond, |b|)
-        if n_prior > 0:
-            # Prior draws of the b block, shared across query points.
-            prior = self.space.sample(n_prior, generator=generator)
-            full_p = {name: y0[name].expand(n_prior) for name in a_names}
-            for name in b_names:
-                full_p[name] = prior[name]
-            z_bp = self.space.map_to_unconstrained_vector(
-                self.space.to_free_vector(full_p)).mapped_point[:, b_t]  # (n_prior, |b|)
-            blocks.append(z_bp[None].expand(M, n_prior, len(b_idx)))
-        z_b = torch.cat(blocks, dim=1)                                  # (M, S, |b|)
+        def draw(n_prior, n_cond):
+            """One mixture batch -> (loglik, log_prior_z, log_qcond), each (M, n)."""
+            blocks = []
+            if n_cond > 0:
+                eps = torch.randn(n_cond, nb, dtype=dtype, device=device, generator=generator)
+                blocks.append(mu_cond.unsqueeze(1) + eps @ L_cond.mT)
+            if n_prior > 0:
+                prior = self.space.sample(n_prior, generator=generator)  # shared over query points
+                full_p = {name: y0[name].expand(n_prior) for name in a_names}
+                for name in b_names:
+                    full_p[name] = prior[name]
+                z_bp = self.space.map_to_unconstrained_vector(
+                    self.space.to_free_vector(full_p)).mapped_point[:, b_t]
+                blocks.append(z_bp[None].expand(M, n_prior, nb))
+            z_b = torch.cat(blocks, dim=1)                               # (M, n, |b|)
+            n = z_b.shape[1]
+            z_full = torch.empty(M, n, d, dtype=dtype, device=device)
+            z_full[..., a_t] = z_a[:, None, :].expand(M, n, na)
+            z_full[..., b_t] = z_b
+            z_flat = z_full.reshape(M * n, d)
+            tmap = self.space.map_to_constrained_vector(z_flat)
+            jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, n)
+            prior_b = self.space.prior_log_prob(
+                {name: tmap.mapped_point[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
+            loglik = self._tempered_loglik(z_flat).reshape(M, n)
+            return loglik, prior_b + jac_b, q_b.log_prob(z_b)
 
-        z_full = torch.empty(M, S, d, dtype=dtype, device=device)
-        z_full[..., a_t] = z_a[:, None, :].expand(M, S, len(a_idx))
-        z_full[..., b_t] = z_b
-        z_flat = z_full.reshape(M * S, d)
+        # Accumulate mixture draws until every point reaches target_ess or the
+        # cap is spent. log_qmix uses the running sampling fractions, so weights
+        # stay comparable as draws pool across rounds.
+        budget = self._n1 if max_marginal is None else int(max_marginal)
+        target = float("inf") if target_ess is None else float(target_ess)
+        loglik = log_pi = log_qc = None
+        n_prior_tot = n_cond_tot = drawn = 0
+        step = budget if math.isinf(target) else min(budget, 8192)
+        while drawn < budget:
+            n = min(step, budget - drawn)
+            n_prior = int(round(alpha * n))
+            ll, lp, lq = draw(n_prior, n - n_prior)
+            loglik = ll if loglik is None else torch.cat([loglik, ll], 1)
+            log_pi = lp if log_pi is None else torch.cat([log_pi, lp], 1)
+            log_qc = lq if log_qc is None else torch.cat([log_qc, lq], 1)
+            n_prior_tot += n_prior
+            n_cond_tot += n - n_prior
+            drawn += n
 
-        # Prior density pushed to z, and the conditional density, at every draw.
-        tmap = self.space.map_to_constrained_vector(z_flat)
-        y_full = tmap.mapped_point
-        jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, S)
-        prior_b = self.space.prior_log_prob(
-            {name: y_full[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, S)
-        log_pi = prior_b + jac_b                                        # log prior density in z
-        log_qc = q_b.log_prob(z_b)                                      # (M, S)
+            terms = []
+            if n_prior_tot > 0:
+                terms.append(math.log(n_prior_tot / drawn) + log_pi)
+            if n_cond_tot > 0:
+                terms.append(math.log(n_cond_tot / drawn) + log_qc)
+            log_qmix = terms[0] if len(terms) == 1 else torch.logaddexp(terms[0], terms[1])
+            log_w = loglik + log_pi - log_qmix
+            ess = torch.exp(2 * torch.logsumexp(log_w, 1) - torch.logsumexp(2 * log_w, 1))
+            if float(ess.min()) >= target:
+                break
+            step *= 2
 
-        # Mixture density with the actual sampling fractions (deterministic
-        # mixture), and weights w = p(x|y_a,y_b) · p(y_b) · |dy_b/dz_b| / q_mix.
-        terms = []
-        if n_prior > 0:
-            terms.append(math.log(n_prior / S) + log_pi)
-        if n_cond > 0:
-            terms.append(math.log(n_cond / S) + log_qc)
-        log_qmix = terms[0] if len(terms) == 1 else torch.logaddexp(terms[0], terms[1])
-        loglik = self._tempered_loglik(z_flat).reshape(M, S)
-        log_w = loglik + log_pi - log_qmix
-
-        log_integral = torch.logsumexp(log_w, dim=1) - math.log(S)
+        log_integral = torch.logsumexp(log_w, 1) - math.log(drawn)
         log_post = self.space.prior_log_prob(y) + log_integral - self.log_evidence
-        ess = torch.exp(2 * torch.logsumexp(log_w, dim=1)
-                        - torch.logsumexp(2 * log_w, dim=1))
         return log_post, ess
 
     def _tempered_loglik(self, z: torch.Tensor) -> torch.Tensor:

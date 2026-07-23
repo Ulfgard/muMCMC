@@ -173,7 +173,7 @@ def test_log_posterior_marginal_matches_gaussian_marginal():
     torch.manual_seed(18)
     ya = x[:2] / 2.0 + 0.3 * torch.randn(16, 2)
     y_dict = {a[0]: ya[:, 0], a[1]: ya[:, 1]}
-    lp, ess = ev.log_posterior(y_dict, n_marginal=5000, return_ess=True,
+    lp, ess = ev.log_posterior(y_dict, max_marginal=5000, return_ess=True,
                                generator=torch.Generator().manual_seed(19))
 
     true = torch.distributions.MultivariateNormal(
@@ -200,7 +200,7 @@ def test_log_posterior_marginal_consistent_across_prior_weight():
         x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2)).log_prob(ya)
 
     for alpha in (0.0, 0.5, 1.0):
-        lp = ev.log_posterior(y_dict, n_marginal=20000, prior_weight=alpha,
+        lp = ev.log_posterior(y_dict, max_marginal=20000, prior_weight=alpha,
                               generator=torch.Generator().manual_seed(23))
         assert torch.max(torch.abs(lp - lp_true)) < 0.1, alpha
 
@@ -212,6 +212,35 @@ def test_log_posterior_prior_weight_out_of_range_raises():
     ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(25))
     with pytest.raises(ValueError):
         ev.log_posterior({names[0]: torch.zeros(3)}, prior_weight=1.5)
+
+
+def test_log_posterior_marginal_adaptive_reaches_target_ess():
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=4, n=2000, seed=26)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(27))
+    ya = x[:2] / 2.0 + 0.2 * torch.randn(8, 2, generator=torch.Generator().manual_seed(28))
+    y_dict = {names[0]: ya[:, 0], names[1]: ya[:, 1]}
+    lp, ess = ev.log_posterior(y_dict, target_ess=3000, max_marginal=100000,
+                               return_ess=True, generator=torch.Generator().manual_seed(29))
+    assert float(ess.min()) >= 3000
+    lp_true = torch.distributions.MultivariateNormal(
+        x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2)).log_prob(ya)
+    assert torch.max(torch.abs(lp - lp_true)) < 0.1
+
+
+def test_log_posterior_marginal_adaptive_stops_at_max():
+    # An unreachable target stops at max_marginal and still returns a finite
+    # estimate (prior_weight > 0 keeps the weights bounded).
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=2, n=1000, seed=33)
+    ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(34))
+    y_dict = {names[0]: torch.zeros(4), names[1]: torch.zeros(4)}
+    lp, ess = ev.log_posterior(y_dict, target_ess=1e9, max_marginal=4000,
+                               return_ess=True, generator=torch.Generator().manual_seed(35))
+    assert float(ess.min()) < 1e9
+    assert ess.shape == (4,) and torch.isfinite(lp).all()
 
 
 def test_log_posterior_marginal_correlated_predictive_block():
@@ -230,7 +259,7 @@ def test_log_posterior_marginal_correlated_predictive_block():
 
     sd0 = Sigma_post[0, 0].sqrt()
     y0 = mu_post[0] + torch.linspace(-1.5, 1.5, 12) * sd0
-    lp, ess = ev.log_posterior({"y0": y0}, n_marginal=8000, return_ess=True,
+    lp, ess = ev.log_posterior({"y0": y0}, max_marginal=8000, return_ess=True,
                                generator=torch.Generator().manual_seed(32))
     lp_true = torch.distributions.Normal(mu_post[0], sd0).log_prob(y0)
 
