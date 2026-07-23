@@ -10,8 +10,8 @@ The evidence uses BAR (Bennett acceptance ratio, as reverse logistic
 regression). Work happens in the sampler's unconstrained coordinates ``z``,
 where ``sampler.evaluate_model(z).value`` is exactly ``−log f(z)`` for the
 unnormalized posterior density ``f(z) = p(x|y(z)) p(y(z)) |dy/dz|`` whose
-integral over ``z`` is the evidence. A Gaussian reference ``q̂`` is fitted to
-the ``z``-draws. With the log-ratio
+integral over ``z`` is the evidence. A reference ``q̂`` (a Gaussian mixture) is
+fitted to the ``z``-draws. With the log-ratio
 
     W(z) = log f(z) − log q̂(z) = −evaluate_model(z).value − log q̂(z)
 
@@ -40,6 +40,8 @@ from typing import Optional
 import torch
 from scipy.optimize import brentq
 from scipy.special import expit
+
+from .mixture import GaussianMixture
 
 
 def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> float:
@@ -81,28 +83,15 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
     return offset - brentq(g, lo, hi)
 
 
-def _fit_gaussian(z: torch.Tensor, jitter: float) -> torch.distributions.MultivariateNormal:
-    """Full-covariance normal fitted to ``z`` (shape ``(n, d)``).
-
-    ``jitter`` loads the diagonal so the Cholesky is stable even when the sample
-    covariance is rank-deficient.
-    """
-    d = z.shape[-1]
-    mean = z.mean(dim=0)
-    cov = torch.cov(z.T).reshape(d, d)
-    cov = cov + jitter * torch.eye(d, dtype=cov.dtype, device=cov.device)
-    return torch.distributions.MultivariateNormal(
-        mean, scale_tril=torch.linalg.cholesky(cov))
-
-
-def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
-                  jitter: float = 1e-6, generator: Optional[torch.Generator] = None,
+def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
+                  n_q: Optional[int] = None, jitter: float = 1e-6,
+                  generator: Optional[torch.Generator] = None,
                   log_target_z: Optional[torch.Tensor] = None,
-                  q: Optional[torch.distributions.MultivariateNormal] = None) -> float:
+                  q: Optional[GaussianMixture] = None) -> float:
     """BAR log-evidence of ``exp(log_target)`` from its draws ``z`` (shape ``(n, d)``).
 
-    Fits a full-covariance normal ``q̂`` to ``z``, draws ``n_q`` points from it,
-    and solves the BAR root over ``W = log_target − log q̂`` on both sets.
+    Fits a Gaussian mixture ``q̂`` to ``z``, draws ``n_q`` points from it, and
+    solves the BAR root over ``W = log_target − log q̂`` on both sets.
 
     Parameters
     ----------
@@ -110,16 +99,18 @@ def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
         Draws from the normalized target, in the coordinates of ``log_target``.
     log_target : callable
         Maps ``(N, d) -> (N,)``, the unnormalized target log-density ``log f``.
+    n_components : int
+        Number of mixture components fitted for ``q̂``.
     n_q : int, optional
         Number of ``q̂`` draws. Default is ``n``.
     jitter : float
-        Diagonal loading for the covariance Cholesky.
+        Diagonal loading for the component covariances.
     generator : torch.Generator, optional
-        RNG for the ``q̂`` draws.
+        RNG for the fit and the ``q̂`` draws.
     log_target_z : Tensor, optional
         Precomputed ``log_target(z)``. Pass it to avoid re-evaluating an
         expensive target on the input draws.
-    q : MultivariateNormal, optional
+    q : GaussianMixture, optional
         A ``q̂`` already fitted to ``z``. Pass it to avoid refitting.
 
     Returns
@@ -127,12 +118,11 @@ def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
     float
         BAR estimate of ``log ∫ f``.
     """
-    n, d = z.shape
+    n = z.shape[0]
     if q is None:
-        q = _fit_gaussian(z, jitter)
+        q = GaussianMixture.fit(z, n_components, jitter=jitter, generator=generator)
     n0 = n if n_q is None else int(n_q)
-    eps = torch.randn(n0, d, dtype=z.dtype, device=z.device, generator=generator)
-    z_q = q.loc + eps @ q.scale_tril.mT
+    z_q = q.sample(n0, generator=generator)
     lf_z = log_target(z) if log_target_z is None else log_target_z
     W_post = lf_z - q.log_prob(z)
     W_q = log_target(z_q) - q.log_prob(z_q)
@@ -150,10 +140,10 @@ class PosteriorEvaluation:
 
     The estimator is BAR (Bennett acceptance ratio, Bennett 1976), cast as
     reverse logistic regression (Geyer 1994). A reference ``q̂`` is fitted to the
-    draws as a full-covariance normal in the sampler's unconstrained coordinates,
-    and ``log Z`` is the intercept discriminating the draws from samples of
-    ``q̂``. Fitting ``q̂`` on the same draws leaves the estimator consistent. The
-    quality of the normal fit sets the variance, not the limit.
+    draws as a Gaussian mixture in the sampler's unconstrained coordinates, and
+    ``log Z`` is the intercept discriminating the draws from samples of ``q̂``.
+    Fitting ``q̂`` on the same draws leaves the estimator consistent. The quality
+    of the mixture fit sets the variance, not the limit.
 
     Parameters
     ----------
@@ -164,13 +154,17 @@ class PosteriorEvaluation:
         Constrained draws keyed by free parameter name, as returned by
         ``run_mcmc`` (grouped by chain, shape ``(num_chains, num_samples)``). A
         single ungrouped axis ``(num_samples,)`` is also accepted.
+    n_components : int
+        Number of Gaussian components fitted for ``q̂``. Use more than one when a
+        single Gaussian cannot cover a multimodal or curved draw cloud (e.g. a
+        posterior that needed tempering to sample).
     n_q : int, optional
         Number of ``q̂`` draws ``n0`` for the pooled estimate. Default is the
         number of posterior draws. Per-chain estimates use their own chain size.
     jitter : float
-        Diagonal loading added to the fitted covariance for a stable Cholesky.
+        Diagonal loading added to the fitted covariances for a stable Cholesky.
     generator : torch.Generator, optional
-        RNG for the ``q̂`` draws, for reproducibility.
+        RNG for the ``q̂`` fit and draws, for reproducibility.
     """
 
     def __init__(
@@ -178,12 +172,14 @@ class PosteriorEvaluation:
         sampler,
         samples: dict,
         *,
+        n_components: int = 1,
         n_q: Optional[int] = None,
         jitter: float = 1e-6,
         generator: Optional[torch.Generator] = None,
     ):
         self.sampler = sampler
         self.space = sampler.space
+        self._n_components = int(n_components)
         self._jitter = jitter
         self._generator = generator
 
@@ -194,8 +190,9 @@ class PosteriorEvaluation:
         K, n, d = theta_free.shape
         self._n_chains, self._n_per_chain, self._d = K, n, d
 
-        # Unconstrained draws grouped by chain.
-        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
+        # Unconstrained draws grouped by chain. Detached so the cached draws (and
+        # everything derived from them: log f, q̂) never carry an autograd graph.
+        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point.detach()
         self._n1 = K * n
         self._n0 = K * n if n_q is None else int(n_q)
 
@@ -205,10 +202,12 @@ class PosteriorEvaluation:
 
         # Joint q̂ over all coordinates, fitted once. Drives the pooled estimate,
         # the W diagnostic, and the conditional proposal for marginals.
-        self._q_pool = _fit_gaussian(self._z.reshape(K * n, d), jitter)
+        self._q_pool = GaussianMixture.fit(
+            self._z.reshape(K * n, d), self._n_components, jitter=jitter,
+            generator=generator)
 
         # Main estimate: BAR on the pooled draws over all chains.
-        self._log_evidence = _bar_gaussian(
+        self._log_evidence = _bar_evidence(
             self._z.reshape(K * n, d), self._log_target, n_q=self._n0,
             jitter=jitter, generator=generator, log_target_z=self._log_f_post,
             q=self._q_pool)
@@ -335,20 +334,14 @@ class PosteriorEvaluation:
         z_a = self.space.map_to_unconstrained_vector(
             self.space.to_free_vector(full)).mapped_point[:, a_t]        # (M, |a|)
 
-        # Conditional Gaussian q(z_b | z_a) from the pooled joint fit.
-        mu, Sigma = self._q_pool.loc, self._q_pool.covariance_matrix
-        A = torch.linalg.solve(Sigma[a_t[:, None], a_t], Sigma[a_t[:, None], b_t])
-        mu_cond = mu[b_t] + (z_a - mu[a_t]) @ A                          # (M, |b|)
-        S_cond = Sigma[b_t[:, None], b_t] - Sigma[a_t[:, None], b_t].mT @ A
-        L_cond = torch.linalg.cholesky(S_cond + self._jitter * torch.eye(nb, dtype=dtype, device=device))
-        q_b = torch.distributions.MultivariateNormal(mu_cond.unsqueeze(1), scale_tril=L_cond)
+        # Conditional q(z_b | z_a) from the pooled joint fit (itself a mixture).
+        q_b = self._q_pool.conditional(a_idx, b_idx, z_a, jitter=self._jitter)
 
         def draw(n_prior, n_cond):
             """One mixture batch -> (loglik, log_prior_z, log_qcond), each (M, n)."""
             blocks = []
             if n_cond > 0:
-                eps = torch.randn(n_cond, nb, dtype=dtype, device=device, generator=generator)
-                blocks.append(mu_cond.unsqueeze(1) + eps @ L_cond.mT)
+                blocks.append(q_b.sample(n_cond, generator=generator))
             if n_prior > 0:
                 prior = self.space.sample(n_prior, generator=generator)  # shared over query points
                 full_p = {name: y0[name].expand(n_prior) for name in a_names}
@@ -422,8 +415,8 @@ class PosteriorEvaluation:
         """
         K, n = self._n_chains, self._n_per_chain
         return torch.tensor([
-            _bar_gaussian(self._z[k], self._log_target, jitter=self._jitter,
-                          generator=self._generator,
+            _bar_evidence(self._z[k], self._log_target, n_components=self._n_components,
+                          jitter=self._jitter, generator=self._generator,
                           log_target_z=self._log_f_post[k * n:(k + 1) * n])
             for k in range(K)
         ])
