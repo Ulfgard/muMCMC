@@ -38,13 +38,18 @@ from functools import cached_property
 from typing import Optional
 
 import torch
+from scipy.optimize import brentq
+from scipy.special import expit
 
 
 def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor,
-              *, max_expand: int = 64, max_iter: int = 100) -> float:
+              *, max_expand: int = 64) -> float:
     """Solve ``Σ_pooled σ(W + b) = n1`` for ``b`` and return ``log(n1/n0) − b``.
 
-    Pure core over arrays, directly testable.
+    Pure core over arrays, directly testable.  ``g(b) = n1 − Σ σ(W + b)`` is
+    strictly decreasing from ``+n1`` (as ``b → −∞``) to ``−n0`` (as ``b → +∞``),
+    so a bracket always exists; it is found by doubling, then refined by
+    ``scipy.optimize.brentq``.
 
     Parameters
     ----------
@@ -60,39 +65,28 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor,
     """
     n1 = W_post.numel()
     n0 = W_q.numel()
-    W = torch.cat([W_post.reshape(-1), W_q.reshape(-1)]).double()
+    W = torch.cat([W_post.reshape(-1), W_q.reshape(-1)]).detach().double().cpu().numpy()
 
     def g(b: float) -> float:                       # strictly decreasing in b
-        return n1 - torch.sigmoid(W + b).sum().item()
+        return n1 - expit(W + b).sum()
 
-    # Bracket [lo, hi] with g(lo) > 0 > g(hi); g -> +n1 as b -> -inf, -> -n0 as
-    # b -> +inf, so expansion always terminates.
+    # Bracket [lo, hi] with g(lo) > 0 > g(hi); the doubling terminates for any
+    # finite W.
     lo, hi = -1.0, 1.0
     for _ in range(max_expand):
         if g(lo) > 0.0:
             break
         lo *= 2.0
+    else:
+        raise RuntimeError("BAR root: could not bracket below; W may be degenerate")
     for _ in range(max_expand):
         if g(hi) < 0.0:
             break
         hi *= 2.0
+    else:
+        raise RuntimeError("BAR root: could not bracket above; W may be degenerate")
 
-    # Safeguarded Newton inside the bracket: Newton for speed (g is smooth and
-    # monotone), bisection fallback whenever a step leaves the bracket.
-    b = 0.5 * (lo + hi)
-    for _ in range(max_iter):
-        s = torch.sigmoid(W + b)
-        gb = n1 - s.sum().item()
-        if gb > 0.0:
-            lo = b
-        else:
-            hi = b
-        if abs(gb) < 1e-10:
-            break
-        gp = -(s * (1.0 - s)).sum().item()          # g'(b) < 0
-        b_newton = b - gb / gp if gp != 0.0 else 0.5 * (lo + hi)
-        b = b_newton if lo < b_newton < hi else 0.5 * (lo + hi)
-    return math.log(n1 / n0) - b
+    return math.log(n1 / n0) - brentq(g, lo, hi)
 
 
 class PosteriorEvaluation:
