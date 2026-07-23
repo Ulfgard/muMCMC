@@ -40,6 +40,25 @@ def test_coverage_ci_weighted_equal_matches_unweighted():
     assert c.n_objects == 4 and abs(c.coverage - 0.5) < 1e-12
 
 
+def test_coverage_ci_interval_matches_scipy_binomial():
+    # The Beta-quantile Clopper-Pearson must reproduce scipy's exact binomial CI
+    # for integer counts (unweighted). 3 of 5 PITs inside the central-50% band.
+    from scipy.stats import binomtest
+    pits = [0.5, 0.5, 0.5, 0.1, 0.9]           # 3 covered at level 0.5
+    c = coverage_ci(pits, 0.5)
+    ci = binomtest(3, 5).proportion_ci(confidence_level=0.95, method="exact")
+    assert abs(c.low - ci.low) < 1e-9 and abs(c.high - ci.high) < 1e-9
+
+
+def test_coverage_ci_weighted_interval_centered_on_coverage():
+    # Fractional effective count: the interval must bracket the reported coverage
+    # (the old round-to-integer path could center it elsewhere).
+    pits = [0.5, 0.5, 0.1, 0.9]
+    w = np.array([3.0, 1.0, 1.0, 1.0])
+    c = coverage_ci(pits, 0.5, weights=w)
+    assert c.low <= c.coverage <= c.high
+
+
 # --------------------------------------------------------------------------- #
 #  pit                                                                         #
 # --------------------------------------------------------------------------- #

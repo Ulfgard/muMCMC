@@ -14,7 +14,7 @@ rank, and any other statistic works the same way.
 from collections import namedtuple
 
 import numpy as np
-from scipy import stats as sstats
+from scipy.stats import beta as _beta
 
 
 def _ess(trace, method):
@@ -57,6 +57,16 @@ def pit(samples, truth, statistic, *, thin=True, ess_method="bulk"):
 Coverage = namedtuple("Coverage", ["coverage", "low", "high", "n_objects"])
 
 
+def _clopper_pearson(k, n, confidence):
+    """Clopper-Pearson interval for ``k`` successes in ``n`` trials, in the Beta
+    quantile form so a fractional effective ``k`` / ``n`` (weighted case) is
+    allowed. Integer ``k`` reproduces the exact binomial interval."""
+    a = 1.0 - confidence
+    lo = 0.0 if k <= 0 else float(_beta.ppf(a / 2.0, k, n - k + 1.0))
+    hi = 1.0 if k >= n else float(_beta.ppf(1.0 - a / 2.0, k + 1.0, n - k))
+    return lo, hi
+
+
 def coverage_ci(pit_values, level, *, confidence=0.95, weights=None):
     """Empirical central-``level`` coverage over objects, with an exact
     Clopper-Pearson interval.
@@ -64,7 +74,7 @@ def coverage_ci(pit_values, level, *, confidence=0.95, weights=None):
     An object is covered iff its PIT lies in the central-``level`` interval
     ``[alpha/2, 1 - alpha/2]``. Non-finite PIT values are dropped. With
     ``weights`` (one per object) the coverage is weighted and the interval is the
-    exact test at the Kish effective count ``(sum w)^2 / sum w^2``.
+    Clopper-Pearson at the Kish effective count ``(sum w)^2 / sum w^2``.
 
     Returns ``Coverage(coverage, low, high, n_objects)``.
     """
@@ -78,14 +88,14 @@ def coverage_ci(pit_values, level, *, confidence=0.95, weights=None):
     alpha = 1.0 - level
     covered = (p >= alpha / 2.0) & (p <= 1.0 - alpha / 2.0)
     if weights is None:
-        k, n = int(np.count_nonzero(covered)), M
-        cov = k / n
+        cov = float(covered.mean())
+        n_eff, k = float(M), float(np.count_nonzero(covered))
     else:
         w = np.asarray(weights, dtype=np.float64)[finite]
         w = w / w.sum()
         cov = float(np.sum(w * covered))
-        n = max(1, int(round(1.0 / float(np.sum(w * w)))))     # Kish effective count
-        k = min(max(int(round(cov * n)), 0), n)
+        n_eff = 1.0 / float(np.sum(w * w))         # Kish effective count
+        k = cov * n_eff                            # consistent with cov, no rounding
 
-    ci = sstats.binomtest(k, n).proportion_ci(confidence_level=confidence, method="exact")
-    return Coverage(cov, float(ci.low), float(ci.high), M)
+    lo, hi = _clopper_pearson(k, n_eff, confidence)
+    return Coverage(cov, lo, hi, M)
