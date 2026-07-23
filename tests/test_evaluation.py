@@ -159,3 +159,14 @@ def test_diagnostics_shape_and_keys():
     assert d["per_chain_log_evidence"].shape == (4,)
     assert math.isfinite(d["log_evidence_se"])
     assert set(d["W_percentiles"]) == {0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99}
+
+
+def test_diagnostics_single_chain_omits_se():
+    x = torch.tensor([0.5, -1.0])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=1, n=2000, seed=10)
+    ev = PosteriorEvaluation(sampler, samples,
+                             generator=torch.Generator().manual_seed(11))
+    d = ev.diagnostics
+    assert "log_evidence_se" not in d
+    assert d["per_chain_log_evidence"].shape == (1,)

@@ -199,8 +199,11 @@ class PosteriorEvaluation:
         - ``W_percentiles``: percentiles of ``W`` on the posterior draws. A heavy
           upper tail means ``q̂`` misses posterior mass.
         - ``per_chain_log_evidence``: per-chain ``logZ`` (shape ``(K,)``).
-        - ``log_evidence_se``: standard error of the pooled estimate from the
-          per-chain spread, ``NaN`` for a single chain. Absorbs autocorrelation.
+        - ``log_evidence_se``: standard error of the pooled estimate, taken from
+          the spread of the per-chain estimates as independent replicates. Each
+          chain estimate carries its own within-chain autocorrelation, so their
+          spread already reflects it and no effective-sample-size correction is
+          needed. Present only for more than one chain.
         - ``n1``, ``n0``: raw posterior and ``q̂`` draw counts.
         """
         probs = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99],
@@ -210,12 +213,12 @@ class PosteriorEvaluation:
                        for p, v in zip(probs, torch.quantile(Wp, probs))}
         per_chain = self._per_chain_log_evidence
         K = self._n_chains
-        se = (float(per_chain.std(unbiased=True) / math.sqrt(K))
-              if K > 1 else float("nan"))
-        return {
+        out = {
             "W_percentiles": percentiles,
             "per_chain_log_evidence": per_chain,
-            "log_evidence_se": se,
             "n1": self._n1,
             "n0": self._n0,
         }
+        if K > 1:
+            out["log_evidence_se"] = float(per_chain.std(unbiased=True) / math.sqrt(K))
+        return out
