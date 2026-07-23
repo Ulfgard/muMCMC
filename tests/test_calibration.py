@@ -7,7 +7,8 @@ the rank histogram inside the band while an overconfident posterior breaches it.
 """
 import numpy as np
 
-from muMCMC.validation.calibration import Calibration, sbc_histogram, SBCHistogram
+from muMCMC.validation import Calibration
+from muMCMC.validation.calibration import _sbc_histogram, SBCHistogram
 
 
 def _coord(k):
@@ -21,14 +22,14 @@ def _coord(k):
 # --------------------------------------------------------------------------- #
 
 def test_sbc_histogram_mechanics():
-    h = sbc_histogram([0, 1, 2, 3, 99, 50, 50], L=99, n_bins=10)
+    h = _sbc_histogram([0, 1, 2, 3, 99, 50, 50], L=99, n_bins=10)
     assert isinstance(h, SBCHistogram)
     assert h.counts.sum() == 7 and h.n_objects == 7
     assert abs(h.expected - 0.7) < 1e-12 and h.low <= h.high
 
 
 def test_sbc_histogram_drops_nonfinite():
-    h = sbc_histogram([0.0, np.nan, 99.0], L=99, n_bins=10)
+    h = _sbc_histogram([0.0, np.nan, 99.0], L=99, n_bins=10)
     assert h.n_objects == 2 and h.counts.sum() == 2
 
 

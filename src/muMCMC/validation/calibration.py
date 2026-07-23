@@ -5,7 +5,7 @@ scalar statistic ``T`` is ``r = #{draws : T(draw) < T(truth)}``, an integer in
 ``{0, ..., L}`` that is discrete-uniform under correct calibration (their
 Theorem 1). Feed objects one at a time to a :class:`Calibration`; the accumulated
 ranks per statistic give the SBC rank histogram with its discrete-uniform
-confidence band (:func:`sbc_histogram`).
+confidence band (:meth:`Calibration.sbc_histogram`).
 
 ``T`` is any user mapping from points to a scalar. A coordinate ``T(y) = y_k``
 recovers the per-parameter rank, a likelihood ``T(y) = loglik(y)`` the likelihood
@@ -28,7 +28,7 @@ SBCHistogram = namedtuple(
     "SBCHistogram", ["counts", "bin_edges", "expected", "low", "high", "n_objects"])
 
 
-def sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
+def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
     """SBC rank histogram with a discrete-uniform confidence band (Talts et al.
     2018).
 
@@ -134,7 +134,13 @@ class Calibration:
         return np.array(self._ranks[name], dtype=int)
 
     def sbc_histogram(self, name, *, n_bins=None, confidence=0.99):
-        """SBC rank histogram + band for statistic ``name`` (see
-        :func:`sbc_histogram`)."""
-        return sbc_histogram(self.ranks(name), self.L,
-                             n_bins=n_bins, confidence=confidence)
+        """SBC rank histogram + band for statistic ``name``, as an
+        ``SBCHistogram(counts, bin_edges, expected, low, high, n_objects)``.
+
+        Bins the accumulated ranks over ``{0, ..., L}``; under the discrete-
+        uniform null each bin count is ``Binomial(N, 1/n_bins)`` and
+        ``[low, high]`` are its central-``confidence`` quantiles (the band).
+        ``n_bins`` defaults to ``L + 1``; rebin to keep ``N / n_bins`` around 20.
+        """
+        return _sbc_histogram(self.ranks(name), self.L,
+                              n_bins=n_bins, confidence=confidence)
