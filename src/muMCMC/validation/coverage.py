@@ -14,7 +14,7 @@ rank, and any other statistic works the same way.
 from collections import namedtuple
 
 import numpy as np
-from scipy.stats import binomtest
+from scipy.stats import binomtest, binom
 
 
 def _ess(trace, method):
@@ -110,3 +110,86 @@ def coverage_ci(pit_values, level, *, confidence=0.95, weights=None):
 
     ci = binomtest(k, n).proportion_ci(confidence_level=confidence, method="exact")
     return Coverage(cov, float(ci.low), float(ci.high), M)
+
+
+def sbc_rank(samples, truth, statistic, *, L, thin=True, ess_method="bulk"):
+    """SBC rank of the truth for one object under ``statistic`` (Talts et al.
+    2018, Algorithm 2).
+
+    ``r = #{ draws : T(draw) < T(truth) }`` over ``L`` draws thinned to about
+    independence, an integer in ``{0, ..., L}`` that is discrete-uniform under
+    correct calibration. The chain is thinned by ``ceil(n / ESS)`` and truncated
+    to a common ``L`` so ranks from different objects share one scale. Returns
+    ``None`` when fewer than ``L`` ~independent draws are available.
+
+    Parameters
+    ----------
+    samples
+        Posterior draws for one object, shaped so ``statistic`` returns a
+        ``(chains, draws)`` trace.
+    truth
+        The true parameters, shaped so ``statistic`` returns a scalar.
+    statistic : callable
+        Mapping from points to a scalar statistic ``T``.
+    L : int
+        Common number of thinned draws to rank against (the rank scale).
+    thin : bool or int
+        ``True`` thins by ``ceil(n / arviz ESS)``, ``False`` keeps every draw,
+        an int forces the factor.
+    ess_method : str
+        arviz ESS method used when ``thin=True``.
+    """
+    t = np.asarray(statistic(samples), dtype=np.float64)
+    t_truth = float(statistic(truth))
+    if thin is True:
+        ess = _ess(t, ess_method)
+        tau = max(1, int(np.ceil(t.size / ess))) if np.isfinite(ess) and ess > 0 else 1
+    else:
+        tau = 1 if thin is False else max(1, int(thin))
+    thinned = t.reshape(-1)[::tau]
+    if thinned.size < L:
+        return None
+    return int(np.count_nonzero(thinned[:L] < t_truth))
+
+
+SBCHistogram = namedtuple(
+    "SBCHistogram", ["counts", "bin_edges", "expected", "low", "high", "n_objects"])
+
+
+def sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
+    """SBC rank histogram with a discrete-uniform confidence band (Talts et al.
+    2018).
+
+    Bins the ranks over ``{0, ..., L}`` and returns the per-bin counts with the
+    band under the discrete-uniform null: each bin count is ``Binomial(N, 1/B)``,
+    and ``[low, high]`` are its central-``confidence`` quantiles. Counts drifting
+    outside the band flag miscalibration. Non-finite ranks are dropped.
+
+    Parameters
+    ----------
+    ranks : array-like
+        One SBC rank per object (from :func:`sbc_rank`), each in ``{0, ..., L}``.
+    L : int
+        Rank scale the ranks were computed on.
+    n_bins : int, optional
+        Number of equal bins over ``{0, ..., L}``. Default is ``L + 1`` (one bin
+        per rank). Rebin (e.g. to keep ``N / n_bins`` around 20) to cut noise.
+    confidence : float
+        Central mass of the band under the uniform null.
+
+    Returns
+    -------
+    SBCHistogram
+        ``(counts, bin_edges, expected, low, high, n_objects)``. ``expected`` is
+        ``N / n_bins`` and ``low`` / ``high`` are the band, shared by all bins.
+    """
+    r = np.asarray(ranks, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    N = r.size
+    B = (L + 1) if n_bins is None else int(n_bins)
+    edges = np.linspace(-0.5, L + 0.5, B + 1)
+    counts, _ = np.histogram(r, bins=edges)
+    a = 1.0 - confidence
+    low = int(binom.ppf(a / 2.0, N, 1.0 / B)) if N else 0
+    high = int(binom.ppf(1.0 - a / 2.0, N, 1.0 / B)) if N else 0
+    return SBCHistogram(counts, edges, N / B if N else float("nan"), low, high, N)

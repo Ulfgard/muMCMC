@@ -5,6 +5,7 @@ density, entropy, information gain). ``coverage`` holds cross-object calibration
 (the PIT of a statistic and its coverage over many objects).
 """
 from .evaluation import PosteriorEvaluation
-from .coverage import pit, coverage_ci, Coverage
+from .coverage import pit, coverage_ci, Coverage, sbc_rank, sbc_histogram, SBCHistogram
 
-__all__ = ["PosteriorEvaluation", "pit", "coverage_ci", "Coverage"]
+__all__ = ["PosteriorEvaluation", "pit", "coverage_ci", "Coverage",
+           "sbc_rank", "sbc_histogram", "SBCHistogram"]

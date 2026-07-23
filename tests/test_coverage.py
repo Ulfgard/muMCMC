@@ -8,7 +8,8 @@ import math
 
 import numpy as np
 
-from muMCMC.validation.coverage import pit, coverage_ci, Coverage
+from muMCMC.validation.coverage import (
+    pit, coverage_ci, Coverage, sbc_rank, sbc_histogram, SBCHistogram)
 
 
 # --------------------------------------------------------------------------- #
@@ -106,3 +107,48 @@ def test_coverage_is_calibrated_under_sbc():
     for level in (0.5, 0.95):
         c = coverage_ci(pits, level)
         assert c.low <= level <= c.high, (level, c)
+
+
+# --------------------------------------------------------------------------- #
+#  SBC ranks and histogram band (Talts et al. 2018)                           #
+# --------------------------------------------------------------------------- #
+
+def test_sbc_rank_range_and_underresolved():
+    ident = lambda a: a
+    rng = np.random.default_rng(10)
+    r = sbc_rank(rng.standard_normal((2, 100)), 0.0, ident, L=99, thin=False)
+    assert isinstance(r, int) and 0 <= r <= 99
+    # only 80 draws available, fewer than L=99 -> under-resolved.
+    assert sbc_rank(rng.standard_normal((2, 40)), 0.0, ident, L=99, thin=False) is None
+
+
+def test_sbc_histogram_mechanics():
+    h = sbc_histogram([0, 1, 2, 3, 99, 50, 50], L=99, n_bins=10)
+    assert isinstance(h, SBCHistogram)
+    assert h.counts.sum() == 7 and h.n_objects == 7
+    assert abs(h.expected - 0.7) < 1e-12 and h.low <= h.high
+
+
+def test_sbc_histogram_uniform_under_calibration():
+    # truth ~ N(0,1), draws ~ N(0,1) -> ranks discrete-uniform -> counts in band.
+    ident = lambda a: a
+    rng = np.random.default_rng(11)
+    N, L = 1000, 99
+    ranks = [sbc_rank(rng.standard_normal((2, 120)), float(t), ident, L=L, thin=False)
+             for t in rng.standard_normal(N)]
+    h = sbc_histogram(ranks, L, n_bins=10)
+    outside = int(np.sum((h.counts < h.low) | (h.counts > h.high)))
+    assert outside <= 1
+
+
+def test_sbc_histogram_flags_overconfident_posterior():
+    # posterior too narrow (std 0.5) vs truth ~ N(0,1): ranks pile at the edges,
+    # so the histogram breaches the uniform band.
+    ident = lambda a: a
+    rng = np.random.default_rng(12)
+    N, L = 1000, 99
+    ranks = [sbc_rank(0.5 * rng.standard_normal((2, 120)), float(t), ident, L=L, thin=False)
+             for t in rng.standard_normal(N)]
+    h = sbc_histogram(ranks, L, n_bins=10)
+    outside = int(np.sum((h.counts < h.low) | (h.counts > h.high)))
+    assert outside >= 2
