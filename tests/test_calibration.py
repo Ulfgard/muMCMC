@@ -81,6 +81,21 @@ def test_calibrated_stays_in_band_and_at_target():
         assert c.low <= c.coverage <= c.high
 
 
+def test_coverage_weighting_reweights():
+    # two objects: one covered (truth mid-sample), one not (truth above all).
+    # equal weights give 0.5; up-weighting the covered one 3:1 gives 0.75.
+    draws = np.linspace(-1.0, 1.0, 100).reshape(1, 100, 1)
+
+    def built(w_covered, w_uncovered):
+        cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
+        cal.add(draws, np.array([0.0]), weight=w_covered)     # rank ~ mid -> covered
+        cal.add(draws, np.array([10.0]), weight=w_uncovered)  # rank = L -> not covered
+        return cal
+
+    assert abs(built(1.0, 1.0).coverage("y0", 0.5).coverage - 0.5) < 1e-9
+    assert abs(built(3.0, 1.0).coverage("y0", 0.5).coverage - 0.75) < 1e-9
+
+
 def test_overconfident_breaches_band_and_undercovers():
     # posterior too narrow (std 0.5): ranks pile at the edges, so the histogram
     # breaches the band and coverage falls well below the target.

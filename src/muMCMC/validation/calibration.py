@@ -103,10 +103,16 @@ class Calibration:
         self._thin = thin
         self._ess_method = ess_method
         self._ranks = {name: [] for name in self.statistics}
+        self._weights = []
         self.n_discarded = 0
 
-    def add(self, samples, truth):
-        """Rank one object and accumulate, or discard it if under-resolved."""
+    def add(self, samples, truth, weight=1.0):
+        """Rank one object and accumulate, or discard it if under-resolved.
+
+        ``weight`` is a per-object weight carried into :meth:`coverage` (e.g. an
+        importance weight for reweighting the test set); discarded objects drop
+        their weight with them. Equal weights give the unweighted result.
+        """
         traces = {n: np.asarray(f(samples), dtype=np.float64)
                   for n, f in self.statistics.items()}
         truths = {n: float(f(truth)) for n, f in self.statistics.items()}
@@ -134,6 +140,7 @@ class Calibration:
         for name, t in traces.items():
             self._ranks[name].append(
                 int(np.count_nonzero(t.reshape(-1)[idx] < truths[name])))
+        self._weights.append(float(weight))
         return self
 
     @property
@@ -156,6 +163,11 @@ class Calibration:
         not to ``level`` -- that is how the finite-draw (ESS) uncertainty of the
         ranks enters, as a shift of the reference rather than a wider interval.
 
+        The per-object weights from :meth:`add` reweight the coverage, and the
+        interval is the Clopper-Pearson at the Kish effective count
+        ``floor((sum w)^2 / sum w^2)`` (floored, which widens it). Equal weights
+        give the unweighted coverage over all objects.
+
         Parameters
         ----------
         name : str
@@ -168,7 +180,8 @@ class Calibration:
         Returns
         -------
         Coverage
-            ``(coverage, low, high, target, n_objects)``.
+            ``(coverage, low, high, target, n_objects)``. ``n_objects`` is the raw
+            retained count.
         """
         r = self.ranks(name)
         M = r.size
@@ -178,10 +191,14 @@ class Calibration:
         target = float(np.mean((grid >= lo_edge) & (grid <= hi_edge)))
         if M == 0:
             return Coverage(float("nan"), float("nan"), float("nan"), target, 0)
-        pit = r / self.L
-        k = int(np.count_nonzero((pit >= lo_edge) & (pit <= hi_edge)))
-        ci = binomtest(k, M).proportion_ci(confidence_level=confidence, method="exact")
-        return Coverage(k / M, float(ci.low), float(ci.high), target, M)
+        covered = (r / self.L >= lo_edge) & (r / self.L <= hi_edge)
+        w = np.asarray(self._weights, dtype=np.float64)
+        w = w / w.sum()
+        cov = float(np.sum(w * covered))
+        n = max(1, int(1.0 / float(np.sum(w * w))))    # Kish effective count, floored
+        k = min(max(int(round(cov * n)), 0), n)
+        ci = binomtest(k, n).proportion_ci(confidence_level=confidence, method="exact")
+        return Coverage(cov, float(ci.low), float(ci.high), target, M)
 
     def sbc_histogram(self, name, *, n_bins=None, confidence=0.99):
         """SBC rank histogram + band for statistic ``name``, as an
