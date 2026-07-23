@@ -17,6 +17,16 @@ def _coord(k):
     return lambda s: s[..., k]
 
 
+def _fill(scale, seed, n_objects=1200):
+    """A single-coordinate Calibration over objects with draws ~ scale * N(0,1)
+    and truth ~ N(0,1). scale=1 is calibrated; scale<1 is overconfident."""
+    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
+    rng = np.random.default_rng(seed)
+    for _ in range(n_objects):
+        cal.add(scale * rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+    return cal
+
+
 # --------------------------------------------------------------------------- #
 #  sbc_histogram                                                              #
 # --------------------------------------------------------------------------- #
@@ -57,54 +67,29 @@ def test_calibration_tracks_multiple_statistics():
     assert not np.array_equal(cal.ranks("y0"), cal.ranks("y1"))
 
 
-def test_calibration_uniform_under_calibration():
-    # truth ~ N(0,I), draws ~ N(0,I) -> ranks discrete-uniform -> counts in band.
-    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
-    rng = np.random.default_rng(12)
-    for _ in range(1000):
-        cal.add(rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+def test_calibrated_stays_in_band_and_at_target():
+    # truth ~ N(0,1), draws ~ N(0,1): ranks discrete-uniform, so the histogram
+    # sits in the band and coverage sits at the finite-L target p_L (~ level).
+    cal = _fill(1.0, seed=12)
     h = cal.sbc_histogram("y0", n_bins=10)
-    outside = int(np.sum((h.counts < h.low) | (h.counts > h.high)))
-    assert outside <= 1
-
-
-def test_coverage_matches_target_under_calibration():
-    # calibrated draws -> coverage at each level sits at the finite-L target p_L,
-    # which for L=99 is within 0.02 of the nominal level.
-    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
-    rng = np.random.default_rng(20)
-    for _ in range(1500):
-        cal.add(rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+    assert int(np.sum((h.counts < h.low) | (h.counts > h.high))) <= 1
     for level in (0.5, 0.75, 0.95):
         c = cal.coverage("y0", level)
-        assert isinstance(c, Coverage) and c.n_objects == 1500
+        assert isinstance(c, Coverage) and c.n_objects == 1200
         assert abs(c.target - level) < 0.02
-        assert abs(c.coverage - c.target) < 0.04       # a few binomial SE at M=1500
+        assert abs(c.coverage - c.target) < 0.04       # a few binomial SE at M=1200
         assert c.low <= c.coverage <= c.high
 
 
-def test_coverage_flags_overconfident_posterior():
-    # posterior too narrow: the central interval misses the truth far more often,
-    # so coverage falls well below the target and the target leaves the interval.
-    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
-    rng = np.random.default_rng(21)
-    for _ in range(1000):
-        cal.add(0.5 * rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
+def test_overconfident_breaches_band_and_undercovers():
+    # posterior too narrow (std 0.5): ranks pile at the edges, so the histogram
+    # breaches the band and coverage falls well below the target.
+    cal = _fill(0.5, seed=13)
+    h = cal.sbc_histogram("y0", n_bins=10)
+    assert int(np.sum((h.counts < h.low) | (h.counts > h.high))) >= 2
     c = cal.coverage("y0", 0.95)
     assert c.coverage < c.target - 0.05
     assert not (c.low <= c.target <= c.high)
-
-
-def test_calibration_flags_overconfident_posterior():
-    # posterior too narrow (std 0.5) vs truth ~ N(0,1): ranks pile at the edges,
-    # so the histogram breaches the uniform band.
-    cal = Calibration({"y0": _coord(0)}, L=99, thin=False)
-    rng = np.random.default_rng(13)
-    for _ in range(1000):
-        cal.add(0.5 * rng.standard_normal((2, 120, 1)), rng.standard_normal(1))
-    h = cal.sbc_histogram("y0", n_bins=10)
-    outside = int(np.sum((h.counts < h.low) | (h.counts > h.high)))
-    assert outside >= 2
 
 
 def test_calibration_thin_true_uses_arviz():
