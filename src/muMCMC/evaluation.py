@@ -213,7 +213,8 @@ class PosteriorEvaluation:
         """BAR estimate of ``log p(x)``, pooled over all chains."""
         return self._log_evidence
 
-    def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None) -> torch.Tensor:
+    def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None,
+                      generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
 
         Vectorized over the batch axis of ``y``. Returns the density with respect
@@ -243,6 +244,9 @@ class PosteriorEvaluation:
         n_marginal : int, optional
             Prior draws for the marginal expectation. Default is the number of
             posterior draws. Unused when every free name is present.
+        generator : torch.Generator, optional
+            RNG for the marginal prior draws, for reproducibility. Unused when
+            every free name is present.
         """
         excluded = [name for name in self.space.free_names if name not in y]
         if not excluded:
@@ -253,10 +257,11 @@ class PosteriorEvaluation:
             # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
             return -value - jac - self.log_evidence
 
-        return self._log_marginal_posterior(y, excluded, n_marginal)
+        return self._log_marginal_posterior(y, excluded, n_marginal, generator)
 
     def _log_marginal_posterior(self, y: dict, excluded: list,
-                                n_marginal: Optional[int]) -> torch.Tensor:
+                                n_marginal: Optional[int],
+                                generator: Optional[torch.Generator]) -> torch.Tensor:
         """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out."""
         provided = [name for name in self.space.free_names if name in y]
         if not provided:
@@ -267,7 +272,7 @@ class PosteriorEvaluation:
 
         # Draw the excluded block from its prior and pair every query point with
         # every draw on an (M, S) grid.
-        prior = self.space.sample(S)
+        prior = self.space.sample(S, generator=generator)
         grid = {}
         for name in provided:
             grid[name] = y[name].reshape(M, 1).expand(M, S)

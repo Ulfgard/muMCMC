@@ -33,9 +33,27 @@ for truncation to a box. Detecting an unnormalized prior is out of scope for the
 current interface, so it is a documented precondition rather than a checked one.
 """
 
+import contextlib
 from functools import cached_property
 
 import torch
+
+
+@contextlib.contextmanager
+def _rng_context(generator):
+    """Make the enclosed sampling reproducible from ``generator``.
+
+    torch and pyro distributions take no generator argument, so a seed drawn
+    from ``generator`` seeds a forked copy of the global RNG, which is restored
+    on exit. With ``generator`` None the global RNG is used directly.
+    """
+    if generator is None:
+        yield
+        return
+    seed = int(torch.randint(0, 2 ** 62, (1,), generator=generator).item())
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        yield
 
 
 class ElementwiseTransform:
@@ -380,14 +398,15 @@ class UnconstrainedSpace:
         G_ff = G.index_select(-2, fi).index_select(-1, fi)  # (N, d, d)
         return dJ[..., :, None] * G_ff * dJ[..., None, :]
 
-    def sample(self, n_samples):
+    def sample(self, n_samples, *, generator=None):
         if self.priors is None:
             raise ValueError("Unconstrained space without priors cannot be sampled from")
         samples = {}
-        for yi in self._free_names:
-            # Per-name prior is univariate. reshape normalises a trailing
-            # singleton and rejects a multivariate prior.
-            samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
+        with _rng_context(generator):
+            for yi in self._free_names:
+                # Per-name prior is univariate. reshape normalises a trailing
+                # singleton and rejects a multivariate prior.
+                samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
         return self.add_fixed(samples)
 
     def remove_fixed(self, samples):
@@ -539,13 +558,17 @@ class UniformBoxSpace:
         G_ff = G.index_select(-2, fi).index_select(-1, fi)  # (N, d, d)
         return dJ[..., :, None] * G_ff * dJ[..., None, :]
 
-    def sample(self, n_samples):
+    def sample(self, n_samples, *, generator=None):
+        with _rng_context(generator):
+            samples = self._sample_body(n_samples)
+        return self.add_fixed(samples)
+
+    def _sample_body(self, n_samples):
         if not self.priors:
             # Uniform sample within the box.
             u = torch.rand(n_samples, self.d, device=self.l.device, dtype=self.l.dtype)
             theta = self.l + u * (self.u - self.l)
-            samples = {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
-            return self.add_fixed(samples)
+            return {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
 
         # Per-coord rejection sampling: draw from the prior, resample draws
         # outside [l, u]. Coords are independent.
@@ -569,11 +592,11 @@ class UniformBoxSpace:
                 filled[idx[ok]] = True
             if not bool(filled.all()):
                 raise RuntimeError(
-                    f"rejection sampling for '{yi}' did not fill all draws; the "
+                    f"rejection sampling for '{yi}' did not fill all draws. The "
                     f"prior places too little mass inside [{float(l_i)}, {float(u_i)}]."
                 )
             samples[yi] = out
-        return self.add_fixed(samples)
+        return samples
 
     def remove_fixed(self, samples):
         samples = samples.copy()

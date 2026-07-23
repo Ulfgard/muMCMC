@@ -332,6 +332,33 @@ def test_box_prior_log_prob_marginal_subset_mixed():
     assert torch.allclose(lp_y, torch.full((2,), -math.log(10.0)), atol=ATOL)
 
 
+def test_box_sample_generator_is_reproducible():
+    s = _box()
+    a = s.sample(32, generator=torch.Generator().manual_seed(0))
+    b = s.sample(32, generator=torch.Generator().manual_seed(0))
+    c = s.sample(32, generator=torch.Generator().manual_seed(1))
+    assert torch.allclose(a["x"], b["x"]) and torch.allclose(a["y"], b["y"])
+    assert not torch.allclose(a["x"], c["x"])
+
+
+def test_unconstrained_sample_generator_is_reproducible():
+    s = UnconstrainedSpace(NAMES, priors=_priors())
+    a = s.sample(32, generator=torch.Generator().manual_seed(0))
+    b = s.sample(32, generator=torch.Generator().manual_seed(0))
+    assert all(torch.allclose(a[n], b[n]) for n in NAMES)
+
+
+def test_sample_generator_does_not_disturb_global_rng():
+    # The forked RNG must leave the global stream untouched.
+    s = _box()
+    torch.manual_seed(123)
+    before = torch.rand(3)
+    torch.manual_seed(123)
+    s.sample(16, generator=torch.Generator().manual_seed(7))
+    after = torch.rand(3)
+    assert torch.allclose(before, after)
+
+
 def test_box_prior_metric_default_none():
     s = _box()
     assert s.prior_metric(torch.randn(3, 2)) is None
