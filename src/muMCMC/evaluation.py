@@ -81,6 +81,60 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
     return offset - brentq(g, lo, hi)
 
 
+def _fit_gaussian(z: torch.Tensor, jitter: float) -> torch.distributions.MultivariateNormal:
+    """Full-covariance normal fitted to ``z`` (shape ``(n, d)``).
+
+    ``jitter`` loads the diagonal so the Cholesky is stable even when the sample
+    covariance is rank-deficient.
+    """
+    d = z.shape[-1]
+    mean = z.mean(dim=0)
+    cov = torch.cov(z.T).reshape(d, d)
+    cov = cov + jitter * torch.eye(d, dtype=cov.dtype, device=cov.device)
+    return torch.distributions.MultivariateNormal(
+        mean, scale_tril=torch.linalg.cholesky(cov))
+
+
+def _bar_gaussian(z: torch.Tensor, log_target, *, n_q: Optional[int] = None,
+                  jitter: float = 1e-6, generator: Optional[torch.Generator] = None,
+                  log_target_z: Optional[torch.Tensor] = None) -> float:
+    """BAR log-evidence of ``exp(log_target)`` from its draws ``z`` (shape ``(n, d)``).
+
+    Fits a full-covariance normal ``q̂`` to ``z``, draws ``n_q`` points from it,
+    and solves the BAR root over ``W = log_target − log q̂`` on both sets.
+
+    Parameters
+    ----------
+    z : Tensor, shape (n, d)
+        Draws from the normalized target, in the coordinates of ``log_target``.
+    log_target : callable
+        Maps ``(N, d) -> (N,)``, the unnormalized target log-density ``log f``.
+    n_q : int, optional
+        Number of ``q̂`` draws. Default is ``n``.
+    jitter : float
+        Diagonal loading for the covariance Cholesky.
+    generator : torch.Generator, optional
+        RNG for the ``q̂`` draws.
+    log_target_z : Tensor, optional
+        Precomputed ``log_target(z)``. Pass it to avoid re-evaluating an
+        expensive target on the input draws.
+
+    Returns
+    -------
+    float
+        BAR estimate of ``log ∫ f``.
+    """
+    n, d = z.shape
+    q = _fit_gaussian(z, jitter)
+    n0 = n if n_q is None else int(n_q)
+    eps = torch.randn(n0, d, dtype=z.dtype, device=z.device, generator=generator)
+    z_q = q.loc + eps @ q.scale_tril.mT
+    lf_z = log_target(z) if log_target_z is None else log_target_z
+    W_post = lf_z - q.log_prob(z)
+    W_q = log_target(z_q) - q.log_prob(z_q)
+    return _bar_root(W_post, W_q)
+
+
 class PosteriorEvaluation:
     """Evidence and posterior density from posterior draws.
 
@@ -107,7 +161,8 @@ class PosteriorEvaluation:
         ``run_mcmc`` (grouped by chain, shape ``(num_chains, num_samples)``). A
         single ungrouped axis ``(num_samples,)`` is also accepted.
     n_q : int, optional
-        Number of ``q̂`` draws ``n0``. Default is the number of posterior draws.
+        Number of ``q̂`` draws ``n0`` for the pooled estimate. Default is the
+        number of posterior draws. Per-chain estimates use their own chain size.
     jitter : float
         Diagonal loading added to the fitted covariance for a stable Cholesky.
     generator : torch.Generator, optional
@@ -125,6 +180,8 @@ class PosteriorEvaluation:
     ):
         self.sampler = sampler
         self.space = sampler.space
+        self._jitter = jitter
+        self._generator = generator
 
         # Constrained free vector grouped by chain: (K, n, d).
         theta_free = self.space.to_free_vector(samples)
@@ -133,37 +190,28 @@ class PosteriorEvaluation:
         K, n, d = theta_free.shape
         self._n_chains, self._n_per_chain, self._d = K, n, d
 
-        # Unconstrained draws, flattened over chains for the shared computations.
-        z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
-        z_flat = z.reshape(K * n, d)
-
-        # Fit q̂: a full-covariance Gaussian on the pooled draws.
-        mean = z_flat.mean(dim=0)
-        cov = torch.cov(z_flat.T).reshape(d, d)
-        cov = cov + jitter * torch.eye(d, dtype=cov.dtype, device=cov.device)
-        L = torch.linalg.cholesky(cov)
-        self._q = torch.distributions.MultivariateNormal(mean, scale_tril=L)
-
-        n0 = K * n if n_q is None else int(n_q)
-        eps = torch.randn(n0, d, dtype=z_flat.dtype, device=z_flat.device,
-                          generator=generator)
-        z_q = mean + eps @ L.T
-
-        # W = log f − log q̂ = −evaluate_model(z).value − log q̂(z), on both sets.
-        self._W_post = self._log_ratio(z_flat).reshape(K, n)
-        self._W_q = self._log_ratio(z_q)
+        # Unconstrained draws grouped by chain.
+        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
         self._n1 = K * n
-        self._n0 = n0
+        self._n0 = K * n if n_q is None else int(n_q)
 
-    def _log_ratio(self, z: torch.Tensor) -> torch.Tensor:
-        """``W(z) = −evaluate_model(z).value − log q̂(z)`` for a batch ``(N, d)``."""
-        neg_log_f = self.sampler.evaluate_model(z)[0].value
-        return -neg_log_f - self._q.log_prob(z)
+        # log f on the posterior draws, the one expensive evaluation. Reused for
+        # the pooled estimate, the per-chain estimates, and the W diagnostic.
+        self._log_f_post = self._log_target(self._z.reshape(K * n, d))
 
-    @cached_property
+        # Main estimate: BAR on the pooled draws over all chains.
+        self._log_evidence = _bar_gaussian(
+            self._z.reshape(K * n, d), self._log_target, n_q=self._n0,
+            jitter=jitter, generator=generator, log_target_z=self._log_f_post)
+
+    def _log_target(self, z: torch.Tensor) -> torch.Tensor:
+        """``log f(z) = −evaluate_model(z).value`` for a batch ``(N, d)``."""
+        return -self.sampler.evaluate_model(z)[0].value
+
+    @property
     def log_evidence(self) -> float:
-        """BAR estimate of ``log p(x)`` (cached)."""
-        return _bar_root(self._W_post, self._W_q)
+        """BAR estimate of ``log p(x)``, pooled over all chains."""
+        return self._log_evidence
 
     def log_posterior(self, y: dict) -> torch.Tensor:
         """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
@@ -187,49 +235,54 @@ class PosteriorEvaluation:
 
     @cached_property
     def _per_chain_log_evidence(self) -> torch.Tensor:
-        """Per-chain BAR estimate on disjoint ``q̂`` blocks, shape (K,).
+        """Independent per-chain BAR estimate, shape (K,).
 
-        Chain ``k`` uses its own posterior draws and its own block of the ``q̂``
-        draws. The blocks are disjoint, so given the fitted ``q̂`` the estimates
-        share no Monte Carlo data and are independent replicates. Requires at
-        least one ``q̂`` draw per chain.
+        Each chain runs the whole estimator on its own draws, fitting its own
+        ``q̂`` and drawing its own ``q̂`` points. The estimates share no Monte
+        Carlo data, so they are independent replicates of the pooled estimate.
+        The precomputed ``log f`` on the posterior draws is sliced per chain, so
+        no chain re-evaluates the target on its own draws.
         """
-        blocks = torch.tensor_split(self._W_q, self._n_chains)
-        return torch.tensor(
-            [_bar_root(self._W_post[k], blocks[k]) for k in range(self._n_chains)]
-        )
+        K, n = self._n_chains, self._n_per_chain
+        return torch.tensor([
+            _bar_gaussian(self._z[k], self._log_target, jitter=self._jitter,
+                          generator=self._generator,
+                          log_target_z=self._log_f_post[k * n:(k + 1) * n])
+            for k in range(K)
+        ])
 
     @cached_property
     def diagnostics(self) -> dict:
         """Scalar diagnostics for automated gating.
 
-        - ``W_percentiles``: percentiles of ``W`` on the posterior draws. A heavy
-          upper tail means ``q̂`` misses posterior mass.
-        - ``per_chain_log_evidence``: per-chain ``logZ`` on disjoint ``q̂`` blocks
-          (shape ``(K,)``). Present when ``n0 >= K`` so each chain gets a block.
+        - ``W_percentiles``: percentiles of ``W = log f − log q̂`` on the pooled
+          posterior draws. A heavy upper tail means ``q̂`` misses posterior mass.
+        - ``per_chain_log_evidence``: an independent per-chain estimate
+          (shape ``(K,)``), each chain fitting its own ``q̂``.
         - ``log_evidence_se``: standard error of the pooled estimate from the
-          spread of the per-chain replicates. Each replicate uses disjoint data
-          on both sides, so given the fitted ``q̂`` they are independent and the
-          spread captures both the posterior and the ``q̂`` Monte Carlo variance,
-          with no effective-sample-size correction. The ``q̂`` fit is shared and
-          treated as a fixed reference. Present for more than one chain.
-        - ``n1``, ``n0``: raw posterior and ``q̂`` draw counts.
+          spread of the per-chain replicates. The replicates are independent, so
+          their spread captures both the posterior and the ``q̂`` Monte Carlo
+          variance with no effective-sample-size correction. Present for more
+          than one chain.
+        - ``n1``, ``n0``: raw posterior and ``q̂`` draw counts of the pooled
+          estimate.
         """
+        z_flat = self._z.reshape(self._n1, self._d)
+        q = _fit_gaussian(z_flat, self._jitter)
+        Wp = (self._log_f_post - q.log_prob(z_flat)).double()
         probs = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99],
                              dtype=torch.float64)
-        Wp = self._W_post.reshape(-1).double()
         percentiles = {float(p): float(v)
                        for p, v in zip(probs, torch.quantile(Wp, probs))}
         K = self._n_chains
+        per_chain = self._per_chain_log_evidence
         out = {
             "W_percentiles": percentiles,
+            "per_chain_log_evidence": per_chain,
             "n1": self._n1,
             "n0": self._n0,
         }
-        if self._n0 >= K:                           # one q̂ block per chain
-            per_chain = self._per_chain_log_evidence
-            out["per_chain_log_evidence"] = per_chain
-            if K > 1:
-                out["log_evidence_se"] = float(
-                    per_chain.std(unbiased=True) / math.sqrt(K))
+        if K > 1:
+            out["log_evidence_se"] = float(
+                per_chain.std(unbiased=True) / math.sqrt(K))
         return out

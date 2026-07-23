@@ -19,7 +19,7 @@ from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
 from muMCMC.spaces import UnconstrainedSpace
-from muMCMC.evaluation import PosteriorEvaluation, _bar_root
+from muMCMC.evaluation import PosteriorEvaluation, _bar_root, _bar_gaussian
 
 torch.set_default_dtype(torch.float64)
 
@@ -172,14 +172,16 @@ def test_diagnostics_single_chain_omits_se():
     assert d["per_chain_log_evidence"].shape == (1,)
 
 
-def test_diagnostics_omits_per_chain_when_fewer_q_draws_than_chains():
-    # Per-chain replicates need one disjoint q̂ block per chain (n0 >= K).
-    x = torch.tensor([0.5, -1.0])
+def test_bar_gaussian_matches_pooled_estimate():
+    # The free-standing core on the pooled draws reproduces log_evidence.
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    d = x.shape[0]
     sampler, names, _ = _gaussian_model(x)
-    samples = _posterior_samples(x, names, K=4, n=500, seed=12)
-    ev = PosteriorEvaluation(sampler, samples, n_q=2,
-                             generator=torch.Generator().manual_seed(13))
-    d = ev.diagnostics
-    assert "per_chain_log_evidence" not in d
-    assert "log_evidence_se" not in d
-    assert d["n0"] == 2 and d["n1"] == 2000
+    samples = _posterior_samples(x, names, K=8, n=4000, seed=14)
+    gen = torch.Generator().manual_seed(15)
+    ev = PosteriorEvaluation(sampler, samples, generator=gen)
+
+    # Same seed, same draws, same fit -> reproduces the pooled estimate exactly.
+    z = ev._z.reshape(-1, d)
+    est = _bar_gaussian(z, ev._log_target, generator=torch.Generator().manual_seed(15))
+    assert abs(est - ev.log_evidence) < 1e-6
