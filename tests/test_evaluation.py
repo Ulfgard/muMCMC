@@ -1,4 +1,4 @@
-"""Tests for ``muMCMC.evaluation`` -- BAR evidence and posterior density.
+"""Tests for ``muMCMC.validation.evaluation``: BAR evidence and posterior density.
 
 The pure BAR core ``_bar_root`` is checked against its defining equation and a
 case with a closed-form answer.  The public ``PosteriorEvaluation`` is checked
@@ -19,7 +19,7 @@ from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
 from muMCMC.spaces import UnconstrainedSpace
-from muMCMC.evaluation import PosteriorEvaluation, _bar_root, _bar_gaussian
+from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_gaussian
 
 torch.set_default_dtype(torch.float64)
 

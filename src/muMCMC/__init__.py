@@ -30,7 +30,7 @@ from .spaces import (
     transforms,
 )
 from .adapters import DualAveraging, Reinforce, NoAdaptation
-from .evaluation import PosteriorEvaluation
+from .validation import PosteriorEvaluation
 
 __all__ = [
     "MCMCSampler",
