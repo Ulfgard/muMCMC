@@ -42,14 +42,19 @@ from scipy.optimize import brentq
 from scipy.special import expit
 
 
-def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor,
-              *, max_expand: int = 64) -> float:
+def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> float:
     """Solve ``Σ_pooled σ(W + b) = n1`` for ``b`` and return ``log(n1/n0) − b``.
 
     Pure core over arrays, directly testable.  ``g(b) = n1 − Σ σ(W + b)`` is
-    strictly decreasing from ``+n1`` (as ``b → −∞``) to ``−n0`` (as ``b → +∞``),
-    so a bracket always exists; it is found by doubling, then refined by
-    ``scipy.optimize.brentq``.
+    strictly decreasing in ``b``.  Since ``σ`` is monotone, the pooled sum is
+    squeezed by its extreme samples, ``N σ(W_min + b) ≤ Σ σ ≤ N σ(W_max + b)``
+    with ``N = n1 + n0``, which pins the root in closed form:
+
+        b* ∈ [ log(n1/n0) − W_max ,  log(n1/n0) − W_min ]
+
+    (equivalently ``log p(x) ∈ [W_min, W_max]``).  A small ``pad`` makes the sign
+    change strict and absorbs the all-equal-``W`` degenerate case; the root is
+    then refined by ``scipy.optimize.brentq``.
 
     Parameters
     ----------
@@ -70,23 +75,10 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor,
     def g(b: float) -> float:                       # strictly decreasing in b
         return n1 - expit(W + b).sum()
 
-    # Bracket [lo, hi] with g(lo) > 0 > g(hi); the doubling terminates for any
-    # finite W.
-    lo, hi = -1.0, 1.0
-    for _ in range(max_expand):
-        if g(lo) > 0.0:
-            break
-        lo *= 2.0
-    else:
-        raise RuntimeError("BAR root: could not bracket below; W may be degenerate")
-    for _ in range(max_expand):
-        if g(hi) < 0.0:
-            break
-        hi *= 2.0
-    else:
-        raise RuntimeError("BAR root: could not bracket above; W may be degenerate")
-
-    return math.log(n1 / n0) - brentq(g, lo, hi)
+    offset = math.log(n1 / n0)
+    lo = offset - float(W.max()) - pad              # g(lo) > 0
+    hi = offset - float(W.min()) + pad              # g(hi) < 0
+    return offset - brentq(g, lo, hi)
 
 
 class PosteriorEvaluation:
