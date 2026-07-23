@@ -70,13 +70,14 @@ def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
 class Calibration:
     """Accumulate SBC ranks for several statistics over a stream of objects.
 
-    Feed one object at a time with :meth:`add`. Each object's chain is thinned to
-    about independence and truncated to a common ``L`` (Talts et al. 2018,
-    Algorithm 2), so ranks from different objects share one scale. The chain is
-    thinned once, by the largest per-statistic factor, so every statistic uses
-    ~independent draws. An object with fewer than ``L`` effective draws is
-    discarded and counted in :attr:`n_discarded`. :meth:`sbc_histogram` reads the
-    accumulated ranks of a statistic.
+    Feed one object at a time with :meth:`add`. Each object is ranked at a common
+    ``L`` draws spread evenly across the whole chain (Talts et al. 2018, Algorithm
+    2, "uniformly thin to ``L`` states"), so ranks from different objects share one
+    scale. The spacing is the largest the chain allows and at least the ESS
+    thinning factor (taken once, as the largest over the statistics), so every
+    statistic uses ~independent draws. An object that cannot supply ``L`` draws
+    that far apart is discarded and counted in :attr:`n_discarded`.
+    :meth:`sbc_histogram` reads the accumulated ranks of a statistic.
 
     Parameters
     ----------
@@ -115,13 +116,20 @@ class Calibration:
         else:
             tau = 1 if self._thin is False else max(1, int(self._thin))
 
-        thinned = {n: t.reshape(-1)[::tau] for n, t in traces.items()}
-        if min(v.size for v in thinned.values()) < self.L:
+        # Place the L ranked draws as far apart as the chain allows, spanning the
+        # whole chain rather than its first L*tau samples. The spacing n // L is
+        # at least tau (the gate below), so with ESS >> L the draws end up far
+        # more separated than tau: more nearly independent, and less sensitive to
+        # an over-optimistic ESS.
+        n = next(iter(traces.values())).size
+        step = n // self.L
+        if step < tau:                       # cannot place L draws >= tau apart
             self.n_discarded += 1
             return self
-
-        for n in self.statistics:
-            self._ranks[n].append(int(np.count_nonzero(thinned[n][:self.L] < truths[n])))
+        idx = np.arange(self.L) * step
+        for name, t in traces.items():
+            self._ranks[name].append(
+                int(np.count_nonzero(t.reshape(-1)[idx] < truths[name])))
         return self
 
     @property
