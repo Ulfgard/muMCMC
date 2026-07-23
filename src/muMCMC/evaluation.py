@@ -213,25 +213,79 @@ class PosteriorEvaluation:
         """BAR estimate of ``log p(x)``, pooled over all chains."""
         return self._log_evidence
 
-    def log_posterior(self, y: dict) -> torch.Tensor:
+    def log_posterior(self, y: dict, *, n_marginal: Optional[int] = None) -> torch.Tensor:
         """``log p(y|x)`` at constrained points ``y`` (a dict keyed by free name).
 
-        Vectorized over the batch axis of ``y``. Returns the density with
-        respect to the constrained measure ``dy``. v1 requires all free names.
-        The marginal over a name subset is planned for v2.
+        Vectorized over the batch axis of ``y``. Returns the density with respect
+        to the constrained measure ``dy``.
+
+        The set of names present in ``y`` selects the marginal. With every free
+        name present the full posterior density is exact,
+
+            log p(y|x) = loglik(y) + log_prior(y) − logZ .
+
+        With a subset present the complementary block ``y_b`` is marginalized out,
+
+            log p(y_a|x) = log_prior(y_a) − logZ
+                           + log E_{y_b ~ p(y_b)}[ p(x | y_a, y_b) ] .
+
+        The expectation is a Monte Carlo average over ``n_marginal`` draws of
+        ``y_b`` from the prior, so its cost is ``batch × n_marginal`` likelihood
+        evaluations. Prior sampling scales where quadrature does not, and the
+        marginal error is bounded by the posterior variance already present in
+        ``logZ``, so on the order of the posterior sample size is enough.
+
+        Parameters
+        ----------
+        y : dict[str, Tensor]
+            Constrained query points keyed by free name. All free names gives the
+            full density, a subset gives the marginal over those names.
+        n_marginal : int, optional
+            Prior draws for the marginal expectation. Default is the number of
+            posterior draws. Unused when every free name is present.
         """
-        missing = [name for name in self.space.free_names if name not in y]
-        if missing:
-            raise NotImplementedError(
-                f"log_posterior needs all free names, missing {missing}. "
-                "Marginalizing over a name subset is planned for v2."
-            )
-        theta_free = self.space.to_free_vector(y)
+        excluded = [name for name in self.space.free_names if name not in y]
+        if not excluded:
+            theta_free = self.space.to_free_vector(y)
+            z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
+            value = self.sampler.evaluate_model(z)[0].value
+            jac = self.space.map_to_constrained_vector(z).jacobian_log_det
+            # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
+            return -value - jac - self.log_evidence
+
+        return self._log_marginal_posterior(y, excluded, n_marginal)
+
+    def _log_marginal_posterior(self, y: dict, excluded: list,
+                                n_marginal: Optional[int]) -> torch.Tensor:
+        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out."""
+        provided = [name for name in self.space.free_names if name in y]
+        if not provided:
+            raise ValueError("log_posterior needs at least one free name in y")
+
+        M = y[provided[0]].shape[0]
+        S = self._n1 if n_marginal is None else int(n_marginal)
+
+        # Draw the excluded block from its prior and pair every query point with
+        # every draw on an (M, S) grid.
+        prior = self.space.sample(S)
+        grid = {}
+        for name in provided:
+            grid[name] = y[name].reshape(M, 1).expand(M, S)
+        for name in excluded:
+            grid[name] = prior[name].reshape(1, S).expand(M, S)
+
+        theta_free = self.space.to_free_vector(grid).reshape(M * S, self._d)
         z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
-        value = self.sampler.evaluate_model(z)[0].value
-        jac = self.space.map_to_constrained_vector(z).jacobian_log_det
-        # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
-        return -value - jac - self.log_evidence
+        loglik = self._tempered_loglik(z).reshape(M, S)
+
+        # log E_prior[ p(x|y_a,y_b) ] = logsumexp_s loglik(y_a, y_b_s) − log S.
+        log_integral = torch.logsumexp(loglik, dim=1) - math.log(S)
+        return self.space.prior_log_prob(y) + log_integral - self.log_evidence
+
+    def _tempered_loglik(self, z: torch.Tensor) -> torch.Tensor:
+        """``beta·loglik(z) = −beta·U_lik``, the tempered log-likelihood."""
+        pot = self.sampler.evaluate_model(z)[0]
+        return -pot.value if pot.base is None else pot.base - pot.value
 
     @cached_property
     def _per_chain_log_evidence(self) -> torch.Tensor:

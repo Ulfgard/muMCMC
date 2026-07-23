@@ -138,14 +138,41 @@ def test_log_posterior_matches_gaussian_posterior():
     assert abs(float((lp - lp_true).mean())) < 0.05
 
 
-def test_log_posterior_requires_all_free_names():
+def test_log_posterior_marginal_matches_gaussian_marginal():
+    # Conjugate Gaussian: the posterior N(x/2, I/2) factorizes, so the marginal
+    # over a subset of coordinates is N(x_a/2, I_a/2). Marginalize one coord out
+    # of three via prior Monte Carlo.
+    x = torch.tensor([1.0, -0.5, 0.5])
+    d = x.shape[0]
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=4, n=2000, seed=16)
+    ev = PosteriorEvaluation(sampler, samples,
+                             generator=torch.Generator().manual_seed(17))
+
+    a = names[:2]                                  # keep y0, y1; marginalize y2
+    torch.manual_seed(18)
+    ya = x[:2] / 2.0 + 0.3 * torch.randn(16, 2)
+    y_dict = {a[0]: ya[:, 0], a[1]: ya[:, 1]}
+    torch.manual_seed(19)                          # prior MC draws
+    lp = ev.log_posterior(y_dict, n_marginal=40000)
+
+    true = torch.distributions.MultivariateNormal(
+        x[:2] / 2.0, covariance_matrix=0.5 * torch.eye(2))
+    lp_true = true.log_prob(ya)
+
+    # The marginalized-block integral is a shared constant across query points,
+    # so differences are exact and the absolute offset is small.
+    assert torch.allclose(lp - lp[0], lp_true - lp_true[0], atol=1e-6)
+    assert abs(float((lp - lp_true).mean())) < 0.05
+
+
+def test_log_posterior_marginal_requires_a_name():
     x = torch.tensor([1.0, -0.5, 0.5])
     sampler, names, _ = _gaussian_model(x)
     samples = _posterior_samples(x, names, K=2, n=500, seed=6)
     ev = PosteriorEvaluation(sampler, samples, generator=torch.Generator().manual_seed(7))
-    partial = {names[0]: torch.zeros(4)}          # drop the other names
-    with pytest.raises(NotImplementedError):
-        ev.log_posterior(partial)
+    with pytest.raises(ValueError):
+        ev.log_posterior({"not_a_name": torch.zeros(4)})
 
 
 def test_diagnostics_shape_and_keys():
