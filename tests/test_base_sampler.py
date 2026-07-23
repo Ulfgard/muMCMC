@@ -90,8 +90,10 @@ def test_potential_adds_prior_on_identity_space():
 
 
 def test_potential_subtracts_jacobian_log_det_on_box_space():
-    # Uniform box: prior log-prob is 0, so U = U_lik(theta) - log|det J|, and
-    # theta passed to potential_fn must be the *constrained* (box) value.
+    # Uniform box: the implicit prior is uniform on the box and normalized, so
+    # U = U_lik(theta) - log_prior(theta) - log|det J|, with log_prior the
+    # constant -log(u_i - l_i) summed over free coords. theta passed to
+    # potential_fn must be the *constrained* (box) value.
     space = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"],
                             device="cpu")
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
@@ -99,7 +101,8 @@ def test_potential_subtracts_jacobian_log_det_on_box_space():
     z = torch.randn(6, 2)
     theta_map = space.map_to_constrained_vector(z)
     theta = theta_map.mapped_point
-    expected = theta.sum(-1) - theta_map.jacobian_log_det
+    prior_lp = space.prior_log_prob_vector(theta)
+    expected = theta.sum(-1) - prior_lp - theta_map.jacobian_log_det
     assert torch.allclose(s.evaluate_model(z)[0].value, expected, atol=ATOL)
 
 

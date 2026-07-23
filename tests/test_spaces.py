@@ -163,6 +163,14 @@ def test_prior_log_prob_skips_fixed_names():
     assert torch.allclose(s.prior_log_prob(y), expected, atol=ATOL)
 
 
+def test_prior_log_prob_marginal_subset():
+    # A subset of names returns the marginal prior over just those names.
+    s = UnconstrainedSpace(NAMES, priors=_priors())
+    y = {"a": torch.tensor([0.5]), "c": torch.tensor([2.0])}
+    expected = sum(Normal(0.0, 1.0).log_prob(y[n]).squeeze(-1) for n in ["a", "c"])
+    assert torch.allclose(s.prior_log_prob(y), expected, atol=ATOL)
+
+
 def test_prior_log_prob_vector_matches_dict_form():
     s = UnconstrainedSpace(NAMES, priors=_priors())
     theta_free = torch.randn(6, 3)
@@ -284,15 +292,71 @@ def test_box_map_to_constrained_stays_inside():
     assert torch.all(theta < s.u)
 
 
-def test_box_prior_log_prob_is_zero():
+def test_box_prior_log_prob_is_normalized_uniform():
+    # No explicit prior -> uniform on the box, normalized: each free coordinate
+    # contributes -log(u_i - l_i). Limits x:(-1,1), y:(0,10) -> -log(2)-log(10).
     s = _box()
+    import math
+    norm = -math.log(2.0) - math.log(10.0)
     y = {"x": torch.tensor([0.1, -0.2]), "y": torch.tensor([3.0, 4.0])}
     lp = s.prior_log_prob(y)
     assert lp.shape == (2,)
-    assert torch.allclose(lp, torch.zeros(2), atol=ATOL)
+    assert torch.allclose(lp, torch.full((2,), norm), atol=ATOL)
     v = s.prior_log_prob_vector(torch.randn(7, 2))
     assert v.shape == (7,)
-    assert torch.allclose(v, torch.zeros(7), atol=ATOL)
+    assert torch.allclose(v, torch.full((7,), norm), atol=ATOL)
+
+
+def test_box_prior_log_prob_marginal_subset():
+    # Passing a subset of names returns the marginal prior over that subset:
+    # only the provided coordinates' uniform normalizers are summed.
+    import math
+    s = _box()                                   # x:(-1,1), y:(0,10)
+    lp_x = s.prior_log_prob({"x": torch.tensor([0.1, -0.2])})
+    assert torch.allclose(lp_x, torch.full((2,), -math.log(2.0)), atol=ATOL)
+    lp_y = s.prior_log_prob({"y": torch.tensor([3.0, 4.0])})
+    assert torch.allclose(lp_y, torch.full((2,), -math.log(10.0)), atol=ATOL)
+
+
+def test_box_prior_log_prob_marginal_subset_mixed():
+    # Mixed: an explicit prior on x, uniform on y. The x-marginal is the user
+    # density; the y-marginal is the uniform normalizer -log(u - l).
+    import math
+    priors = {"x": Normal(0.0, 1.0)}
+    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 10.0)}, ["x", "y"],
+                        device="cpu", priors=priors)
+    xv = torch.tensor([0.1, -0.2])
+    lp_x = s.prior_log_prob({"x": xv})
+    assert torch.allclose(lp_x, Normal(0.0, 1.0).log_prob(xv).squeeze(-1), atol=ATOL)
+    lp_y = s.prior_log_prob({"y": torch.tensor([3.0, 4.0])})
+    assert torch.allclose(lp_y, torch.full((2,), -math.log(10.0)), atol=ATOL)
+
+
+def test_box_sample_generator_is_reproducible():
+    s = _box()
+    a = s.sample(32, generator=torch.Generator().manual_seed(0))
+    b = s.sample(32, generator=torch.Generator().manual_seed(0))
+    c = s.sample(32, generator=torch.Generator().manual_seed(1))
+    assert torch.allclose(a["x"], b["x"]) and torch.allclose(a["y"], b["y"])
+    assert not torch.allclose(a["x"], c["x"])
+
+
+def test_unconstrained_sample_generator_is_reproducible():
+    s = UnconstrainedSpace(NAMES, priors=_priors())
+    a = s.sample(32, generator=torch.Generator().manual_seed(0))
+    b = s.sample(32, generator=torch.Generator().manual_seed(0))
+    assert all(torch.allclose(a[n], b[n]) for n in NAMES)
+
+
+def test_sample_generator_does_not_disturb_global_rng():
+    # The forked RNG must leave the global stream untouched.
+    s = _box()
+    torch.manual_seed(123)
+    before = torch.rand(3)
+    torch.manual_seed(123)
+    s.sample(16, generator=torch.Generator().manual_seed(7))
+    after = torch.rand(3)
+    assert torch.allclose(before, after)
 
 
 def test_box_prior_metric_default_none():
@@ -432,8 +496,10 @@ def test_box_sample_raises_when_prior_misses_box():
         s.sample(16)
 
 
-def test_box_without_priors_unchanged():
-    # No priors -> uniform behaviour preserved (prior_log_prob is zero).
+def test_box_without_priors_is_uniform_normalized():
+    # No priors -> uniform on the box, normalized to -log(volume) per coord.
+    import math
     s = _box()
+    norm = -math.log(2.0) - math.log(10.0)
     y = {"x": torch.tensor([0.1, -0.2]), "y": torch.tensor([3.0, 4.0])}
-    assert torch.allclose(s.prior_log_prob(y), torch.zeros(2), atol=ATOL)
+    assert torch.allclose(s.prior_log_prob(y), torch.full((2,), norm), atol=ATOL)
