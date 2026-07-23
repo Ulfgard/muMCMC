@@ -67,6 +67,33 @@ def test_fit_recovers_separated_bimodal():
     assert abs(float(variances[0]) - 0.25) < 0.05 and abs(float(variances[1]) - 0.25) < 0.05
 
 
+def test_fit_warm_start_matches_cold_on_true_mixture():
+    # On a genuine well-separated mixture the optimum is well-defined, so warm-
+    # starting one chain's fit from the pooled fit lands on the same optimum
+    # (same fit quality) as a cold k-means++ start.
+    g = torch.Generator().manual_seed(5)
+    centers = torch.tensor([[-4.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    comp = torch.randint(3, (8, 4000), generator=g)
+    z_all = centers[comp] + 0.5 * torch.randn(8, 4000, 3, generator=g)
+    pooled = GaussianMixture.fit(z_all.reshape(-1, 3), 3,
+                                 generator=torch.Generator().manual_seed(6))
+    chain = z_all[0]
+    cold = GaussianMixture.fit(chain, 3, generator=torch.Generator().manual_seed(7))
+    warm = GaussianMixture.fit(chain, 3, init=pooled)
+    assert abs(float(cold.log_prob(chain).mean()) - float(warm.log_prob(chain).mean())) < 1e-3
+
+
+def test_fit_max_iter_caps_work():
+    # A tiny iteration cap returns a valid, usable fit (does not error, weights
+    # normalized), so the cap is a safe cost knob.
+    g = torch.Generator().manual_seed(8)
+    z = torch.randn(3000, 4, generator=g)
+    gm = GaussianMixture.fit(z, 3, max_iter=2, generator=torch.Generator().manual_seed(9))
+    assert gm.n_components == 3
+    assert abs(float(gm.weights.sum()) - 1.0) < 1e-10
+    assert torch.isfinite(gm.log_prob(z)).all()
+
+
 def test_fit_single_component_is_sample_moments():
     g = torch.Generator().manual_seed(2)
     z = torch.randn(2000, 3, generator=g) @ torch.tensor(

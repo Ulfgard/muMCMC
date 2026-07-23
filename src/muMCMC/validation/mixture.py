@@ -61,12 +61,16 @@ class GaussianMixture:
     @classmethod
     def fit(cls, z: torch.Tensor, n_components: int, *, jitter: float = 1e-6,
             max_iter: int = 200, tol: float = 1e-5,
-            generator: Optional[torch.Generator] = None) -> "GaussianMixture":
+            generator: Optional[torch.Generator] = None,
+            init: Optional["GaussianMixture"] = None) -> "GaussianMixture":
         """EM fit of a ``n_components`` mixture to ``z`` (shape ``(n, d)``).
 
         ``jitter`` loads every component covariance diagonal so the Choleskys stay
         stable. ``K = 1`` is the plain sample mean and covariance. EM stops on a
         relative log-likelihood change below ``tol`` or after ``max_iter`` steps.
+        ``init`` warm-starts EM from an existing fit (e.g. a pooled fit when
+        refitting each chain), so a nearby fit converges in a few steps instead of
+        from a cold k-means++ seed.
         """
         z = z.detach()
         n, d = z.shape
@@ -77,9 +81,14 @@ class GaussianMixture:
             return cls(z.new_ones(1), z.mean(0, keepdim=True),
                        torch.linalg.cholesky(cov).unsqueeze(0))
 
-        means = _kmeanspp_init(z, k, generator)
-        covs = (torch.cov(z.T).reshape(d, d) + eye).expand(k, d, d).clone()
-        weights = z.new_full((k,), 1.0 / k)
+        if init is not None:
+            means = init.means.detach().clone()
+            covs = init.covs.detach().clone()
+            weights = init.weights.detach().clone()
+        else:
+            means = _kmeanspp_init(z, k, generator)
+            covs = (torch.cov(z.T).reshape(d, d) + eye).expand(k, d, d).clone()
+            weights = z.new_full((k,), 1.0 / k)
         prev = None
         for _ in range(max_iter):
             log_r = torch.log(weights) + MVN(means, covariance_matrix=covs).log_prob(z.unsqueeze(1))

@@ -427,6 +427,18 @@ def test_log_evidence_bimodal_mixture_reduces_se():
     assert se2 < ev1.diagnostics["log_evidence_se"]
 
 
+def test_evidence_em_knobs_bound_fit_and_keep_estimate():
+    # A capped/loosened EM fit still recovers the evidence on the bimodal model
+    # (q̂ only needs to cover, not converge tightly).
+    m, s, sigma0, w = 3.0, 0.5, 5.0, 0.6
+    sampler = _bimodal_model(m, s, sigma0, w)
+    samples = _bimodal_samples(m, s, w, K=8, n=4000, seed=62)
+    ev = PosteriorEvaluation(sampler, samples, n_components=2, max_iter=15, tol=1e-3,
+                             generator=torch.Generator().manual_seed(63))
+    se = ev.diagnostics["log_evidence_se"]
+    assert abs(ev.log_evidence) < max(3.0 * se, 0.05)
+
+
 def test_log_posterior_marginal_mixture_q():
     # The mixture conditional path (n_components=2) recovers the analytic marginal
     # on the conjugate Gaussian, matching the single-component result.

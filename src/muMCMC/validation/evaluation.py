@@ -87,7 +87,9 @@ def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
                   n_q: Optional[int] = None, jitter: float = 1e-6,
                   generator: Optional[torch.Generator] = None,
                   log_target_z: Optional[torch.Tensor] = None,
-                  q: Optional[GaussianMixture] = None) -> float:
+                  q: Optional[GaussianMixture] = None,
+                  init: Optional[GaussianMixture] = None,
+                  max_iter: int = 200, tol: float = 1e-5) -> float:
     """BAR log-evidence of ``exp(log_target)`` from its draws ``z`` (shape ``(n, d)``).
 
     Fits a Gaussian mixture ``q̂`` to ``z``, draws ``n_q`` points from it, and
@@ -112,6 +114,10 @@ def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
         expensive target on the input draws.
     q : GaussianMixture, optional
         A ``q̂`` already fitted to ``z``. Pass it to avoid refitting.
+    init : GaussianMixture, optional
+        Warm-start fit for ``q̂`` (e.g. a pooled fit when refitting one chain).
+    max_iter, tol : int, float
+        EM iteration cap and relative log-likelihood stopping tolerance.
 
     Returns
     -------
@@ -120,7 +126,8 @@ def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
     """
     n = z.shape[0]
     if q is None:
-        q = GaussianMixture.fit(z, n_components, jitter=jitter, generator=generator)
+        q = GaussianMixture.fit(z, n_components, jitter=jitter, generator=generator,
+                                init=init, max_iter=max_iter, tol=tol)
     n0 = n if n_q is None else int(n_q)
     z_q = q.sample(n0, generator=generator)
     lf_z = log_target(z) if log_target_z is None else log_target_z
@@ -163,6 +170,11 @@ class PosteriorEvaluation:
         number of posterior draws. Per-chain estimates use their own chain size.
     jitter : float
         Diagonal loading added to the fitted covariances for a stable Cholesky.
+    max_iter, tol : int, float
+        EM iteration cap and relative log-likelihood stopping tolerance for the
+        ``q̂`` fit. Lower ``max_iter`` or looser ``tol`` bound the fit cost, which
+        matters when ``n_components > 1`` on a non-Gaussian cloud, where EM would
+        otherwise crawl toward the cap. Ignored for ``n_components == 1``.
     generator : torch.Generator, optional
         RNG for the ``q̂`` fit and draws, for reproducibility.
     """
@@ -175,12 +187,16 @@ class PosteriorEvaluation:
         n_components: int = 1,
         n_q: Optional[int] = None,
         jitter: float = 1e-6,
+        max_iter: int = 200,
+        tol: float = 1e-5,
         generator: Optional[torch.Generator] = None,
     ):
         self.sampler = sampler
         self.space = sampler.space
         self._n_components = int(n_components)
         self._jitter = jitter
+        self._max_iter = int(max_iter)
+        self._tol = float(tol)
         self._generator = generator
 
         # Constrained free vector grouped by chain: (K, n, d).
@@ -204,7 +220,7 @@ class PosteriorEvaluation:
         # the W diagnostic, and the conditional proposal for marginals.
         self._q_pool = GaussianMixture.fit(
             self._z.reshape(K * n, d), self._n_components, jitter=jitter,
-            generator=generator)
+            generator=generator, max_iter=self._max_iter, tol=self._tol)
 
         # Main estimate: BAR on the pooled draws over all chains.
         self._log_evidence = _bar_evidence(
@@ -411,13 +427,17 @@ class PosteriorEvaluation:
         ``q̂`` and drawing its own ``q̂`` points. The estimates share no Monte
         Carlo data, so they are independent replicates of the pooled estimate.
         The precomputed ``log f`` on the posterior draws is sliced per chain, so
-        no chain re-evaluates the target on its own draws.
+        no chain re-evaluates the target on its own draws. Each chain's ``q̂``
+        warm-starts from the pooled fit, so EM converges in a few steps to the
+        chain's own optimum. The replicate spread stays driven by the chains'
+        draws, which enter the estimate directly through the BAR log-ratio.
         """
         K, n = self._n_chains, self._n_per_chain
         return torch.tensor([
             _bar_evidence(self._z[k], self._log_target, n_components=self._n_components,
                           jitter=self._jitter, generator=self._generator,
-                          log_target_z=self._log_f_post[k * n:(k + 1) * n])
+                          log_target_z=self._log_f_post[k * n:(k + 1) * n],
+                          init=self._q_pool, max_iter=self._max_iter, tol=self._tol)
             for k in range(K)
         ])
 
