@@ -457,6 +457,45 @@ def test_log_posterior_marginal_mixture_q():
     assert float(ess.min()) > 0.3 * 8000
 
 
+def test_jackknife_reports_corrected_estimate_and_se():
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    sampler, names, logZ_true = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=8, n=4000, seed=64)
+    ev = PosteriorEvaluation(sampler, samples, jackknife=True,
+                             generator=torch.Generator().manual_seed(65))
+    d = ev.diagnostics
+    assert d["jackknife_estimates"].shape == (8,)
+    assert math.isfinite(d["log_evidence_se"]) and "per_chain_log_evidence" not in d
+    # log_evidence is the bias-corrected value, not the raw pooled estimate.
+    assert abs(ev.log_evidence - (d["log_evidence_pooled"] - d["log_evidence_bias"])) < 1e-12
+    assert abs(ev.log_evidence - logZ_true) < max(3.0 * d["log_evidence_se"], 0.02)
+
+
+def test_jackknife_reduces_bias_on_sticky_chains():
+    # Autocorrelation inflates the q̂-reuse bias; the jackknife-corrected estimate
+    # sits closer to the true logZ than the raw pooled one.
+    x = torch.tensor([1.0, -0.5, 0.5, 2.0, -1.5])
+    sampler, names, logZ_true = _gaussian_model(x)
+    iid = _posterior_samples(x, names, K=8, n=4000, seed=66)
+    base = torch.stack([iid[n] for n in names], dim=-1)
+    sticky = {n: _sticky(base, 0.97, seed=67)[..., i] for i, n in enumerate(names)}
+
+    raw = PosteriorEvaluation(sampler, sticky, n_components=2,
+                              generator=torch.Generator().manual_seed(68)).log_evidence
+    ev = PosteriorEvaluation(sampler, sticky, n_components=2, jackknife=True,
+                             generator=torch.Generator().manual_seed(68))
+    assert abs(ev.log_evidence - logZ_true) < abs(raw - logZ_true)
+
+
+def test_jackknife_requires_two_chains():
+    x = torch.tensor([1.0, -0.5, 0.5])
+    sampler, names, _ = _gaussian_model(x)
+    samples = _posterior_samples(x, names, K=1, n=1000, seed=69)
+    with pytest.raises(ValueError):
+        PosteriorEvaluation(sampler, samples, jackknife=True,
+                            generator=torch.Generator().manual_seed(70))
+
+
 def _sticky(draws, stay_prob, seed):
     """Carry each draw forward with probability stay_prob (an autocorrelated
     chain with the same stationary distribution)."""

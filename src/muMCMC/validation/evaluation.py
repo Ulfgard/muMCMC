@@ -175,6 +175,15 @@ class PosteriorEvaluation:
         ``q̂`` fit. Lower ``max_iter`` or looser ``tol`` bound the fit cost, which
         matters when ``n_components > 1`` on a non-Gaussian cloud, where EM would
         otherwise crawl toward the cap. Ignored for ``n_components == 1``.
+    jackknife : bool
+        Report the delete-one-chain jackknife estimate instead of the raw pooled
+        one. :attr:`log_evidence` (and everything derived from it) then returns
+        the bias-corrected ``log Z``, and :attr:`diagnostics` its jackknife
+        standard error and the size of the correction. The correction targets the
+        finite-sample bias of fitting and scoring ``q̂`` on the same draws, which
+        is negligible for well-mixed chains but grows with autocorrelation and
+        with ``n_components``. Needs at least two chains and costs a BAR refit per
+        chain. Off by default.
     generator : torch.Generator, optional
         RNG for the ``q̂`` fit and draws, for reproducibility.
     """
@@ -189,6 +198,7 @@ class PosteriorEvaluation:
         jitter: float = 1e-6,
         max_iter: int = 200,
         tol: float = 1e-5,
+        jackknife: bool = False,
         generator: Optional[torch.Generator] = None,
     ):
         self.sampler = sampler
@@ -197,6 +207,7 @@ class PosteriorEvaluation:
         self._jitter = jitter
         self._max_iter = int(max_iter)
         self._tol = float(tol)
+        self._jackknife = bool(jackknife)
         self._generator = generator
 
         # Constrained free vector grouped by chain: (K, n, d).
@@ -205,6 +216,8 @@ class PosteriorEvaluation:
             theta_free = theta_free.unsqueeze(0)
         K, n, d = theta_free.shape
         self._n_chains, self._n_per_chain, self._d = K, n, d
+        if self._jackknife and K < 2:
+            raise ValueError("jackknife needs at least two chains")
 
         # Unconstrained draws grouped by chain. Detached so the cached draws (and
         # everything derived from them: log f, q̂) never carry an autograd graph.
@@ -234,8 +247,10 @@ class PosteriorEvaluation:
 
     @property
     def log_evidence(self) -> float:
-        """BAR estimate of ``log p(x)``, pooled over all chains."""
-        return self._log_evidence
+        """BAR estimate of ``log p(x)``. The delete-one-chain jackknife
+        bias-corrected value when ``jackknife=True``, else the raw pooled BAR
+        estimate over all chains."""
+        return self._jackknife_result["corrected"] if self._jackknife else self._log_evidence
 
     @cached_property
     def entropy(self) -> float:
@@ -420,6 +435,33 @@ class PosteriorEvaluation:
         return -pot.value if pot.base is None else pot.base - pot.value
 
     @cached_property
+    def _jackknife_result(self) -> dict:
+        """Delete-one-chain jackknife of the pooled BAR estimate.
+
+        Each replicate is a full BAR estimate on all chains but one (its own
+        ``q̂``, warm-started from the pooled fit), so the jackknife respects both
+        BAR's single-``q̂`` structure and the chain-block structure of
+        autocorrelated draws. Returns the bias-corrected estimate, the bias, its
+        standard error, and the delete-one estimates.
+        """
+        K, n = self._n_chains, self._n_per_chain
+        lf = self._log_f_post.reshape(K, n)
+        est = torch.tensor([
+            _bar_evidence(
+                self._z[[j for j in range(K) if j != k]].reshape((K - 1) * n, self._d),
+                self._log_target, n_components=self._n_components, n_q=self._n0,
+                jitter=self._jitter, generator=self._generator,
+                log_target_z=lf[[j for j in range(K) if j != k]].reshape(-1),
+                init=self._q_pool, max_iter=self._max_iter, tol=self._tol)
+            for k in range(K)
+        ])
+        full = self._log_evidence
+        mean = est.mean()
+        bias = float((K - 1) * (mean - full))
+        se = float((((K - 1) / K) * ((est - mean) ** 2).sum()).sqrt())
+        return {"corrected": full - bias, "bias": bias, "se": se, "estimates": est}
+
+    @cached_property
     def _per_chain_log_evidence(self) -> torch.Tensor:
         """Independent per-chain BAR estimate, shape (K,).
 
@@ -447,15 +489,18 @@ class PosteriorEvaluation:
 
         - ``W_percentiles``: percentiles of ``W = log f − log q̂`` on the pooled
           posterior draws. A heavy upper tail means ``q̂`` misses posterior mass.
-        - ``per_chain_log_evidence``: an independent per-chain estimate
-          (shape ``(K,)``), each chain fitting its own ``q̂``.
-        - ``log_evidence_se``: standard error of the pooled estimate from the
-          spread of the per-chain replicates. The replicates are independent, so
-          their spread captures both the posterior and the ``q̂`` Monte Carlo
-          variance with no effective-sample-size correction. Present for more
-          than one chain.
+        - ``log_evidence_se``: standard error of :attr:`log_evidence`. Present for
+          more than one chain (always under ``jackknife``).
         - ``n1``, ``n0``: raw posterior and ``q̂`` draw counts of the pooled
           estimate.
+
+        Without ``jackknife`` it also carries ``per_chain_log_evidence`` (an
+        independent per-chain estimate, shape ``(K,)``), and the SE is the spread
+        of those replicates over ``sqrt(K)``. Under ``jackknife`` it instead
+        carries ``log_evidence_pooled`` (the raw, uncorrected estimate),
+        ``log_evidence_bias`` (the size of the correction, a mixing-quality
+        alarm), and ``jackknife_estimates`` (the delete-one estimates), and the
+        SE is the jackknife standard error.
         """
         z_flat = self._z.reshape(self._n1, self._d)
         Wp = (self._log_f_post - self._q_pool.log_prob(z_flat)).double()
@@ -464,14 +509,17 @@ class PosteriorEvaluation:
         percentiles = {float(p): float(v)
                        for p, v in zip(probs, torch.quantile(Wp, probs))}
         K = self._n_chains
-        per_chain = self._per_chain_log_evidence
-        out = {
-            "W_percentiles": percentiles,
-            "per_chain_log_evidence": per_chain,
-            "n1": self._n1,
-            "n0": self._n0,
-        }
-        if K > 1:
-            out["log_evidence_se"] = float(
-                per_chain.std(unbiased=True) / math.sqrt(K))
+        out = {"W_percentiles": percentiles, "n1": self._n1, "n0": self._n0}
+        if self._jackknife:
+            jk = self._jackknife_result
+            out["log_evidence_pooled"] = self._log_evidence
+            out["log_evidence_bias"] = jk["bias"]
+            out["jackknife_estimates"] = jk["estimates"]
+            out["log_evidence_se"] = jk["se"]
+        else:
+            per_chain = self._per_chain_log_evidence
+            out["per_chain_log_evidence"] = per_chain
+            if K > 1:
+                out["log_evidence_se"] = float(
+                    per_chain.std(unbiased=True) / math.sqrt(K))
         return out
