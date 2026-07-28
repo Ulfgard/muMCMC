@@ -60,9 +60,10 @@ def _midpoint_map(
     p_k: torch.Tensor,
     eps,
     evaluate_model: Callable,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, TemperedMetric]:
     """
-    Fixed-point map F(z_k) = (F_q, F_p):
+    Fixed-point map F(z_k) = (F_q, F_p), also returning the midpoint metric G so
+    callers can reuse its Cholesky factor without re-evaluating the model:
 
         q_mid = ½(q + q_k)
         p_mid = ½(p + p_k)
@@ -96,7 +97,21 @@ def _midpoint_map(
     with torch.no_grad():
         F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
         F_p = p - e * dHdq
-    return F_q, F_p
+    return F_q, F_p, metric
+
+
+def _metric_weight(L, x, d):
+    """Left-apply W = blockdiag(G, G⁻¹) to ``x`` (..., 2d, k) via the Cholesky
+    factor L of G = L Lᵀ: G on the q-block, G⁻¹ on the p-block. When G is the
+    Gauss-Newton Hessian the p-residual scales like G (stiff) and the q-residual
+    like G⁻¹ (soft); this weighting equalises that ~cond(G) spread so the
+    Anderson least squares is conditioned by the map, not by the metric."""
+    Lt = L.transpose(-2, -1)
+    xq, xp = x[..., :d, :], x[..., d:, :]
+    Gxq = L @ (Lt @ xq)
+    Ginv_xp = torch.linalg.solve_triangular(
+        Lt, torch.linalg.solve_triangular(L, xp, upper=False), upper=True)
+    return torch.cat([Gxq, Ginv_xp], dim=-2)
 
 
 # ---- Fixed-point update rules ------------------------------------------- #
@@ -133,8 +148,8 @@ class _PicardUpdate:
     def __init__(self, beta=1.0):
         self.beta = float(beta)
 
-    def new(self, d):
-        """Fresh per-solve updater for ``d``-dim positions."""
+    def new(self, d, weight=None):
+        """Fresh per-solve updater for ``d``-dim positions (``weight`` unused)."""
         return self
 
     def propose(self, z, r):
@@ -163,7 +178,7 @@ class _AndersonUpdate:
         Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
     """
 
-    # Relative / absolute Tikhonov floors for the m×m normal-equation solve.
+    # Relative / absolute Tikhonov floors for the m×m least-squares solve.
     reg_rel = 1e-10
     reg_abs = 1e-14
 
@@ -172,11 +187,14 @@ class _AndersonUpdate:
         self.beta = float(beta)
         self._Z = []   # committed iterates z_k        (each (N, 2d))
         self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
+        self._weight = None   # optional metric preconditioner for the LS
 
-    def new(self, d):
+    def new(self, d, weight=None):
         """Fresh per-solve updater for ``d``-dim positions, resolving a None
-        ``history`` to ``d``."""
-        return _AndersonUpdate(d if self.history is None else self.history, self.beta)
+        ``history`` to ``d``. ``weight`` metric-preconditions the least squares."""
+        u = _AndersonUpdate(d if self.history is None else self.history, self.beta)
+        u._weight = weight
+        return u
 
     def propose(self, z, r):
         self._Z.append(z)
@@ -194,16 +212,25 @@ class _AndersonUpdate:
         dF = torch.stack([self._F[j] - self._F[j - 1]
                           for j in range(1, len(self._F))], dim=-1)   # (N, 2d, mk)
 
+        # Pick γ in the metric-weighted residual norm (W = blockdiag(G, G⁻¹)) so
+        # the stiff/soft component spread (~cond G) does not swamp the fit; the
+        # update below still uses the raw differences.
+        if self._weight is not None:
+            dF_ls = self._weight(dF)
+            f_ls  = self._weight(f_k.unsqueeze(-1)).squeeze(-1)
+        else:
+            dF_ls, f_ls = dF, f_k
+
         N, _, mk = dF.shape
         # Scale-aware Tikhonov floor for (near-)collinear or zero ΔF columns.
-        scale = (dF * dF).sum(-2).mean(-1)                # (N,) mean ‖ΔF_j‖²
+        scale = (dF_ls * dF_ls).sum(-2).mean(-1)          # (N,) mean ‖ΔF_j‖²
         reg   = self.reg_rel * scale + self.reg_abs       # (N,)
         # Solve the damped least squares by QR on the stacked [ΔF; √reg·I], not
         # the normal equations ΔFᵀΔF whose squared condition number overflows
-        # float64 at a stiff metric's column spread (collapsing Anderson).
+        # float64 at a stiff metric's scale spread (collapsing Anderson).
         eye   = torch.eye(mk, dtype=dF.dtype, device=dF.device)
-        A_aug = torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
-        b_aug = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(N, mk, 1)], dim=-2)
+        A_aug = torch.cat([dF_ls, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
+        b_aug = torch.cat([f_ls.unsqueeze(-1), f_ls.new_zeros(N, mk, 1)], dim=-2)
         Q, R  = torch.linalg.qr(A_aug)
         gamma = torch.linalg.solve_triangular(
             R, Q.transpose(-2, -1) @ b_aug, upper=True)    # (N, mk, 1)
@@ -227,15 +254,21 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
     d = q.shape[-1]
     N = q.shape[0]
 
+    start = {}   # captures the start-point metric factor from the first eval
+
     def residual_fn(z):
-        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
+        F_q, F_p, metric = _midpoint_map(
+            q, p, z[..., :d], z[..., d:], eps, evaluate_model)
+        if "L" not in start:
+            start["L"] = metric.L.detach()     # already factored by the map
         return z - torch.cat([F_q, F_p], dim=-1)
 
-    updater = solver.new(d)
-
     z_k = torch.cat([q, p], dim=-1)            # (N, 2d)
-    r_k = residual_fn(z_k)
+    r_k = residual_fn(z_k)                     # z_k=(q,p) => G evaluated at q
     r_init_norm = r_k.abs().amax(-1)           # (N,)
+
+    # Metric preconditioner for the accelerator: freeze G at the start point.
+    updater = solver.new(d, lambda x: _metric_weight(start["L"], x, d))
 
     done     = torch.zeros(N, dtype=torch.bool, device=q.device)
     iters    = torch.full((N,), max_iter, dtype=torch.long, device=q.device)

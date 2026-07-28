@@ -115,7 +115,7 @@ def test_midpoint_map_position_update_formula():
     ev = make_eval(model_qdep)
     q, p, q_k, p_k = _random_phase(2, seed=2)
     eps = torch.full((2,), 0.2)
-    F_q, _ = _midpoint_map(q, p, q_k, p_k, eps, ev)
+    F_q, _, _ = _midpoint_map(q, p, q_k, p_k, eps, ev)
 
     q_mid = 0.5 * (q + q_k)
     _, metric_mid = ev(q_mid)
@@ -130,7 +130,7 @@ def test_midpoint_map_momentum_gradient_matches_finite_difference():
     ev = make_eval(model_qdep)
     q, p, q_k, p_k = _random_phase(2, seed=3)
     eps = torch.full((2,), 0.2)
-    _, F_p = _midpoint_map(q, p, q_k, p_k, eps, ev)
+    _, F_p, _ = _midpoint_map(q, p, q_k, p_k, eps, ev)
     dHdq_used = (p - F_p) / eps.unsqueeze(-1)
 
     q_mid = 0.5 * (q + q_k)
@@ -160,7 +160,7 @@ def test_step_endpoint_satisfies_implicit_midpoint_equations():
     eps = torch.full((3,), 0.2)
     q1, p1, iters, residual = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12)
     # the converged endpoint is a fixed point of the midpoint map
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    F_q, F_p, _ = _midpoint_map(q, p, q1, p1, eps, ev)
     assert torch.allclose(q1, F_q, atol=1e-8)
     assert torch.allclose(p1, F_p, atol=1e-8)
     assert torch.all(residual < 1e-8)
@@ -298,7 +298,7 @@ def test_anderson_endpoint_satisfies_implicit_midpoint_equations():
     eps = torch.full((3,), 0.25)
     q1, p1, _, residual = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12,
                                                   _AndersonUpdate())
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    F_q, F_p, _ = _midpoint_map(q, p, q1, p1, eps, ev)
     assert torch.allclose(q1, F_q, atol=1e-8)
     assert torch.allclose(p1, F_p, atol=1e-8)
     assert torch.all(residual < 1e-8)
@@ -385,7 +385,7 @@ def test_damping_rescues_a_step_size_where_undamped_diverges(solver):
     assert float(res_undamped) > 1e-9                 # beta=1: does not converge
     assert float(res_damped) < 1e-9                   # beta<1: converges
     # ...and to a genuine fixed point of the (beta-independent) midpoint map.
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    F_q, F_p, _ = _midpoint_map(q, p, q1, p1, eps, ev)
     assert torch.allclose(q1, F_q, atol=1e-8)
     assert torch.allclose(p1, F_p, atol=1e-8)
 
@@ -434,7 +434,7 @@ def test_fallback_ladder_rescues_a_step_where_the_base_solver_diverges():
 
     assert float(r_base) > 1e-9                        # base alone: does not converge
     assert float(r_lad) < 1e-9                         # ladder: rescued
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    F_q, F_p, _ = _midpoint_map(q, p, q1, p1, eps, ev)
     assert torch.allclose(q1, F_q, atol=1e-8)
     assert torch.allclose(p1, F_p, atol=1e-8)
 
