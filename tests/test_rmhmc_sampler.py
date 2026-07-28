@@ -293,6 +293,36 @@ def test_damping_default_matches_undamped_transition():
     assert torch.allclose(run(), run(damping=1.0), atol=1e-12)
 
 
+def test_warm_start_matches_trivial_start_endpoint():
+    # The warm-started solve (predict the endpoint from the previous substep's
+    # displacement) must converge to the SAME fixed point as the trivial start
+    # to solver tolerance -- the guess changes only the iteration count, not the
+    # map, so detailed balance is preserved. Run a trajectory both ways.
+    def run_traj(warm):
+        torch.manual_seed(0)
+        s = make_sampler(model_qdep, adapt=False, num_steps=8,
+                         solver="anderson", step_size=0.05)
+        state = s.sample_momentum(s.init(torch.zeros(4, D)))
+        prop = RMHMCState(state.q.clone(), state.p.clone())
+        for _ in range(s.num_steps):
+            prop = s.integrate(prop, s.step_size)
+            if not warm:
+                prop.dz = None          # force the trivial start every substep
+        return prop
+
+    warm, cold = run_traj(True), run_traj(False)
+    assert torch.allclose(warm.q, cold.q, atol=1e-6)
+    assert torch.allclose(warm.p, cold.p, atol=1e-6)
+
+
+def test_warm_start_resets_each_trajectory():
+    # A fresh trajectory must start from the trivial guess: accept() rebuilds the
+    # state without dz, so the first substep sees dz=None.
+    s = make_sampler(model_qdep, adapt=False, num_steps=4, solver="anderson")
+    state = s.step(s.init(torch.zeros(4, D)))
+    assert state.dz is None
+
+
 def test_anderson_solver_runs_and_matches_picard_endpoint():
     # With adaptation off and a shared seed, a full transition (num_steps
     # leapfrogs + accept) must land in the same place under either solver,
