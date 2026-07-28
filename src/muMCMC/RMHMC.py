@@ -17,8 +17,7 @@ from .adapters import Reinforce, NoAdaptation
 #  update rule that drives the solve is pluggable: Picard iteration            #
 #  (z_{k+1} = F(z_k)) and Anderson acceleration both solve the same F, so      #
 #  the endpoint is solver- and damping-independent. Only the proposal,         #
-#  the iteration count, and stability differ.  F itself is solved with a       #
-#  momentum-first Gauss-Seidel sweep (F_p, then F_q from the fresh F_p).        #
+#  the iteration count, and stability differ.                                  #
 #                                                                              #
 #  Only the values F_q, F_p are needed (no Jacobian), so the sole              #
 #  gradient is the first-order dH/dq at the midpoint.                          #
@@ -63,13 +62,12 @@ def _midpoint_map(
     evaluate_model: Callable,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fixed-point map F(z_k) = (F_q, F_p), a momentum-first Gauss-Seidel sweep of
-    the implicit-midpoint equations:
+    Fixed-point map F(z_k) = (F_q, F_p):
 
         q_mid = ½(q + q_k)
         p_mid = ½(p + p_k)
-        F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}            (momentum first)
-        F_q   = q + (ε/2) G⁻¹(q_mid) (p + F_p)         (position from F_p)
+        F_q   = q + (ε/2) G⁻¹(q_mid) (p + p_k)
+        F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}
 
     Parameters
     ----------
@@ -96,9 +94,8 @@ def _midpoint_map(
     # the (N, d) updates.
     e = eps.unsqueeze(-1)
     with torch.no_grad():
-        # Gauss-Seidel: F_q uses the just-updated momentum F_p, not p_k.
+        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
         F_p = p - e * dHdq
-        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + F_p)
     return F_q, F_p
 
 
@@ -166,7 +163,7 @@ class _AndersonUpdate:
         Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
     """
 
-    # Relative / absolute Tikhonov floors for the m×m normal-equation solve.
+    # Relative / absolute Tikhonov floors for the least-squares solve.
     reg_rel = 1e-10
     reg_abs = 1e-14
 
@@ -197,14 +194,19 @@ class _AndersonUpdate:
         dF = torch.stack([self._F[j] - self._F[j - 1]
                           for j in range(1, len(self._F))], dim=-1)   # (N, 2d, mk)
 
-        A  = dF.transpose(-2, -1) @ dF                    # (N, mk, mk)
-        b  = dF.transpose(-2, -1) @ f_k.unsqueeze(-1)     # (N, mk, 1)
-        mk = A.shape[-1]
+        N, _, mk = dF.shape
         # Scale-aware Tikhonov floor for (near-)collinear or zero ΔF columns.
-        scale = A.diagonal(dim1=-2, dim2=-1).mean(-1)     # (N,)
-        reg   = (self.reg_rel * scale + self.reg_abs).view(-1, 1, 1)
-        A = A + reg * torch.eye(mk, dtype=A.dtype, device=A.device)
-        gamma = torch.linalg.solve(A, b)                  # (N, mk, 1)
+        scale = (dF * dF).sum(-2).mean(-1)                # (N,) mean ‖ΔF_j‖²
+        reg   = self.reg_rel * scale + self.reg_abs       # (N,)
+        # Solve the damped least squares by QR on the stacked [ΔF; √reg·I], not
+        # the normal equations ΔFᵀΔF whose squared condition number overflows
+        # float64 at a stiff metric's column spread (collapsing Anderson).
+        eye   = torch.eye(mk, dtype=dF.dtype, device=dF.device)
+        A_aug = torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
+        b_aug = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(N, mk, 1)], dim=-2)
+        Q, R  = torch.linalg.qr(A_aug)
+        gamma = torch.linalg.solve_triangular(
+            R, Q.transpose(-2, -1) @ b_aug, upper=True)    # (N, mk, 1)
 
         z_next = z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
         return z_next
