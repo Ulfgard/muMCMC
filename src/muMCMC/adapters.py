@@ -41,6 +41,10 @@ class NoAdaptation:
         """Size the (constant) value to ``(N,)``."""
         self._value = torch.full((N,), self._init, dtype=dtype, device=device)
 
+    def set_upper_bound(self, ub):
+        """No-op: the fixed value already sits at the caller's step size."""
+        pass
+
     def update(self, signal):
         """No-op: the value never moves."""
         pass
@@ -92,6 +96,7 @@ class DualAveraging:
         self.kappa = kappa
         self.gamma = gamma
         self._init = init
+        self.ub = float("inf")      # upper bound on the value (log step size)
         # State is device-dependent, so it is built by reset(), not here: the
         # caller must reset() before use (as init() does for the adapter role).
 
@@ -117,6 +122,10 @@ class DualAveraging:
         )
         # x_t = prox_center - sqrt(t)/gamma * g_avg
         self._x_t = self.prox_center - (self._t ** 0.5) / self.gamma * self._g_avg
+        # Bound the state (not just the reported value) so a later downward
+        # push from a bad sample acts immediately, with no inflation to unwind.
+        if self.ub != float("inf"):
+            self._x_t = torch.clamp(self._x_t, max=self.ub)
         # x_avg = (1 - t^-kappa) x_avg + t^-kappa x_t
         weight_t = self._t ** (-self.kappa)
         self._x_avg = (1 - weight_t) * self._x_avg + weight_t * self._x_t
@@ -134,6 +143,10 @@ class DualAveraging:
         """Fold one ``subgradient`` (no-op once frozen)."""
         if not self._frozen:
             self.step(subgradient)
+
+    def set_upper_bound(self, ub):
+        """Cap the value (and its running average) at ``ub`` from now on."""
+        self.ub = ub
 
     def finalize(self):
         """Freeze the estimate: :meth:`get_state` now reports ``(x_avg, x_avg)``."""
@@ -182,6 +195,7 @@ class Reinforce:
         self._dual       = DualAveraging(gamma=gamma)
         self._g          = None             # EMA baseline, None until first step
         self._frozen     = False
+        self.ub          = float("inf")     # upper bound on the value (log step size)
 
     def _draw_eps(self) -> torch.Tensor:
         """Draw a fresh ``(N,)`` perturbation ``eps ~ N(0, I)`` on
@@ -224,9 +238,17 @@ class Reinforce:
         x_t, x_avg = self._dual.get_state()
         if self._frozen:
             return x_avg, x_avg
-        return x_t + self.sigma * self._eps, x_avg
+        proposal = x_t + self.sigma * self._eps
+        if self.ub != float("inf"):
+            proposal = torch.clamp(proposal, max=self.ub)   # never evaluate past the cap
+        return proposal, x_avg
 
     # ---- adapter role ------------------------------------------------------- #
+
+    def set_upper_bound(self, ub):
+        """Cap the value (proposal and dual-averaged state) at ``ub``."""
+        self.ub = ub
+        self._dual.set_upper_bound(ub)
 
     def update(self, cost):
         """Fold one ``cost`` (no-op once frozen)."""

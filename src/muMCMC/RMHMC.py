@@ -471,6 +471,7 @@ class RMHMC(HamiltonianSampler):
         damping: float = 1.0,
         fallback_damping: Tuple[float, ...] = (0.5, 0.25),
         fallback_iter_scale: int = 4,
+        step_normalization: str = None,
         divergence_threshold: float = 100.0
     ):
         # Resolve the string choice into a configured solver.
@@ -501,7 +502,9 @@ class RMHMC(HamiltonianSampler):
         else:
             adapter = NoAdaptation(init=log_eps)
         super().__init__(model_fn, space, requires_metric=True, num_steps=num_steps,
-                         adapter=adapter, divergence_threshold=divergence_threshold)
+                         adapter=adapter, divergence_threshold=divergence_threshold,
+                         trajectory_length=num_steps * step_size,
+                         step_normalization=step_normalization)
 
         self._fp_max_iter = fp_max_iter
         self._fp_tol      = fp_tol
