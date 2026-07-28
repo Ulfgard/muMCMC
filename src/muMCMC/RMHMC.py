@@ -275,14 +275,16 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
 def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
                             solver=None, fallback=(), z_init=None):
     """One implicit-midpoint step: the base solve, then a fallback ladder that
-    re-solves only the non-converged chains (from the same start) with
-    progressively stronger damping -- ``fallback`` is a sequence of
-    (factor, max_iter). Damping keeps the fixed point, so the ladder is
-    endpoint-preserving: it turns non-convergence into convergence rather than
-    rejecting it (a solver-driven rejection would break detailed balance). Empty
-    ``fallback`` is a plain single pass. ``z_init`` warm-starts the base pass
-    only (the ladder keeps the trivial start as a safe fallback). Returns as
-    :func:`_solve_pass`, with ``iters`` summed over the passes a chain took."""
+    re-solves the non-converged chains with progressively stronger damping --
+    ``fallback`` is a sequence of (factor, max_iter). Damping keeps the fixed
+    point, so the ladder is endpoint-preserving: it turns non-convergence into
+    convergence rather than rejecting it (a solver-driven rejection would break
+    detailed balance). Empty ``fallback`` is a plain single pass. ``z_init``
+    warm-starts the base pass only (the ladder keeps the trivial start as a safe
+    fallback). Each ladder pass runs over the full batch and commits only the
+    still-bad chains, so the batch never desyncs from the caller's per-chain
+    state. Returns as :func:`_solve_pass`, with ``iters`` summed over the passes
+    a chain took."""
     base = solver if solver is not None else _PicardUpdate()
     q_out, p_out, iters, residual = _solve_pass(
         q, p, eps, evaluate_model, max_iter, tol, base, z_init=z_init)
@@ -291,14 +293,13 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
         bad = residual > tol
         if not bool(bad.any()):
             break
-        idx = bad.nonzero(as_tuple=True)[0]
         qn, pn, it_n, r_n = _solve_pass(
-            q[idx], p[idx], eps[idx], evaluate_model, fb_iter, tol,
-            base.damped(factor))
-        q_out[idx]    = qn
-        p_out[idx]    = pn
-        iters[idx]    = iters[idx] + it_n     # accumulate honest cost
-        residual[idx] = r_n
+            q, p, eps, evaluate_model, fb_iter, tol, base.damped(factor))
+        commit  = bad.unsqueeze(-1)
+        q_out    = torch.where(commit, qn, q_out)
+        p_out    = torch.where(commit, pn, p_out)
+        iters    = torch.where(bad, iters + it_n, iters)   # honest cost, bad chains only
+        residual = torch.where(bad, r_n, residual)
 
     return q_out, p_out, iters, residual
 
