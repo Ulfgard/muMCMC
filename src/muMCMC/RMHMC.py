@@ -334,25 +334,28 @@ class RMHMCState:
         Metric at ``q``. Set at ``init`` / ``accept``, ``None`` after ``step``.
     """
 
-    def __init__(self, q, p=None, U=None, metric=None, dz=None):
+    def __init__(self, q, p=None, U=None, metric=None, dz=None, dz_prev=None):
         self.q = q
         self.p = p
         self.U = U
         self.metric = metric
-        # Last converged endpoint displacement (N, 2d), used to warm-start the
-        # next substep's solve; None at a trajectory start (dropped by accept).
+        # Last two converged endpoint displacements (N, 2d), used to warm-start
+        # the next substep's solve by quadratic extrapolation; None at a
+        # trajectory start (dropped by accept).
         self.dz = dz
+        self.dz_prev = dz_prev
 
     def reorder(self, perm):
         """Permute the batch elements by ``perm`` (an ``(N,)`` long index
         tensor): slot ``i`` of the result carries the configuration from
         ``perm[i]``. Absent (None) fields stay None."""
         return RMHMCState(
-            q      = self.q[perm],
-            p      = None if self.p is None else self.p[perm],
-            U      = None if self.U is None else self.U.reorder(perm),
-            metric = None if self.metric is None else self.metric.reorder(perm),
-            dz     = None if self.dz is None else self.dz[perm],
+            q       = self.q[perm],
+            p       = None if self.p is None else self.p[perm],
+            U       = None if self.U is None else self.U.reorder(perm),
+            metric  = None if self.metric is None else self.metric.reorder(perm),
+            dz      = None if self.dz is None else self.dz[perm],
+            dz_prev = None if self.dz_prev is None else self.dz_prev[perm],
         )
 
     def select_accepted(self, accepted, other):
@@ -538,13 +541,19 @@ class RMHMC(HamiltonianSampler):
         fixed-point residual and iteration count over the transition's substeps
         (read by :meth:`acceptance_delta` and :meth:`adapt`).
 
-        The solve is warm-started by predicting the endpoint as the current
-        point plus the previous substep's converged displacement (``state.dz``);
-        the guess only changes the iteration count, not the fixed point, so the
-        map -- and detailed balance -- are unchanged. ``dz`` is reset per
-        trajectory (``accept`` builds a fresh state without it)."""
+        The solve is warm-started by extrapolating the endpoint from the last
+        two converged displacements (quadratic; linear on the second substep,
+        trivial on the first). The guess only changes the iteration count, not
+        the fixed point, so the map -- and detailed balance -- are unchanged.
+        The displacements reset per trajectory (``accept`` builds a fresh state
+        without them)."""
         z_start = torch.cat([state.q, state.p], dim=-1)
-        z_init  = None if state.dz is None else z_start + state.dz
+        if state.dz is None:
+            z_init = None                                       # first substep
+        elif state.dz_prev is None:
+            z_init = z_start + state.dz                         # linear
+        else:
+            z_init = z_start + 2.0 * state.dz - state.dz_prev   # quadratic
         q, p, fp_it, residual = _implicit_midpoint_step(
             state.q, state.p, step_size, self.evaluate_model,
             self._fp_max_iter, self._fp_tol, self._solver, self._fallback,
@@ -553,7 +562,7 @@ class RMHMC(HamiltonianSampler):
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters    = torch.maximum(self._step_iters, it)
         dz = torch.cat([q, p], dim=-1) - z_start
-        return RMHMCState(q, p, dz=dz)
+        return RMHMCState(q, p, dz=dz, dz_prev=state.dz)
 
     def acceptance_delta(self, new, old):
         """``delta_H = H(new) - H(old)``, forced to +inf where the trajectory's
