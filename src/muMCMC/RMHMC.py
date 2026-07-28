@@ -17,7 +17,8 @@ from .adapters import Reinforce, NoAdaptation
 #  update rule that drives the solve is pluggable: Picard iteration            #
 #  (z_{k+1} = F(z_k)) and Anderson acceleration both solve the same F, so      #
 #  the endpoint is solver- and damping-independent. Only the proposal,         #
-#  the iteration count, and stability differ.                                  #
+#  the iteration count, and stability differ.  F itself is solved with a       #
+#  momentum-first Gauss-Seidel sweep (F_p, then F_q from the fresh F_p).        #
 #                                                                              #
 #  Only the values F_q, F_p are needed (no Jacobian), so the sole              #
 #  gradient is the first-order dH/dq at the midpoint.                          #
@@ -62,12 +63,13 @@ def _midpoint_map(
     evaluate_model: Callable,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fixed-point map F(z_k) = (F_q, F_p):
+    Fixed-point map F(z_k) = (F_q, F_p), a momentum-first Gauss-Seidel sweep of
+    the implicit-midpoint equations:
 
         q_mid = ½(q + q_k)
         p_mid = ½(p + p_k)
-        F_q   = q + (ε/2) G⁻¹(q_mid) (p + p_k)
-        F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}
+        F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}            (momentum first)
+        F_q   = q + (ε/2) G⁻¹(q_mid) (p + F_p)         (position from F_p)
 
     Parameters
     ----------
@@ -94,8 +96,9 @@ def _midpoint_map(
     # the (N, d) updates.
     e = eps.unsqueeze(-1)
     with torch.no_grad():
-        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
+        # Gauss-Seidel: F_q uses the just-updated momentum F_p, not p_k.
         F_p = p - e * dHdq
+        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + F_p)
     return F_q, F_p
 
 
