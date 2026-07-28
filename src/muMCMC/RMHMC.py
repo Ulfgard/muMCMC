@@ -143,6 +143,10 @@ class _PicardUpdate:
     def propose(self, z, r):
         return z - self.beta * r
 
+    def damped(self, factor):
+        """Copy with β scaled by ``factor`` (fallback ladder)."""
+        return _PicardUpdate(self.beta * factor)
+
 
 class _AndersonUpdate:
     """Anderson(m) acceleration (Type-II, damping β) of the fixed-point map.
@@ -205,42 +209,19 @@ class _AndersonUpdate:
         z_next = z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
         return z_next
 
+    def damped(self, factor):
+        """Copy with β scaled by ``factor``, same history (fallback ladder)."""
+        return _AndersonUpdate(self.history, self.beta * factor)
+
 
 # ---- Implicit midpoint step --------------------------------------------- #
 
-def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=None):
-    """
-    One step of I.M.(a): solve for the endpoint (q', p') via a per-chain
-    fixed-point iteration.
-
-    Batched over a leading chain axis (q, p have shape (N, d)). Each chain
-    runs its own solve and finishes when it converges (max-norm residual <
-    tol) or blows up (residual > 10x its initial value). Finished chains are
-    frozen via a mask while live chains keep iterating, until all chains
-    finish or max_iter is reached.
-
-    Parameters
-    ----------
-    q, p : (N, d)
-        Start-of-step position and momentum.
-    eps : (N,)
-        Per-chain step size.
-    evaluate_model : Callable
-        Maps q to (potential, metric).
-    max_iter : int
-        Maximum iterations per chain.
-    tol : float
-        Convergence tolerance (max norm).
-    solver : _PicardUpdate or _AndersonUpdate or None
-        Configured update rule. None defaults to undamped Picard.
-
-    Returns
-    -------
-    q_out, p_out : (N, d)
-    iters    : (N,) long   per-chain iteration count (max_iter if blown up
-               or never converged, else the iteration at which tol was met)
-    residual : (N,)        per-chain final max-norm residual
-    """
+def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
+    """One fixed-point pass for the implicit-midpoint endpoint with a single
+    ``solver``, batched over chains (q, p: (N, d)). Each chain iterates until it
+    converges (max-norm residual < tol) or blows up (residual > 10x its initial
+    value), frozen by a mask thereafter, up to ``max_iter``. Returns
+    (q_out, p_out, iters, residual)."""
     d = q.shape[-1]
     N = q.shape[0]
 
@@ -248,7 +229,7 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
         F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
         return z - torch.cat([F_q, F_p], dim=-1)
 
-    updater = (solver if solver is not None else _PicardUpdate()).new(d)
+    updater = solver.new(d)
 
     z_k = torch.cat([q, p], dim=-1)            # (N, 2d)
     r_k = residual_fn(z_k)
@@ -284,6 +265,36 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol, solver=Non
             break
 
     return z_k[..., :d].detach(), z_k[..., d:].detach(), iters, residual.detach()
+
+
+def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
+                            solver=None, fallback=()):
+    """One implicit-midpoint step: the base solve, then a fallback ladder that
+    re-solves only the non-converged chains (from the same start) with
+    progressively stronger damping -- ``fallback`` is a sequence of
+    (factor, max_iter). Damping keeps the fixed point, so the ladder is
+    endpoint-preserving: it turns non-convergence into convergence rather than
+    rejecting it (a solver-driven rejection would break detailed balance). Empty
+    ``fallback`` is a plain single pass. Returns as :func:`_solve_pass`, with
+    ``iters`` summed over the passes a chain took."""
+    base = solver if solver is not None else _PicardUpdate()
+    q_out, p_out, iters, residual = _solve_pass(
+        q, p, eps, evaluate_model, max_iter, tol, base)
+
+    for factor, fb_iter in fallback:
+        bad = residual > tol
+        if not bool(bad.any()):
+            break
+        idx = bad.nonzero(as_tuple=True)[0]
+        qn, pn, it_n, r_n = _solve_pass(
+            q[idx], p[idx], eps[idx], evaluate_model, fb_iter, tol,
+            base.damped(factor))
+        q_out[idx]    = qn
+        p_out[idx]    = pn
+        iters[idx]    = iters[idx] + it_n     # accumulate honest cost
+        residual[idx] = r_n
+
+    return q_out, p_out, iters, residual
 
 
 # =========================================================================== #
@@ -405,6 +416,13 @@ class RMHMC(HamiltonianSampler):
     damping : float
         Under-relaxation factor β ∈ (0, 1] shared by both solvers.
         Default 1.0 (undamped).
+    fallback_damping : tuple of float
+        Fallback ladder: on non-convergence, re-solve the failed chains with the
+        base solver damped by each factor in turn (each in (0, 1), relative to
+        ``damping``; default ``(0.5, 0.25)``). Endpoint-preserving, so it removes
+        solver-driven rejections. ``()`` disables it.
+    fallback_iter_scale : int
+        Per-level iteration cap as a multiple of ``fp_max_iter``. Default 4.
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence. Default 100.
@@ -438,6 +456,8 @@ class RMHMC(HamiltonianSampler):
         solver: str = "picard",
         anderson_history: int = None,
         damping: float = 1.0,
+        fallback_damping: Tuple[float, ...] = (0.5, 0.25),
+        fallback_iter_scale: int = 4,
         divergence_threshold: float = 100.0
     ):
         # Resolve the string choice into a configured solver.
@@ -453,6 +473,13 @@ class RMHMC(HamiltonianSampler):
         else:
             raise ValueError(
                 f"unknown solver {solver!r}; expected 'picard' or 'anderson'")
+
+        # Fallback ladder: re-solve non-converged chains with stronger damping.
+        if any(not 0.0 < f < 1.0 for f in fallback_damping):
+            raise ValueError(
+                f"fallback_damping factors must be in (0, 1), got {fallback_damping}")
+        self._fallback = [(f, fallback_iter_scale * fp_max_iter)
+                          for f in fallback_damping]
 
         # The adapters work on the log step size; step_size = exp(adapter value).
         log_eps = math.log(step_size)
@@ -502,7 +529,7 @@ class RMHMC(HamiltonianSampler):
         (read by :meth:`acceptance_delta` and :meth:`adapt`)."""
         q, p, fp_it, residual = _implicit_midpoint_step(
             state.q, state.p, step_size, self.evaluate_model,
-            self._fp_max_iter, self._fp_tol, self._solver)
+            self._fp_max_iter, self._fp_tol, self._solver, self._fallback)
         it = fp_it.to(step_size.dtype)
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters    = torch.maximum(self._step_iters, it)
