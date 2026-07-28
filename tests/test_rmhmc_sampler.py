@@ -261,6 +261,28 @@ def test_invalid_damping_raises(bad):
         make_sampler(damping=bad)
 
 
+@pytest.mark.parametrize("bad", [(0.5, 1.0), (0.5, 1.5), (0.0, 0.25), (-0.1,)])
+def test_invalid_fallback_damping_raises(bad):
+    with pytest.raises(ValueError, match="fallback_damping"):
+        make_sampler(fallback_damping=bad)
+
+
+def test_fallback_ladder_reduces_divergences_on_a_stiff_step():
+    # An undamped-Picard base diverges on a stiff step; the default fallback
+    # ladder rescues it, so the transition is accepted rather than counted a
+    # (detailed-balance-breaking) solver divergence. Same seed both ways.
+    def run(fallback_damping):
+        torch.manual_seed(0)
+        s = make_sampler(model_qdep, adapt=False, num_steps=4, step_size=2.0,
+                         damping=1.0, fallback_damping=fallback_damping)
+        state = s.init(torch.full((8, D), 0.5))
+        s.step(state)
+        return int(s._num_divergences.sum())
+
+    assert run(()) > 0                         # no ladder: solver-driven divergences
+    assert run((0.5, 0.25)) < run(())          # ladder rescues them
+
+
 def test_damping_default_matches_undamped_transition():
     # damping=1.0 is the default, so an explicit 1.0 must reproduce it exactly.
     def run(**kw):

@@ -112,14 +112,17 @@ def _random_phase(N, seed):
 
 
 def test_midpoint_map_position_update_formula():
+    # Momentum-first Gauss-Seidel: the position update consumes the freshly
+    # updated momentum F_p (not the stale p_k), against the metric at the
+    # midpoint.
     ev = make_eval(model_qdep)
     q, p, q_k, p_k = _random_phase(2, seed=2)
     eps = torch.full((2,), 0.2)
-    F_q, _ = _midpoint_map(q, p, q_k, p_k, eps, ev)
+    F_q, F_p = _midpoint_map(q, p, q_k, p_k, eps, ev)
 
     q_mid = 0.5 * (q + q_k)
     _, metric_mid = ev(q_mid)
-    expected = q + (eps.unsqueeze(-1) / 2.0) * metric_mid.inv_metric_times_vec(p + p_k)
+    expected = q + (eps.unsqueeze(-1) / 2.0) * metric_mid.inv_metric_times_vec(p + F_p)
     assert torch.allclose(F_q, expected, atol=1e-10)
 
 
@@ -165,6 +168,38 @@ def test_step_endpoint_satisfies_implicit_midpoint_equations():
     assert torch.allclose(p1, F_p, atol=1e-8)
     assert torch.all(residual < 1e-8)
     assert iters.shape == (3,) and residual.shape == (3,)
+
+
+def _jacobi_midpoint_map(q, p, q_k, p_k, eps, ev):
+    """The plain Jacobi sweep of the implicit-midpoint map (F_q uses the stale
+    p_k, not the freshly updated F_p). The production ``_midpoint_map`` is the
+    momentum-first Gauss-Seidel reorder of this; both share the same fixed
+    point. Local reference for the regression test below."""
+    q_mid = (0.5 * (q + q_k)).detach().requires_grad_(True)
+    p_mid = 0.5 * (p + p_k)
+    with torch.enable_grad():
+        potential, metric = ev(q_mid)
+        H = _hamiltonian(q_mid, p_mid, potential.value, metric)
+        (dHdq,) = torch.autograd.grad(H.sum(), q_mid)
+    e = eps.unsqueeze(-1)
+    with torch.no_grad():
+        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
+        F_p = p - e * dHdq
+    return F_q, F_p
+
+
+def test_gauss_seidel_reorder_preserves_the_jacobi_fixed_point():
+    # _midpoint_map is a momentum-first Gauss-Seidel sweep; the reorder must
+    # change only the path, not the endpoint. So the converged endpoint has to
+    # be a fixed point of the *plain Jacobi* map as well (they coincide there).
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(4, seed=31)
+    eps = torch.full((4,), 0.3)
+    q1, p1, _, residual = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12)
+    assert torch.all(residual < 1e-10)
+    F_q, F_p = _jacobi_midpoint_map(q, p, q1, p1, eps, ev)
+    assert torch.allclose(q1, F_q, atol=1e-8)
+    assert torch.allclose(p1, F_p, atol=1e-8)
 
 
 def test_step_per_chain_convergence_is_independent():
@@ -361,15 +396,16 @@ _damped = {
 }
 
 
-@pytest.mark.parametrize("solver", ["picard", "anderson"])
-def test_damping_rescues_a_step_size_where_undamped_diverges(solver):
-    # Constant metric + quadratic potential => the iteration Jacobian is (to
-    # leading order) block off-diagonal with purely imaginary eigenvalues
-    # ±i(eps/2)sqrt(eig(G^-1 H)).  Here lambda_max(B_CONST^-1 A_QUAD) ~ 1.58, so
-    # the undamped (beta=1) iteration has spectral radius > 1 for eps=1.8 and
-    # cannot converge, while under-relaxation (beta=0.5) pulls it back inside
-    # the unit circle.  Same eps, same solver -- only beta differs.
-    make = _damped[solver]
+def test_damping_rescues_a_step_size_where_undamped_diverges():
+    # Picard on constant metric + quadratic potential: the iteration Jacobian is
+    # (to leading order) block off-diagonal with eigenvalues set by
+    # lambda_max(B_CONST^-1 A_QUAD) ~ 1.55. The momentum-first Gauss-Seidel
+    # sweep squares the plain-Jacobi contraction, but at eps=1.8 the undamped
+    # (beta=1) radius still exceeds 1 and cannot converge, while under-relaxation
+    # (beta=0.5) pulls it back inside the unit circle. Same eps, only beta
+    # differs. (This is a Picard property: Anderson is Krylov-type and converges
+    # undamped even here, so it needs no rescue on this linear map; damping
+    # composing with Anderson is covered by the endpoint-equivalence test below.)
     ev = make_eval(model_gauss_const)
     torch.manual_seed(20)
     q = torch.randn(1, D)
@@ -378,9 +414,9 @@ def test_damping_rescues_a_step_size_where_undamped_diverges(solver):
     eps = torch.full((1,), 1.8)
 
     _, _, _, res_undamped = _implicit_midpoint_step(
-        q, p, eps, ev, 100, 1e-9, make(1.0))
+        q, p, eps, ev, 100, 1e-9, _PicardUpdate(1.0))
     q1, p1, _, res_damped = _implicit_midpoint_step(
-        q, p, eps, ev, 100, 1e-9, make(0.5))
+        q, p, eps, ev, 100, 1e-9, _PicardUpdate(0.5))
 
     assert float(res_undamped) > 1e-9                 # beta=1: does not converge
     assert float(res_damped) < 1e-9                   # beta<1: converges
@@ -403,3 +439,72 @@ def test_damping_reaches_same_endpoint_as_undamped(solver):
     assert torch.all(r1 < 1e-11) and torch.all(rb < 1e-11)
     assert torch.allclose(qb, q1, atol=1e-9)
     assert torch.allclose(pb, p1, atol=1e-9)
+
+
+# ========================================================================== #
+#  7. Solver fallback ladder                                                 #
+# ========================================================================== #
+
+def test_damped_scales_beta_on_both_updaters():
+    assert _PicardUpdate(0.8).damped(0.5).beta == pytest.approx(0.4)
+    a = _AndersonUpdate(5, 0.8).damped(0.5)
+    assert a.beta == pytest.approx(0.4) and a.history == 5
+
+
+def test_fallback_ladder_rescues_a_step_where_the_base_solver_diverges():
+    # Same setup as the damping-rescue test: at eps=1.8 the undamped Picard base
+    # does not converge. The fallback ladder re-solves the failed chain with
+    # damping and lands it on a genuine fixed point of the midpoint map -- so a
+    # step that would have been rejected (breaking detailed balance) is resolved.
+    ev = make_eval(model_gauss_const)
+    torch.manual_seed(20)
+    q = torch.randn(1, D)
+    _, metric = ev(q)
+    p = metric.sample_momentum()
+    eps = torch.full((1,), 1.8)
+
+    _, _, _, r_base = _implicit_midpoint_step(
+        q, p, eps, ev, 100, 1e-9, _PicardUpdate(1.0))                 # no ladder
+    q1, p1, _, r_lad = _implicit_midpoint_step(
+        q, p, eps, ev, 100, 1e-9, _PicardUpdate(1.0), fallback=[(0.5, 300)])
+
+    assert float(r_base) > 1e-9                        # base alone: does not converge
+    assert float(r_lad) < 1e-9                         # ladder: rescued
+    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    assert torch.allclose(q1, F_q, atol=1e-8)
+    assert torch.allclose(p1, F_p, atol=1e-8)
+
+
+def test_fallback_only_touches_unconverged_chains():
+    # A batch mixing an easy chain (base converges) and a hard one (needs the
+    # ladder): the easy chain's endpoint and iteration count are identical with
+    # or without the ladder -- only the failed chain is re-solved.
+    ev = make_eval(model_gauss_const)
+    torch.manual_seed(20)
+    q = torch.randn(1, D)
+    _, metric = ev(q)
+    p = metric.sample_momentum()
+    q2 = torch.cat([q, q], 0)
+    p2 = torch.cat([p, p], 0)
+    eps = torch.tensor([0.3, 1.8])                     # easy, then diverges undamped
+
+    qb, pb, ib, rb = _implicit_midpoint_step(
+        q2, p2, eps, ev, 100, 1e-9, _PicardUpdate(1.0))                # no ladder
+    ql, pl, il, rl = _implicit_midpoint_step(
+        q2, p2, eps, ev, 100, 1e-9, _PicardUpdate(1.0), fallback=[(0.5, 300)])
+
+    # easy chain untouched by the ladder
+    assert torch.equal(qb[0], ql[0]) and torch.equal(ib[0], il[0])
+    # hard chain: rejected by base, rescued by the ladder
+    assert float(rb[1]) > 1e-9 and float(rl[1]) < 1e-9
+
+
+def test_fallback_empty_schedule_is_a_plain_single_pass():
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(3, seed=41)
+    eps = torch.full((3,), 0.3)
+    q0, p0, i0, r0 = _implicit_midpoint_step(q, p, eps, ev, 200, 1e-12, _PicardUpdate())
+    q1, p1, i1, r1 = _implicit_midpoint_step(
+        q, p, eps, ev, 200, 1e-12, _PicardUpdate(), fallback=())
+    assert torch.equal(q0, q1) and torch.equal(p0, p1)
+    assert torch.equal(i0, i1) and torch.equal(r0, r1)
