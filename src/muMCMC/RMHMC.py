@@ -194,14 +194,19 @@ class _AndersonUpdate:
         dF = torch.stack([self._F[j] - self._F[j - 1]
                           for j in range(1, len(self._F))], dim=-1)   # (N, 2d, mk)
 
-        A  = dF.transpose(-2, -1) @ dF                    # (N, mk, mk)
-        b  = dF.transpose(-2, -1) @ f_k.unsqueeze(-1)     # (N, mk, 1)
-        mk = A.shape[-1]
+        N, _, mk = dF.shape
         # Scale-aware Tikhonov floor for (near-)collinear or zero ΔF columns.
-        scale = A.diagonal(dim1=-2, dim2=-1).mean(-1)     # (N,)
-        reg   = (self.reg_rel * scale + self.reg_abs).view(-1, 1, 1)
-        A = A + reg * torch.eye(mk, dtype=A.dtype, device=A.device)
-        gamma = torch.linalg.solve(A, b)                  # (N, mk, 1)
+        scale = (dF * dF).sum(-2).mean(-1)                # (N,) mean ‖ΔF_j‖²
+        reg   = self.reg_rel * scale + self.reg_abs       # (N,)
+        # Solve the damped least squares by QR on the stacked [ΔF; √reg·I], not
+        # the normal equations ΔFᵀΔF whose squared condition number overflows
+        # float64 at a stiff metric's column spread (collapsing Anderson).
+        eye   = torch.eye(mk, dtype=dF.dtype, device=dF.device)
+        A_aug = torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
+        b_aug = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(N, mk, 1)], dim=-2)
+        Q, R  = torch.linalg.qr(A_aug)
+        gamma = torch.linalg.solve_triangular(
+            R, Q.transpose(-2, -1) @ b_aug, upper=True)    # (N, mk, 1)
 
         z_next = z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
         return z_next
