@@ -218,11 +218,12 @@ class _AndersonUpdate:
 
 # ---- Implicit midpoint step --------------------------------------------- #
 
-def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
+def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
     """One fixed-point pass for the implicit-midpoint endpoint with a single
     ``solver``, batched over chains (q, p: (N, d)). Each chain iterates until it
     converges (max-norm residual < tol) or blows up (residual > 10x its initial
-    value), frozen by a mask thereafter, up to ``max_iter``. Returns
+    value), frozen by a mask thereafter, up to ``max_iter``. ``z_init`` (N, 2d)
+    seeds the iterate; None starts from (q, p). Returns
     (q_out, p_out, iters, residual)."""
     d = q.shape[-1]
     N = q.shape[0]
@@ -233,7 +234,7 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
 
     updater = solver.new(d)
 
-    z_k = torch.cat([q, p], dim=-1)            # (N, 2d)
+    z_k = torch.cat([q, p], dim=-1) if z_init is None else z_init   # (N, 2d)
     r_k = residual_fn(z_k)
     r_init_norm = r_k.abs().amax(-1)           # (N,)
 
@@ -253,8 +254,10 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
         residual = torch.where(done, residual, r_next_norm)
 
         live = ~done
-        # Blow-up: finish at max_iter semantics (iters already max_iter).
-        blew = live & (r_next_norm > 10.0 * r_init_norm)
+        # Blow-up: finish at max_iter semantics (iters already max_iter). The
+        # tol conjunct keeps a warm-started chain whose r_init is already tiny
+        # from tripping on a sub-tol Anderson wobble.
+        blew = live & (r_next_norm > 10.0 * r_init_norm) & (r_next_norm > tol)
         done = done | blew
 
         live = ~done
@@ -270,18 +273,19 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver):
 
 
 def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
-                            solver=None, fallback=()):
+                            solver=None, fallback=(), z_init=None):
     """One implicit-midpoint step: the base solve, then a fallback ladder that
     re-solves only the non-converged chains (from the same start) with
     progressively stronger damping -- ``fallback`` is a sequence of
     (factor, max_iter). Damping keeps the fixed point, so the ladder is
     endpoint-preserving: it turns non-convergence into convergence rather than
     rejecting it (a solver-driven rejection would break detailed balance). Empty
-    ``fallback`` is a plain single pass. Returns as :func:`_solve_pass`, with
-    ``iters`` summed over the passes a chain took."""
+    ``fallback`` is a plain single pass. ``z_init`` warm-starts the base pass
+    only (the ladder keeps the trivial start as a safe fallback). Returns as
+    :func:`_solve_pass`, with ``iters`` summed over the passes a chain took."""
     base = solver if solver is not None else _PicardUpdate()
     q_out, p_out, iters, residual = _solve_pass(
-        q, p, eps, evaluate_model, max_iter, tol, base)
+        q, p, eps, evaluate_model, max_iter, tol, base, z_init=z_init)
 
     for factor, fb_iter in fallback:
         bad = residual > tol
@@ -330,11 +334,14 @@ class RMHMCState:
         Metric at ``q``. Set at ``init`` / ``accept``, ``None`` after ``step``.
     """
 
-    def __init__(self, q, p=None, U=None, metric=None):
+    def __init__(self, q, p=None, U=None, metric=None, dz=None):
         self.q = q
         self.p = p
         self.U = U
         self.metric = metric
+        # Last converged endpoint displacement (N, 2d), used to warm-start the
+        # next substep's solve; None at a trajectory start (dropped by accept).
+        self.dz = dz
 
     def reorder(self, perm):
         """Permute the batch elements by ``perm`` (an ``(N,)`` long index
@@ -345,6 +352,7 @@ class RMHMCState:
             p      = None if self.p is None else self.p[perm],
             U      = None if self.U is None else self.U.reorder(perm),
             metric = None if self.metric is None else self.metric.reorder(perm),
+            dz     = None if self.dz is None else self.dz[perm],
         )
 
     def select_accepted(self, accepted, other):
@@ -528,14 +536,24 @@ class RMHMC(HamiltonianSampler):
     def integrate(self, state, step_size):
         """One implicit-midpoint substep at ``step_size``, tracking the worst
         fixed-point residual and iteration count over the transition's substeps
-        (read by :meth:`acceptance_delta` and :meth:`adapt`)."""
+        (read by :meth:`acceptance_delta` and :meth:`adapt`).
+
+        The solve is warm-started by predicting the endpoint as the current
+        point plus the previous substep's converged displacement (``state.dz``);
+        the guess only changes the iteration count, not the fixed point, so the
+        map -- and detailed balance -- are unchanged. ``dz`` is reset per
+        trajectory (``accept`` builds a fresh state without it)."""
+        z_start = torch.cat([state.q, state.p], dim=-1)
+        z_init  = None if state.dz is None else z_start + state.dz
         q, p, fp_it, residual = _implicit_midpoint_step(
             state.q, state.p, step_size, self.evaluate_model,
-            self._fp_max_iter, self._fp_tol, self._solver, self._fallback)
+            self._fp_max_iter, self._fp_tol, self._solver, self._fallback,
+            z_init=z_init)
         it = fp_it.to(step_size.dtype)
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters    = torch.maximum(self._step_iters, it)
-        return RMHMCState(q, p)
+        dz = torch.cat([q, p], dim=-1) - z_start
+        return RMHMCState(q, p, dz=dz)
 
     def acceptance_delta(self, new, old):
         """``delta_H = H(new) - H(old)``, forced to +inf where the trajectory's
