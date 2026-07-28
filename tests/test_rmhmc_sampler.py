@@ -323,6 +323,39 @@ def test_warm_start_resets_each_trajectory():
     assert state.dz is None
 
 
+def test_step_normalization_fixed_caps_step_size():
+    # trajectory length = step_size * num_steps is held fixed: with adaptation on,
+    # no chain's step size exceeds trajectory_length/num_steps (= initial step_size),
+    # and num_steps is unchanged.
+    torch.manual_seed(0)
+    s = make_sampler(model_qdep, adapt=True, step_size=0.05, num_steps=5,
+                     solver="picard", step_normalization="fixed")
+    state = s.init(torch.randn(4, D) * 0.3)
+    for _ in range(15):
+        state = s.step(state)
+    assert s.num_steps == 5
+    assert float(s.step_size.max()) <= 0.05 + 1e-9
+
+
+def test_step_normalization_max_holds_trajectory_length():
+    # "max" re-derives num_steps from the fastest chain so no trajectory exceeds
+    # the target length (0.05 * 5).
+    torch.manual_seed(0)
+    traj = 0.05 * 5
+    s = make_sampler(model_qdep, adapt=True, step_size=0.05, num_steps=5,
+                     solver="picard", step_normalization="max")
+    state = s.init(torch.randn(4, D) * 0.3)
+    for _ in range(15):
+        state = s.step(state)
+    assert s.num_steps >= 1
+    assert float(s.step_size.max()) * s.num_steps <= traj + 1e-9
+
+
+def test_invalid_step_normalization_raises():
+    with pytest.raises(ValueError):
+        make_sampler(step_normalization="bogus")
+
+
 def test_anderson_solver_runs_and_matches_picard_endpoint():
     # With adaptation off and a shared seed, a full transition (num_steps
     # leapfrogs + accept) must land in the same place under either solver,

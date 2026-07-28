@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from typing import Callable
 from collections import OrderedDict
+import math
 
 import torch
 
@@ -61,12 +62,29 @@ class HamiltonianSampler(MCMCSampler):
         num_steps: int,
         adapter,
         divergence_threshold: float,
+        trajectory_length: float = None,
+        step_normalization: str = None,
     ):
         super().__init__(potential_fn=model_fn, space=space,
                          requires_metric=requires_metric)
         self.num_steps             = num_steps
         self._step_size_adapter    = adapter
         self._divergence_threshold = divergence_threshold
+
+        # Trajectory-length normalization (off by default). When on, the
+        # trajectory length ``num_steps * step_size`` is held at
+        # ``trajectory_length`` while step sizes adapt: every step size is
+        # capped at ``trajectory_length / num_steps``, and in "max" mode
+        # ``num_steps`` is re-derived from the fastest chain so no trajectory
+        # exceeds the target.
+        if step_normalization not in (None, "fixed", "max"):
+            raise ValueError(
+                f"step_normalization must be None, 'fixed' or 'max', got "
+                f"{step_normalization!r}")
+        if step_normalization is not None and trajectory_length is None:
+            raise ValueError("step_normalization requires a trajectory_length")
+        self._trajectory_length = trajectory_length
+        self._step_normalization = step_normalization
 
         # Diagnostics returned by diagnostics(): key -> callable giving an (N,)
         # tensor, evaluated on each call. Subclasses add entries in __init__.
@@ -106,11 +124,25 @@ class HamiltonianSampler(MCMCSampler):
         """One chain transition: fresh momentum, ``num_steps`` integrator
         substeps at the adapter's step size, then Metropolis accept/reject."""
         state = self.sample_momentum(state)
+        self._normalize_trajectory()
         step_size = self.step_size
         proposal = state
         for _ in range(self.num_steps):
             proposal = self.integrate(proposal, step_size)
         return self.accept(proposal, state)
+
+    def _normalize_trajectory(self):
+        """Hold the trajectory length at ``trajectory_length`` (no-op when
+        normalization is off). In "max" mode ``num_steps`` is re-derived from the
+        fastest chain (``ceil`` so the cap binds it exactly, floored at 1); either
+        way every step size is capped at ``trajectory_length / num_steps``."""
+        if self._step_normalization is None:
+            return
+        if self._step_normalization == "max":
+            h = torch.exp(self._step_size_adapter.get_state()[1])   # smoothed (N,)
+            self.num_steps = max(1, math.ceil(self._trajectory_length / float(h.max())))
+        cap = self._trajectory_length / self.num_steps
+        self._step_size_adapter.set_upper_bound(math.log(cap))
 
     def accept(self, new, old):
         """Per-chain Metropolis accept/reject between the endpoint ``new`` and
