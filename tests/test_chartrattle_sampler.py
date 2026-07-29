@@ -7,8 +7,6 @@ integrator internals live in test_chartrattle_solver.py. Recovery is checked
 against the exact Gaussian induced by an affine map and against a quadrature
 reference for the funnel.
 """
-import math
-
 import torch
 import pytest
 
@@ -32,9 +30,7 @@ class FunnelChart(ChartConstraint):
         return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        b = self.beta
-        log_b = b.log() if torch.is_tensor(b) else math.log(b)
-        return 0.5 * self.x.shape[-1] * (self.s * eta[:, 0] - log_b)
+        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]     # untempered, no β-normalizer
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
@@ -271,12 +267,13 @@ def test_pt_runs_swaps_and_recovers_target_mean():
     kernel = ChartRATTLE(FunnelChart(sigma, xobs), UnconstrainedSpace(["v"]),
                          step_size=0.06, num_steps=12, adapt_step_size=False,
                          solver="anderson", fp_tol=1e-9)
-    pt = PT(kernel, betas=torch.tensor([0.0, 0.25, 0.5, 1.0]))
+    # β > 0 throughout: β = 0 sends Σ/β -> ∞, outside the scale family.
+    pt = PT(kernel, betas=torch.tensor([0.1, 0.3, 0.55, 1.0]))
     state = pt.init(torch.zeros(24, 1))
     for _ in range(400):
         state = pt.step(state)
 
     diag = pt.diagnostics()
     assert diag["swap_accept_rate"].shape == (3,)
-    assert float(diag["swap_accept_rate"][-1]) > 0.1     # hot pairs communicate
+    assert float(diag["swap_accept_rate"].min()) > 0.1   # every pair communicates
     assert abs(float(state.q.reshape(-1).mean()) - mean_q) < 0.05

@@ -87,14 +87,16 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate
 #  Tempering                                                                   #
 #                                                                              #
 #  Inverse temperature β lives on the constraint and softens the observation.  #
-#  In the scale family Σ -> Σ/β, so ψ_β = √β ψ₁ and the chart target is         #
+#  In the scale family the tempered residual is ψ_β = √β ψ₁ (i.e. Σ -> Σ/β),    #
+#  and the chart target is                                                      #
 #                                                                              #
-#      e^{−½‖η‖² − ½ log det Σ}·e^{−β U_lik},      U_lik = ½‖ψ₁‖² = ½‖ψ_β‖²/β,  #
+#      e^{−½‖η‖² − ½ log det Σ}·e^{−β U_lik},      U_lik = ½‖ψ₁‖²,             #
 #                                                                              #
-#  base·e^{−β U_lik} with a temperature-free U_lik, so parallel tempering      #
-#  swaps are valid. The sampler pushes its per-replica β into the constraint   #
-#  and exposes U_lik on the state. Note β = 0 is the Σ-weighted prior, not the #
-#  N(0, I) prior (the ½ log det Σ term stays in the base).                     #
+#  base·e^{−β U_lik} with a temperature-free U_lik, so parallel-tempering       #
+#  swaps are valid. log|det B| is the untempered ½ log det Σ, with no           #
+#  β-normalizer, so the potential stays finite as β -> 0. The sampler pushes    #
+#  its per-replica β into the constraint and exposes U_lik on the state. The    #
+#  scale family needs β > 0.                                                    #
 #                                                                              #
 # =========================================================================== #
 
@@ -154,8 +156,10 @@ class ChartConstraint:
     beta : float or (N,) Tensor
         Inverse temperature, per chain. A subclass softens the constraint by
         ``beta`` (the scale family divides Sigma by ``beta``), so ``beta = 1`` is
-        the posterior and ``beta`` -> 0 flattens the data fit. Set by the sampler
-        from its ``beta`` (parallel tempering fills it per replica).
+        the posterior and smaller ``beta`` inflates the observation noise. Must
+        stay ``> 0``: ``beta -> 0`` sends ``Sigma / beta -> inf``, outside the
+        family. Set by the sampler from its ``beta`` (parallel tempering fills it
+        per replica).
     """
 
     def __init__(self, x: torch.Tensor, beta=1.0):
@@ -230,23 +234,24 @@ class LocationScaleChart(ChartConstraint):
         self.mean = mean
         self.cov = cov
 
-    def _factor(self, eta):
-        # Tempering softens the observation: Sigma_beta = Sigma / beta.
+    def _sqrt_beta(self):
         b = self.beta
-        Sigma = self.cov(eta)
-        if torch.is_tensor(b) and b.ndim > 0:
-            Sigma = Sigma / b.reshape(-1, 1, 1)
-        elif b != 1.0:
-            Sigma = Sigma / b
-        return self.mean(eta), torch.linalg.cholesky_ex(Sigma).L
+        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
+
+    def _factor(self, eta):
+        # Untempered factor. Tempering scales the residual by √β (equivalently
+        # Sigma -> Sigma/beta) without forming Sigma/beta, so nothing diverges as
+        # beta -> 0 and log|det B| carries no beta-normalizer.
+        return self.mean(eta), torch.linalg.cholesky_ex(self.cov(eta)).L
 
     def psi(self, eta):
         mu, L = self._factor(eta)
-        return torch.linalg.solve_triangular(
+        psi1 = torch.linalg.solve_triangular(
             L, (self.x - mu).unsqueeze(-1), upper=False).squeeze(-1)
+        return self._sqrt_beta() * psi1
 
     def log_abs_det_B(self, eta):
-        _, L = self._factor(eta)
+        _, L = self._factor(eta)                           # untempered ½ log det Sigma
         return torch.log(L.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
 
 

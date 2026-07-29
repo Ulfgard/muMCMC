@@ -12,8 +12,6 @@ we check, against closed forms, that:
    map the induced posterior is the exact Gaussian.
 5. The endpoint bundle is detached (no autograd graph pinned).
 """
-import math
-
 import torch
 import pytest
 
@@ -41,9 +39,7 @@ class FunnelChart(ChartConstraint):
         return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        b = self.beta
-        log_b = b.log() if torch.is_tensor(b) else math.log(b)
-        return 0.5 * self.x.shape[-1] * (self.s * eta[:, 0] - log_b)
+        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]     # untempered, no β-normalizer
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
