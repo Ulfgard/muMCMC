@@ -45,7 +45,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
-#  Step  (η0, π0) -> (η1, π1)  (β scales the untempered ψ, W)                  #
+#  Step  (η0, π0) -> (η1, π1)                                                  #
 #                                                                              #
 #      F(η1) = (η1 − η0) − β W0ᵀ(ψ(η1) − ψ0) − h π0 + (h²/2) ∇V(η0) = 0,       #
 #      DF(η0) = I + β W0ᵀ W0 = G_M(η0),                                        #
@@ -67,10 +67,19 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                              #
 #  W = −∂ψ/∂η follows from one reverse pass per latent (classic autograd, no   #
 #  vmap); override psi_with_jvp with explicit Jacobians to skip it. The         #
-#  constraint is temperature-free: β enters only in evaluate_model. Tempering   #
-#  in the scale family softens the observation (Σ -> Σ/β), and the potential    #
-#  carries the untempered ½ log det Σ, so it stays finite as β -> 0; the scale  #
-#  family needs β > 0.                                                         #
+#  constraint is temperature-free: β enters only in evaluate_model.            #
+#                                                                              #
+# =========================================================================== #
+#                                                                              #
+#  Tempering                                                                   #
+#                                                                              #
+#  β softens the observation in the scale family, Σ -> Σ/β, which scales the    #
+#  data-fit ½‖ψ‖² by β. So β multiplies the likelihood wherever it appears: in  #
+#  the potential U (β·½‖ψ‖²), in the metric G_M = I + β WᵀW, and hence in the    #
+#  position equation F and its Jacobian above. The prior ½‖η‖² and the volume   #
+#  ½ log det Σ stay untempered, so U is finite as β -> 0 while the scale family  #
+#  itself needs β > 0. A parallel-tempering swap reads the β-free ½‖ψ‖² off      #
+#  U.lik.                                                                       #
 #                                                                              #
 # =========================================================================== #
 
@@ -163,8 +172,8 @@ class LocationScaleChart(ChartConstraint):
 
 # ---- Position solve ------------------------------------------------------ #
 
-def _solve_position(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init,
-                    solver, max_iter, tol):
+def _solve_rattle_step(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs,
+                       eta_init, solver, max_iter, tol):
     """Solve the RATTLE position equation F(η) = (η − η0) − β W0ᵀ(ψ(η) − ψ0)
     − rhs = 0 for η1, preconditioned by G_M(η0). Returns (η1, iters,
     residual)."""
@@ -174,12 +183,13 @@ def _solve_position(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init
         with torch.no_grad():                              # solve is derivative-free
             psi = constraint.psi(eta)                      # (N, m), untempered
             corr = (W0t @ (psi - psi0).unsqueeze(-1)).squeeze(-1)
-            F = (eta - eta0) - beta_col * corr - rhs
-            pre = torch.cholesky_solve(F.unsqueeze(-1), chol_G0).squeeze(-1)   # G⁻¹ F
-        return F, pre
+            return (eta - eta0) - beta_col * corr - rhs
 
-    return _fixed_point_solve(residual_fn, eta_init, solver.new(eta0.shape[-1]),
-                              max_iter, tol)
+    def precond(F):                                        # G_M(η0)⁻¹ F
+        return torch.cholesky_solve(F.unsqueeze(-1), chol_G0).squeeze(-1)
+
+    updater = solver.new(eta0.shape[-1], precond=precond)
+    return _fixed_point_solve(residual_fn, eta_init, updater, max_iter, tol)
 
 
 # ---- Chain state --------------------------------------------------------- #
@@ -289,8 +299,8 @@ class ChartRATTLE(HamiltonianSampler):
 
     Notes
     -----
-    A failed position solve (max residual over ``fp_tol``, or non-finite) is
-    rejected with +inf energy. No reverse-projection check is run.
+    A proposal whose position solve does not converge is rejected. No
+    reverse-projection check is run.
     """
 
     def __init__(
@@ -351,7 +361,8 @@ class ChartRATTLE(HamiltonianSampler):
             Potential U(η) = ½‖η‖² + log|det B| + β·½‖ψ‖². The target is e^{−U}.
 
         metric : TemperedMetric
-            Chart metric G_M(η) = I + β WᵀW.
+            Metric G_M(η) = I + β WᵀW on the η-chart, the pushforward of the
+            ambient N(0, I) metric onto the manifold in η coordinates.
 
         psi : (N, m)
             ψ(η) = φ_η⁻¹(x), the latent on the manifold.
@@ -392,22 +403,18 @@ class ChartRATTLE(HamiltonianSampler):
 
     # ---- integrator hooks -------------------------------------------------- #
 
-    def _reset_step_scratch(self, q):
-        z = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
-        self._step_residual = z.clone()
-        self._step_iters = z.clone()
-
     def build_initial_state(self, q):
         """Evaluate the model at ``q`` = η and return the initial trajectory
         state, with momentum drawn later in :meth:`sample_momentum`."""
-        self._reset_step_scratch(q)
         U, metric, psi, W, grad_V = self.evaluate_model(q, grad=True)
         return ChartRATTLEState(q, None, U, metric, psi, W, grad_V, None)
 
     def sample_momentum(self, state):
         """Evaluate the model and force at η, draw the momentum π ~ N(0, G_M(η)),
-        and reset the per-transition solver scratch."""
-        self._reset_step_scratch(state.q)
+        and zero this transition's worst-solve accumulators."""
+        z = torch.zeros(state.q.shape[0], dtype=state.q.dtype, device=state.q.device)
+        self._step_residual = z
+        self._step_iters = z.clone()
         (state.U, state.metric, state.psi, state.W,
          state.grad_V) = self.evaluate_model(state.q, grad=True)
         state.p = state.metric.sample_momentum()
@@ -419,30 +426,30 @@ class ChartRATTLE(HamiltonianSampler):
         residual and iteration count. The solve is warm-started by the previous
         displacement, which changes only the iteration count, not the fixed point."""
         h = step_size.unsqueeze(-1)                        # (N, 1)
-        eta0, pi0, g0 = state.q, state.p, state.grad_V
-        psi0, W0 = state.psi, state.W
-        chol_G0 = state.metric.L
         beta_col = _bcast_beta(self.beta, 1)
 
-        rhs = h * pi0 - 0.5 * h * h * g0
-        eta_init = eta0 if state.deta is None else eta0 + state.deta
-        eta1, iters, residual = _solve_position(
-            self.constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init,
-            self._solver, self._fp_max_iter, self._fp_tol)
+        rhs = h * state.p - 0.5 * h * h * state.grad_V
+        eta_init = state.q
+        if state.deta is not None:
+            eta_init = state.q + state.deta
+        eta1, iters, residual = _solve_rattle_step(
+            self.constraint, state.q, state.psi, state.W, beta_col,
+            state.metric.L, rhs, eta_init, self._solver,
+            self._fp_max_iter, self._fp_tol)
 
         # A diverged chain (non-finite η1) is rejected by acceptance_delta. Fall
         # its position back to η0 so the model eval stays finite.
         finite = torch.isfinite(eta1).all(-1, keepdim=True)
-        eta1 = torch.where(finite, eta1, eta0)
+        eta1 = torch.where(finite, eta1, state.q)
         U1, metric1, psi1, W1, g1 = self.evaluate_model(eta1, grad=True)
 
-        corr = (W1.transpose(-2, -1) @ (psi1 - psi0).unsqueeze(-1)).squeeze(-1)
-        pi1 = ((eta1 - eta0) - beta_col * corr) / h - 0.5 * h * g1
+        corr = (W1.transpose(-2, -1) @ (psi1 - state.psi).unsqueeze(-1)).squeeze(-1)
+        pi1 = ((eta1 - state.q) - beta_col * corr) / h - 0.5 * h * g1
 
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters = torch.maximum(self._step_iters, iters.to(h.dtype))
         return ChartRATTLEState(eta1, pi1, U1, metric1, psi1, W1, g1,
-                                deta=(eta1 - eta0))
+                                deta=(eta1 - state.q))
 
     def acceptance_delta(self, new, old):
         """``delta_H = H(new) − H(old)``, forced to +inf where the position solve
@@ -477,11 +484,13 @@ class ChartRATTLE(HamiltonianSampler):
         self._step_size_adapter.update(f_t)
 
     def reset_extra_diagnostics(self):
-        """Zero the run-level solver summaries. The per-transition scratch is
-        reset each transition in :meth:`sample_momentum`."""
+        """Zero the run-level solver summaries and this transition's worst-solve
+        accumulators (re-zeroed each transition in :meth:`sample_momentum`)."""
         N = self.step_size.shape[0]
         z = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
         self._residual_sum = z.clone()
         self._residual_max = z.clone()
         self._fp_iters_sum = z.clone()
         self._fp_iters_max = z.clone()
+        self._step_residual = z.clone()
+        self._step_iters = z.clone()
