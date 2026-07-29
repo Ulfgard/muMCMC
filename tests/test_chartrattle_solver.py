@@ -94,11 +94,20 @@ def _H(st):
 # ========================================================================== #
 
 def test_position_solve_reaches_orthogonality_tolerance():
-    s = _funnel_sampler(step_size=0.2, num_steps=1, fp_tol=1e-12, fp_max_iter=200)
+    # Recompute the RATTLE position residual at the endpoint from the constraint
+    # itself, not from the solver's own stopping value:
+    #   F(η1) = (η1 − η0) − β W0ᵀ(ψ(η1) − ψ0) − hπ0 + (h²/2)∇V(η0).
+    # At convergence F(η1) is at tolerance, so η1 sits on the RATTLE update.
+    h = 0.2
+    s = _funnel_sampler(step_size=h, num_steps=1, fp_tol=1e-12, fp_max_iter=200)
     torch.manual_seed(1)
     st = _seed_state(s, torch.randn(6, 1))
-    s.integrate(st, torch.full((6,), 0.2))
-    assert float(s._step_residual.max()) < 1e-11
+    out = s.integrate(_restart(st, st.q.clone(), st.p.clone()), torch.full((6,), h))
+
+    psi1 = s.constraint.psi(out.q)
+    corr = (st.W.transpose(-2, -1) @ (psi1 - st.psi).unsqueeze(-1)).squeeze(-1)
+    F = (out.q - st.q) - s.beta * corr - h * st.p + 0.5 * h * h * st.grad_V
+    assert float(F.abs().max()) < 1e-11
 
 
 # ========================================================================== #

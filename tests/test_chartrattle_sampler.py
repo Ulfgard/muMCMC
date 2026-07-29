@@ -139,16 +139,17 @@ def test_non_finite_solve_is_rejected():
 #  reorder                                                                   #
 # ========================================================================== #
 
-def test_reorder_permutes_state():
+def test_reorder_relabels_position_and_drops_the_model():
+    # A swap moves the configuration q (and its momentum p) to a new temperature
+    # slot. The model is re-evaluated there at the next step, so it is dropped.
     s = _funnel_sampler(num_steps=2)
     state = s.sample_momentum(s.init(torch.randn(3, 1)))
     perm = torch.tensor([2, 0, 1])
     r = state.reorder(perm)
     assert torch.equal(r.q, state.q[perm])
     assert torch.equal(r.p, state.p[perm])
-    assert torch.equal(r.W, state.W[perm])
-    assert torch.equal(r.U.lik, state.U.lik[perm])
-    assert r.grad_V is None                       # dropped, retempered next step
+    assert r.U is None and r.metric is None and r.W is None and r.psi is None
+    assert r.grad_V is None
 
 
 # ========================================================================== #

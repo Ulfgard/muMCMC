@@ -219,99 +219,82 @@ class _AndersonUpdate:
 # ---- Implicit midpoint step --------------------------------------------- #
 
 def _fixed_point_solve(residual_fn, z_init, updater, max_iter, tol):
-    """Batched fixed-point iteration with per-chain freeze, shared by the RMHMC
-    implicit-midpoint solve and the ChartRATTLE position solve.
+    """Solve ``residual(z) = 0`` per chain by iterating ``updater`` from
+    ``z_init``, batched over chains. Returns the solution, the per-chain
+    iteration count, and the final residual max-norm.
 
-    ``residual_fn(z) -> (measure, signal)``: ``measure`` is the residual whose
-    max-norm gates convergence (< tol) and blow-up (> 10x its start, or
-    non-finite); ``signal`` is fed to ``updater.propose``. They coincide for a
-    plain fixed point z = F(z) and differ when the iteration is preconditioned.
-    ``residual_fn`` owns its autograd context and must return detached tensors.
-    Each chain iterates up to ``max_iter``, frozen once done. Returns
-    (z, iters, residual)."""
+    ``residual_fn(z)`` returns ``(residual, update)``: the residual whose
+    max-norm measures convergence, and the vector ``updater`` steps along to
+    propose the next iterate (the residual after preconditioning, equal to the
+    residual itself when the iteration is not preconditioned). A chain stops when
+    its residual falls below ``tol`` or diverges, and holds its state afterwards.
+    ``residual_fn`` returns detached tensors and owns its autograd context."""
     N = z_init.shape[0]
     z = z_init
-    measure, signal = residual_fn(z)
-    m_init = measure.abs().amax(-1)                        # (N,)
+    residual, update = residual_fn(z)
+    r0 = residual.abs().amax(-1)
 
-    done     = torch.zeros(N, dtype=torch.bool, device=z.device)
-    iters    = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
-    residual = m_init.clone()
+    done      = torch.zeros(N, dtype=torch.bool, device=z.device)
+    iters     = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
+    residual_norm = r0.clone()
 
     for i in range(1, max_iter + 1):
-        z_next = updater.propose(z, signal)               # Picard or Anderson
-        measure_next, signal_next = residual_fn(z_next)
-        m_norm = measure_next.abs().amax(-1)
+        z_next = updater.propose(z, update)
+        residual_next, update_next = residual_fn(z_next)
+        r = residual_next.abs().amax(-1)
 
-        # Freeze finished chains: discard their update, keep last state.
         keep = done[..., None]
         z = torch.where(keep, z, z_next)
-        signal = torch.where(keep, signal, signal_next)
-        residual = torch.where(done, residual, m_norm)
+        update = torch.where(keep, update, update_next)
+        residual_norm = torch.where(done, residual_norm, r)
 
-        live = ~done
-        # Blow-up (non-finite, or > 10x start). The tol conjunct keeps a
-        # warm-started chain whose start is already tiny from tripping on a
-        # sub-tol Anderson wobble.
-        blew = live & (~torch.isfinite(m_norm)
-                       | ((m_norm > 10.0 * m_init) & (m_norm > tol)))
-        done = done | blew
+        # Divergence: non-finite, or grown far beyond the start (the tol
+        # conjunct spares a warm start whose residual began sub-tol).
+        diverged = ~done & (~torch.isfinite(r) | ((r > 1000.0 * r0) & (r > tol)))
+        done = done | diverged
 
-        live = ~done
-        conv = live & (residual < tol)
-        iters = torch.where(conv, torch.full_like(iters, i), iters)
-        done = done | conv
+        converged = ~done & (residual_norm < tol)
+        iters = torch.where(converged, torch.full_like(iters, i), iters)
+        done = done | converged
 
         if bool(done.all()):
             break
 
-    return z.detach(), iters, residual.detach()
-
-
-def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
-    """One fixed-point pass for the implicit-midpoint endpoint with a single
-    ``solver``, batched over chains (q, p: (N, d)). ``z_init`` (N, 2d) seeds the
-    iterate; None starts from (q, p). Returns (q_out, p_out, iters, residual)."""
-    d = q.shape[-1]
-
-    def residual_fn(z):
-        # _midpoint_map detaches F_q, F_p, so r is detached; the fixed-point
-        # residual is both the convergence measure and the propose signal.
-        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
-        r = z - torch.cat([F_q, F_p], dim=-1)
-        return r, r
-
-    z0 = torch.cat([q, p], dim=-1) if z_init is None else z_init
-    z, iters, residual = _fixed_point_solve(residual_fn, z0, solver.new(d), max_iter, tol)
-    return z[..., :d], z[..., d:], iters, residual
+    return z.detach(), iters, residual_norm.detach()
 
 
 def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
                             solver=None, fallback=(), z_init=None):
-    """One implicit-midpoint step: the base solve, then a fallback ladder that
-    re-solves the non-converged chains with progressively stronger damping --
-    ``fallback`` is a sequence of (factor, max_iter). Damping keeps the fixed
-    point, so the ladder is endpoint-preserving: it turns non-convergence into
-    convergence rather than rejecting it (a solver-driven rejection would break
-    detailed balance). Empty ``fallback`` is a plain single pass. ``z_init``
-    warm-starts the base pass only (the ladder keeps the trivial start as a safe
-    fallback). Each ladder pass runs over the full batch and commits only the
-    still-bad chains, so the batch never desyncs from the caller's per-chain
-    state. Returns as :func:`_solve_pass`, with ``iters`` summed over the passes
-    a chain took."""
+    """Advance ``(q, p)`` one implicit-midpoint step, returning the endpoint
+    ``(q_out, p_out)`` with the per-chain iteration count and final residual.
+
+    ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
+    not converge are re-solved with progressively stronger under-relaxation.
+    Damping does not move the fixed point, so this resolves a stuck chain rather
+    than rejecting it (a solver-driven rejection would break detailed balance).
+    ``z_init`` warm-starts the first solve; the fallback re-solves from ``(q, p)``."""
+    d = q.shape[-1]
     base = solver if solver is not None else _PicardUpdate()
-    q_out, p_out, iters, residual = _solve_pass(
-        q, p, eps, evaluate_model, max_iter, tol, base, z_init=z_init)
+
+    def residual_fn(z):
+        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
+        r = z - torch.cat([F_q, F_p], dim=-1)
+        return r, r
+
+    trivial = torch.cat([q, p], dim=-1)
+    z, iters, residual = _fixed_point_solve(
+        residual_fn, trivial if z_init is None else z_init, base.new(d), max_iter, tol)
+    q_out, p_out = z[..., :d], z[..., d:]
 
     for factor, fb_iter in fallback:
         bad = residual > tol
         if not bool(bad.any()):
             break
-        qn, pn, it_n, r_n = _solve_pass(
-            q, p, eps, evaluate_model, fb_iter, tol, base.damped(factor))
-        commit  = bad.unsqueeze(-1)
-        q_out    = torch.where(commit, qn, q_out)
-        p_out    = torch.where(commit, pn, p_out)
+        zb, it_n, r_n = _fixed_point_solve(
+            residual_fn, trivial, base.damped(factor).new(d), fb_iter, tol)
+        commit   = bad.unsqueeze(-1)
+        q_out    = torch.where(commit, zb[..., :d], q_out)
+        p_out    = torch.where(commit, zb[..., d:], p_out)
         iters    = torch.where(bad, iters + it_n, iters)   # honest cost, bad chains only
         residual = torch.where(bad, r_n, residual)
 
@@ -423,8 +406,7 @@ class RMHMC(HamiltonianSampler):
     space
         Parameter space object (priors, transform, free/fixed split).
     step_size : float
-        Integration step size, required (no default). Adapted during warmup when
-        adapting.
+        Integration step size. Adapted during warmup when adapting.
     num_steps : int
         Number of leapfrog substeps per transition.
     adapt_step_size : bool
