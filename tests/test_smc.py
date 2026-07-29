@@ -76,7 +76,7 @@ def _ess_at(u_lik, d):
 def test_tempered_potential_lik_is_likelihood_only():
     lam, mu = 3.0, 2.0
     space = gaussian_1d_space()
-    sampler = RMHMC(gaussian_1d(lam, mu), space, adapt_step_size=False)
+    sampler = RMHMC(gaussian_1d(lam, mu), space, step_size=0.1, adapt_step_size=False)
     z = torch.tensor([[0.5], [-1.0], [2.0]])
 
     potential, _ = sampler.evaluate_model(z, beta=1.0)

@@ -51,7 +51,7 @@ def make_eval(model_fn, fp_tol=1e-12, fp_max_iter=200):
     """evaluate_model for an identity space (no prior): the pulled-back metric
     is exactly G_lik and the potential is exactly U_lik."""
     space = UnconstrainedSpace([f"x{i}" for i in range(D)])
-    s = RMHMC(model_fn, space, fp_tol=fp_tol, fp_max_iter=fp_max_iter)
+    s = RMHMC(model_fn, space, step_size=0.1, fp_tol=fp_tol, fp_max_iter=fp_max_iter)
     return s.evaluate_model
 
 

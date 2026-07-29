@@ -105,7 +105,9 @@ def _midpoint_map(
 # proposal z_{k+1}.  ``r_k`` is the fixed-point residual z_k − F(z_k), so
 # ``F(z_k) = z_k − r_k`` and the Anderson residual (Walker & Ni's notation) is
 # ``f_k = F(z_k) − z_k = −r_k``.  A fresh updater is built per solve, so any
-# internal history it keeps is scoped to a single ``_implicit_midpoint_step``.
+# internal history it keeps is scoped to a single solve. An updater may carry a
+# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(η0)⁻¹ for
+# the ChartRATTLE position solve, absent for the RMHMC midpoint solve).
 #
 # Relaxed Picard (β < 1) pulls the iteration eigenvalues (β − 1) + β λ toward
 # (1 − β) on the real axis, taming the near-imaginary spectrum of the
@@ -120,7 +122,8 @@ def _midpoint_map(
 # by a scale-aware Tikhonov floor.
 
 class _PicardUpdate:
-    """Relaxed Picard iteration: z_{k+1} = z_k − β r_k = (1−β) z_k + β F(z_k).
+    """Relaxed Picard iteration: z_{k+1} = z_k − β P r_k = (1−β) z_k + β F(z_k)
+    when P = I.
 
     Stateless.
 
@@ -128,16 +131,23 @@ class _PicardUpdate:
     ----------
     beta : float
         Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
+    precond : callable or None
+        Preconditioner P applied to the residual before the step. Default None
+        (P = I).
     """
 
-    def __init__(self, beta=1.0):
+    def __init__(self, beta=1.0, precond=None):
         self.beta = float(beta)
+        self._precond = precond
 
-    def new(self, d):
-        """Fresh per-solve updater for ``d``-dim positions."""
-        return self
+    def new(self, d, precond=None):
+        """Fresh per-solve updater for ``d``-dim positions with preconditioner
+        ``precond``."""
+        return _PicardUpdate(self.beta, precond)
 
     def propose(self, z, r):
+        if self._precond is not None:
+            r = self._precond(r)
         return z - self.beta * r
 
     def damped(self, factor):
@@ -161,24 +171,31 @@ class _AndersonUpdate:
         resolve to dim(q) when ``new`` is called.
     beta : float
         Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
+    precond : callable or None
+        Preconditioner P applied to the residual before the step. Default None
+        (P = I).
     """
 
     # Relative / absolute Tikhonov floors for the least-squares solve.
     reg_rel = 1e-10
     reg_abs = 1e-14
 
-    def __init__(self, history=None, beta=1.0):
+    def __init__(self, history=None, beta=1.0, precond=None):
         self.history = history      # int, or None to resolve to dim(q) in new()
         self.beta = float(beta)
+        self._precond = precond
         self._Z = []   # committed iterates z_k        (each (N, 2d))
         self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
 
-    def new(self, d):
-        """Fresh per-solve updater for ``d``-dim positions, resolving a None
-        ``history`` to ``d``."""
-        return _AndersonUpdate(d if self.history is None else self.history, self.beta)
+    def new(self, d, precond=None):
+        """Fresh per-solve updater for ``d``-dim positions with preconditioner
+        ``precond``, resolving a None ``history`` to ``d``."""
+        return _AndersonUpdate(
+            d if self.history is None else self.history, self.beta, precond)
 
     def propose(self, z, r):
+        if self._precond is not None:
+            r = self._precond(r)
         self._Z.append(z)
         self._F.append(-r)
         if len(self._Z) > self.history + 1:    # keep at most `history` differences
@@ -218,86 +235,83 @@ class _AndersonUpdate:
 
 # ---- Implicit midpoint step --------------------------------------------- #
 
-def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
-    """One fixed-point pass for the implicit-midpoint endpoint with a single
-    ``solver``, batched over chains (q, p: (N, d)). Each chain iterates until it
-    converges (max-norm residual < tol) or blows up (residual > 10x its initial
-    value), frozen by a mask thereafter, up to ``max_iter``. ``z_init`` (N, 2d)
-    seeds the iterate; None starts from (q, p). Returns
-    (q_out, p_out, iters, residual)."""
+def _fixed_point_solve(residual_fn, z_init, updater, max_iter, tol):
+    """Find ``z`` with ``residual_fn(z) = 0``, batched over chains, by
+    fixed-point iteration from ``z_init``. Each step the ``updater`` reads the
+    current iterate and its residual and returns the next iterate (relaxed
+    Picard or Anderson acceleration, optionally preconditioned). A chain stops
+    once its residual max-norm drops below ``tol``, or when it diverges. Returns
+    the solution, the per-chain iteration count, and the final residual max-norm.
+
+    ``residual_fn(z)`` returns the residual, one row per chain, detached from any
+    autograd graph."""
+    N = z_init.shape[0]
+    z = z_init
+    residual = residual_fn(z)
+    r0 = residual.abs().amax(-1)
+
+    done      = torch.zeros(N, dtype=torch.bool, device=z.device)
+    iters     = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
+    residual_norm = r0.clone()
+
+    for i in range(1, max_iter + 1):
+        z_next = updater.propose(z, residual)
+        residual_next = residual_fn(z_next)
+        r = residual_next.abs().amax(-1)
+
+        keep = done[..., None]
+        z = torch.where(keep, z, z_next)
+        residual = torch.where(keep, residual, residual_next)
+        residual_norm = torch.where(done, residual_norm, r)
+
+        # Divergence: non-finite, or grown far beyond the start (the tol
+        # conjunct spares a warm start whose residual began sub-tol).
+        diverged = ~done & (~torch.isfinite(r) | ((r > 1000.0 * r0) & (r > tol)))
+        done = done | diverged
+
+        converged = ~done & (residual_norm < tol)
+        iters = torch.where(converged, torch.full_like(iters, i), iters)
+        done = done | converged
+
+        if bool(done.all()):
+            break
+
+    return z.detach(), iters, residual_norm.detach()
+
+
+def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
+                            solver=None, fallback=(), z_init=None):
+    """Solve RMHMC's implicit-midpoint fixed-point equation z = F(z) for the
+    step endpoint z = (q_out, p_out), starting from ``(q, p)`` (F is the midpoint
+    map in :func:`_midpoint_map`). Returns the endpoint with the per-chain
+    iteration count and final residual.
+
+    ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
+    not converge are re-solved with progressively stronger under-relaxation.
+    Damping does not move the fixed point, so this resolves a stuck chain rather
+    than rejecting it (a solver-driven rejection would break detailed balance).
+    ``z_init`` warm-starts the first solve; the fallback re-solves from ``(q, p)``."""
     d = q.shape[-1]
-    N = q.shape[0]
+    base = solver if solver is not None else _PicardUpdate()
 
     def residual_fn(z):
         F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
         return z - torch.cat([F_q, F_p], dim=-1)
 
-    updater = solver.new(d)
-
-    z_k = torch.cat([q, p], dim=-1) if z_init is None else z_init   # (N, 2d)
-    r_k = residual_fn(z_k)
-    r_init_norm = r_k.abs().amax(-1)           # (N,)
-
-    done     = torch.zeros(N, dtype=torch.bool, device=q.device)
-    iters    = torch.full((N,), max_iter, dtype=torch.long, device=q.device)
-    residual = r_init_norm.clone()             # (N,)
-
-    for i in range(1, max_iter + 1):
-        z_next = updater.propose(z_k, r_k)     # Picard or Anderson proposal
-        r_next = residual_fn(z_next)
-        r_next_norm = r_next.abs().amax(-1)    # (N,)
-
-        # Freeze finished chains: discard their update, keep last state.
-        keep = done[..., None]
-        z_k = torch.where(keep, z_k, z_next)
-        r_k = torch.where(keep, r_k, r_next)
-        residual = torch.where(done, residual, r_next_norm)
-
-        live = ~done
-        # Blow-up: finish at max_iter semantics (iters already max_iter). The
-        # tol conjunct keeps a warm-started chain whose r_init is already tiny
-        # from tripping on a sub-tol Anderson wobble.
-        blew = live & (r_next_norm > 10.0 * r_init_norm) & (r_next_norm > tol)
-        done = done | blew
-
-        live = ~done
-        # Convergence: finish at this iteration i.
-        conv = live & (residual < tol)
-        iters = torch.where(conv, torch.full_like(iters, i), iters)
-        done = done | conv
-
-        if bool(done.all()):
-            break
-
-    return z_k[..., :d].detach(), z_k[..., d:].detach(), iters, residual.detach()
-
-
-def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
-                            solver=None, fallback=(), z_init=None):
-    """One implicit-midpoint step: the base solve, then a fallback ladder that
-    re-solves the non-converged chains with progressively stronger damping --
-    ``fallback`` is a sequence of (factor, max_iter). Damping keeps the fixed
-    point, so the ladder is endpoint-preserving: it turns non-convergence into
-    convergence rather than rejecting it (a solver-driven rejection would break
-    detailed balance). Empty ``fallback`` is a plain single pass. ``z_init``
-    warm-starts the base pass only (the ladder keeps the trivial start as a safe
-    fallback). Each ladder pass runs over the full batch and commits only the
-    still-bad chains, so the batch never desyncs from the caller's per-chain
-    state. Returns as :func:`_solve_pass`, with ``iters`` summed over the passes
-    a chain took."""
-    base = solver if solver is not None else _PicardUpdate()
-    q_out, p_out, iters, residual = _solve_pass(
-        q, p, eps, evaluate_model, max_iter, tol, base, z_init=z_init)
+    trivial = torch.cat([q, p], dim=-1)
+    z, iters, residual = _fixed_point_solve(
+        residual_fn, trivial if z_init is None else z_init, base.new(d), max_iter, tol)
+    q_out, p_out = z[..., :d], z[..., d:]
 
     for factor, fb_iter in fallback:
         bad = residual > tol
         if not bool(bad.any()):
             break
-        qn, pn, it_n, r_n = _solve_pass(
-            q, p, eps, evaluate_model, fb_iter, tol, base.damped(factor))
-        commit  = bad.unsqueeze(-1)
-        q_out    = torch.where(commit, qn, q_out)
-        p_out    = torch.where(commit, pn, p_out)
+        zb, it_n, r_n = _fixed_point_solve(
+            residual_fn, trivial, base.damped(factor).new(d), fb_iter, tol)
+        commit   = bad.unsqueeze(-1)
+        q_out    = torch.where(commit, zb[..., :d], q_out)
+        p_out    = torch.where(commit, zb[..., d:], p_out)
         iters    = torch.where(bad, iters + it_n, iters)   # honest cost, bad chains only
         residual = torch.where(bad, r_n, residual)
 
@@ -409,7 +423,7 @@ class RMHMC(HamiltonianSampler):
     space
         Parameter space object (priors, transform, free/fixed split).
     step_size : float
-        Integration step size (adapted during warmup when adapting).
+        Integration step size. Adapted during warmup when adapting.
     num_steps : int
         Number of leapfrog substeps per transition.
     adapt_step_size : bool
@@ -461,7 +475,7 @@ class RMHMC(HamiltonianSampler):
         model_fn: Callable,
         space,
         *,
-        step_size: float = 0.1,
+        step_size: float,
         num_steps: int = 10,
         adapt_step_size: bool = True,
         adaptation_sigma: float = 0.1,

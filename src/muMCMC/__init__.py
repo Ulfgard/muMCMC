@@ -16,6 +16,12 @@ __version__ = "0.1.0"
 from .MCMCSampler import MCMCSampler, PyroSampler
 from .HamiltonianSampler import HamiltonianSampler
 from .RMHMC import RMHMC, RMHMCState
+from .ChartRATTLE import (
+    ChartRATTLE,
+    ChartRATTLEState,
+    ChartConstraint,
+    LocationScaleChart,
+)
 from .HMC import HMC, HMCState
 from .LMC import LMC, LMCState
 from .NUTS import NUTS
@@ -38,6 +44,10 @@ __all__ = [
     "HamiltonianSampler",
     "RMHMC",
     "RMHMCState",
+    "ChartRATTLE",
+    "ChartRATTLEState",
+    "ChartConstraint",
+    "LocationScaleChart",
     "HMC",
     "HMCState",
     "LMC",
