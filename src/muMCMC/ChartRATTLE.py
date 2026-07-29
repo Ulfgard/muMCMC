@@ -7,7 +7,7 @@ import torch
 from .HamiltonianSampler import HamiltonianSampler
 from .adapters import Reinforce, NoAdaptation
 from .spaces import TemperedAffine, TemperedMetric
-from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian
+from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_solve
 
 # =========================================================================== #
 #                                                                              #
@@ -159,54 +159,21 @@ class LocationScaleChart(ChartConstraint):
 def _solve_position(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init,
                     solver, max_iter, tol):
     """Solve F(η) = (η − η0) − β W0ᵀ(ψ(η) − ψ0) − rhs = 0, preconditioned by
-    G_M(η0), batched over chains. ``beta_col`` broadcasts β over ``(N, n)``.
-    Each chain iterates until ‖F‖∞ < tol or it blows up (non-finite, or ‖F‖∞
-    over 10x its start), frozen thereafter, up to ``max_iter``. Returns
+    G_M(η0), via the shared :func:`_fixed_point_solve`. The convergence measure
+    is ‖F‖∞ and the propose signal is the preconditioned G_M(η0)⁻¹ F. Returns
     (η1, iters, residual)."""
-    N, n = eta0.shape
     W0t = W0.transpose(-2, -1)                             # (N, n, m)
 
     def residual_fn(eta):
-        psi = constraint.psi(eta)                          # (N, m), untempered
-        corr = (W0t @ (psi - psi0).unsqueeze(-1)).squeeze(-1)
-        F = (eta - eta0) - beta_col * corr - rhs
-        pre = torch.cholesky_solve(F.unsqueeze(-1), chol_G0).squeeze(-1)   # G⁻¹ F
+        with torch.no_grad():                              # solve is derivative-free
+            psi = constraint.psi(eta)                      # (N, m), untempered
+            corr = (W0t @ (psi - psi0).unsqueeze(-1)).squeeze(-1)
+            F = (eta - eta0) - beta_col * corr - rhs
+            pre = torch.cholesky_solve(F.unsqueeze(-1), chol_G0).squeeze(-1)   # G⁻¹ F
         return F, pre
 
-    updater = solver.new(n)
-    eta = eta_init.clone()
-    with torch.no_grad():
-        F, pre = residual_fn(eta)
-        F_init = F.abs().amax(-1)
-
-        done = torch.zeros(N, dtype=torch.bool, device=eta0.device)
-        iters = torch.full((N,), max_iter, dtype=torch.long, device=eta0.device)
-        residual = F_init.clone()
-
-        for i in range(1, max_iter + 1):
-            eta_next = updater.propose(eta, pre)
-            F_next, pre_next = residual_fn(eta_next)
-            F_norm = F_next.abs().amax(-1)
-
-            keep = done[..., None]
-            eta = torch.where(keep, eta, eta_next)
-            pre = torch.where(keep, pre, pre_next)
-            residual = torch.where(done, residual, F_norm)
-
-            live = ~done
-            blew = live & (~torch.isfinite(F_norm)
-                           | ((F_norm > 10.0 * F_init) & (F_norm > tol)))
-            done = done | blew
-
-            live = ~done
-            conv = live & (residual < tol)
-            iters = torch.where(conv, torch.full_like(iters, i), iters)
-            done = done | conv
-
-            if bool(done.all()):
-                break
-
-    return eta.detach(), iters, residual.detach()
+    return _fixed_point_solve(residual_fn, eta_init, solver.new(eta0.shape[-1]),
+                              max_iter, tol)
 
 
 # ---- Chain state --------------------------------------------------------- #

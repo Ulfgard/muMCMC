@@ -218,50 +218,46 @@ class _AndersonUpdate:
 
 # ---- Implicit midpoint step --------------------------------------------- #
 
-def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
-    """One fixed-point pass for the implicit-midpoint endpoint with a single
-    ``solver``, batched over chains (q, p: (N, d)). Each chain iterates until it
-    converges (max-norm residual < tol) or blows up (residual > 10x its initial
-    value), frozen by a mask thereafter, up to ``max_iter``. ``z_init`` (N, 2d)
-    seeds the iterate; None starts from (q, p). Returns
-    (q_out, p_out, iters, residual)."""
-    d = q.shape[-1]
-    N = q.shape[0]
+def _fixed_point_solve(residual_fn, z_init, updater, max_iter, tol):
+    """Batched fixed-point iteration with per-chain freeze, shared by the RMHMC
+    implicit-midpoint solve and the ChartRATTLE position solve.
 
-    def residual_fn(z):
-        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
-        return z - torch.cat([F_q, F_p], dim=-1)
+    ``residual_fn(z) -> (measure, signal)``: ``measure`` is the residual whose
+    max-norm gates convergence (< tol) and blow-up (> 10x its start, or
+    non-finite); ``signal`` is fed to ``updater.propose``. They coincide for a
+    plain fixed point z = F(z) and differ when the iteration is preconditioned.
+    ``residual_fn`` owns its autograd context and must return detached tensors.
+    Each chain iterates up to ``max_iter``, frozen once done. Returns
+    (z, iters, residual)."""
+    N = z_init.shape[0]
+    z = z_init
+    measure, signal = residual_fn(z)
+    m_init = measure.abs().amax(-1)                        # (N,)
 
-    updater = solver.new(d)
-
-    z_k = torch.cat([q, p], dim=-1) if z_init is None else z_init   # (N, 2d)
-    r_k = residual_fn(z_k)
-    r_init_norm = r_k.abs().amax(-1)           # (N,)
-
-    done     = torch.zeros(N, dtype=torch.bool, device=q.device)
-    iters    = torch.full((N,), max_iter, dtype=torch.long, device=q.device)
-    residual = r_init_norm.clone()             # (N,)
+    done     = torch.zeros(N, dtype=torch.bool, device=z.device)
+    iters    = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
+    residual = m_init.clone()
 
     for i in range(1, max_iter + 1):
-        z_next = updater.propose(z_k, r_k)     # Picard or Anderson proposal
-        r_next = residual_fn(z_next)
-        r_next_norm = r_next.abs().amax(-1)    # (N,)
+        z_next = updater.propose(z, signal)               # Picard or Anderson
+        measure_next, signal_next = residual_fn(z_next)
+        m_norm = measure_next.abs().amax(-1)
 
         # Freeze finished chains: discard their update, keep last state.
         keep = done[..., None]
-        z_k = torch.where(keep, z_k, z_next)
-        r_k = torch.where(keep, r_k, r_next)
-        residual = torch.where(done, residual, r_next_norm)
+        z = torch.where(keep, z, z_next)
+        signal = torch.where(keep, signal, signal_next)
+        residual = torch.where(done, residual, m_norm)
 
         live = ~done
-        # Blow-up: finish at max_iter semantics (iters already max_iter). The
-        # tol conjunct keeps a warm-started chain whose r_init is already tiny
-        # from tripping on a sub-tol Anderson wobble.
-        blew = live & (r_next_norm > 10.0 * r_init_norm) & (r_next_norm > tol)
+        # Blow-up (non-finite, or > 10x start). The tol conjunct keeps a
+        # warm-started chain whose start is already tiny from tripping on a
+        # sub-tol Anderson wobble.
+        blew = live & (~torch.isfinite(m_norm)
+                       | ((m_norm > 10.0 * m_init) & (m_norm > tol)))
         done = done | blew
 
         live = ~done
-        # Convergence: finish at this iteration i.
         conv = live & (residual < tol)
         iters = torch.where(conv, torch.full_like(iters, i), iters)
         done = done | conv
@@ -269,7 +265,25 @@ def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
         if bool(done.all()):
             break
 
-    return z_k[..., :d].detach(), z_k[..., d:].detach(), iters, residual.detach()
+    return z.detach(), iters, residual.detach()
+
+
+def _solve_pass(q, p, eps, evaluate_model, max_iter, tol, solver, z_init=None):
+    """One fixed-point pass for the implicit-midpoint endpoint with a single
+    ``solver``, batched over chains (q, p: (N, d)). ``z_init`` (N, 2d) seeds the
+    iterate; None starts from (q, p). Returns (q_out, p_out, iters, residual)."""
+    d = q.shape[-1]
+
+    def residual_fn(z):
+        # _midpoint_map detaches F_q, F_p, so r is detached; the fixed-point
+        # residual is both the convergence measure and the propose signal.
+        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
+        r = z - torch.cat([F_q, F_p], dim=-1)
+        return r, r
+
+    z0 = torch.cat([q, p], dim=-1) if z_init is None else z_init
+    z, iters, residual = _fixed_point_solve(residual_fn, z0, solver.new(d), max_iter, tol)
+    return z[..., :d], z[..., d:], iters, residual
 
 
 def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
