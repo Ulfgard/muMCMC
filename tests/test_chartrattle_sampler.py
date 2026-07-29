@@ -1,12 +1,12 @@
 """Sampler-level tests for ChartRATTLE: the operator interface around the
 integrator, plus statistical recovery on targets with a closed form.
 
-Adaptation is finicky for a Verlet-type integrator with a solver-convergence
-cliff, so it is out of scope here: every sampler runs at a fixed step. The
-integrator internals live in test_chartrattle_solver.py. Recovery is checked
-against the exact Gaussian induced by an affine map and against a quadrature
-reference for the funnel; parallel tempering rides on the base TemperedAffine /
-TemperedMetric that evaluate_model returns.
+Adaptation is out of scope here (finicky against the solver-convergence cliff),
+so every sampler runs at a fixed step. The integrator internals live in
+test_chartrattle_solver.py. Recovery is checked against the exact Gaussian
+induced by an affine map and against a quadrature reference for the funnel;
+parallel tempering rides on the TemperedAffine / TemperedMetric that
+evaluate_model returns.
 """
 import torch
 import pytest

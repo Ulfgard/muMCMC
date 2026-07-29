@@ -27,22 +27,21 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
-#  Energy = RMHMC energy                                                       #
+#  Energy                                                                       #
 #                                                                              #
 #  With ψ(η) = φ_η⁻¹(x) and W = −∂ψ/∂η = B⁻¹A, the target is e^{−U} with        #
 #                                                                              #
-#      U(η) = ½‖η‖² + log|det B| + β·½‖ψ‖²,     G_M(η) = I + β Wᵀ W,           #
+#      U(η) = ½‖η‖² + log|det B| + β·½‖ψ‖²,     G_M(η) = I + β Wᵀ W.           #
 #                                                                              #
-#  U affine in β (a TemperedAffine, lik = ½‖ψ‖², base = ½‖η‖² + log|det B|),    #
-#  G_M affine in β (a TemperedMetric, A_lik = Wᵀ W, A_prior = I). These are     #
-#  exactly what evaluate_model returns, so the Hamiltonian                      #
+#  U is affine in β (lik = ½‖ψ‖², base = ½‖η‖² + log|det B|) and G_M is affine  #
+#  in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as a        #
+#  TemperedAffine and a TemperedMetric. The Hamiltonian                         #
 #                                                                              #
 #      H = U + ½ πᵀ G_M⁻¹ π + ½ log det G_M                                    #
 #                                                                              #
-#  is RMHMC's _hamiltonian, tempering / parallel tempering ride on the base     #
-#  TemperedAffine / TemperedMetric (reorder retempers with no re-evaluation),   #
-#  and PT reads the temperature-free U_lik = ½‖ψ‖² off U.lik. Only the          #
-#  integrator is ChartRATTLE-specific.                                         #
+#  keeps e^{−U} invariant. Tempering and parallel tempering ride on those two   #
+#  objects: reorder retempers them with no re-evaluation, and a swap reads the   #
+#  temperature-free U_lik = ½‖ψ‖² off U.lik.                                    #
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
@@ -53,11 +52,11 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #      η^{k+1} = η^k − G_M(η0)⁻¹ F(η^k),                                       #
 #      π1 = (1/h)[(η1 − η0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(η1),                  #
 #                                                                              #
-#  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), η)      #
-#  (RMHMC's dH/dq). Only ψ(η^k) is evaluated in the loop, preconditioned by     #
-#  one Cholesky of G_M(η0) (the metric's own factor). The scheme is             #
-#  self-adjoint, so reversible up to the solve. v1 runs no reverse-projection   #
-#  check and rejects a failed solve (+inf energy), as RMHMC does.              #
+#  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), η).     #
+#  Only ψ(η^k) is evaluated in the loop, preconditioned by one Cholesky of      #
+#  G_M(η0) (the metric's own factor). The scheme is self-adjoint, so            #
+#  reversible up to the solve. v1 runs no reverse-projection check and rejects  #
+#  a failed solve with +inf energy.                                            #
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
@@ -74,6 +73,13 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  family needs β > 0.                                                         #
 #                                                                              #
 # =========================================================================== #
+
+
+def _bcast_beta(beta, ndim):
+    """β reshaped to broadcast over ``ndim`` trailing axes (scalar stays scalar)."""
+    if torch.is_tensor(beta) and beta.ndim > 0:
+        return beta.reshape((-1,) + (1,) * ndim)
+    return beta
 
 
 # ---- Constraint ---------------------------------------------------------- #
@@ -181,12 +187,13 @@ def _solve_position(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init
 class ChartRATTLEState:
     """Working state of one ChartRATTLE trajectory, batched over ``(N,)`` chains.
 
-    Mirrors ``RMHMCState`` (``q, p, U, metric``) plus the untempered geometry
-    ``psi, W`` the RATTLE solve needs, and the force ``grad_V``. ``U`` / ``metric``
-    are a ``TemperedAffine`` / ``TemperedMetric``, so a parallel-tempering swap
-    retempers them under ``reorder`` with no re-evaluation; ``psi``, ``W`` are
-    temperature-free and just permute; ``grad_V`` (not β-affine) is dropped and
-    recomputed at the new temperature by the next :meth:`sample_momentum`.
+    Carries the position / momentum ``q, p``, the potential ``U`` and metric
+    ``metric`` (a ``TemperedAffine`` / ``TemperedMetric``), the untempered
+    geometry ``psi, W`` the solve needs, and the force ``grad_V``. On a
+    parallel-tempering swap ``reorder`` retempers U / metric with no
+    re-evaluation; ``psi``, ``W`` are temperature-free and just permute;
+    ``grad_V`` (not β-affine) is dropped and recomputed at the new temperature by
+    the next :meth:`sample_momentum`.
 
     Attributes
     ----------
@@ -250,9 +257,8 @@ class ChartRATTLEState:
 #                                                                              #
 #  Runs in the η chart. The N(0, I) top-level prior is baked into U, so the     #
 #  space is the identity UnconstrainedSpace over the θ names and the driver     #
-#  reads q = η off as θ. evaluate_model is overridden to build U (TemperedAffine)#
-#  and G_M (TemperedMetric) from the constraint, so tempering and PT ride on    #
-#  the base machinery; only integrate is ChartRATTLE-specific.                 #
+#  reads q = η off as θ. evaluate_model builds U (TemperedAffine) and G_M        #
+#  (TemperedMetric) from the constraint; integrate performs the RATTLE step.    #
 #                                                                              #
 # =========================================================================== #
 
@@ -345,11 +351,6 @@ class ChartRATTLE(HamiltonianSampler):
 
     # ---- model evaluation (the extension point) ---------------------------- #
 
-    def _beta_col(self):
-        """β reshaped to broadcast over ``(N, n)`` / ``(N, m)`` (scalar stays scalar)."""
-        b = self.beta
-        return b.reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else b
-
     def evaluate_model(self, z_free, beta=None, grad=False):
         """``(U, metric, psi, W[, grad_V])`` at η = ``z_free``.
 
@@ -362,21 +363,20 @@ class ChartRATTLE(HamiltonianSampler):
         eta = z_free.detach().requires_grad_(True) if grad else z_free
         n = eta.shape[-1]
         eye = torch.eye(n, dtype=eta.dtype, device=eta.device)
-        beta_mat = beta.reshape(-1, 1, 1) if (torch.is_tensor(beta) and beta.ndim > 0) else beta
 
         with torch.enable_grad() if grad else nullcontext():
-            eps, W, log_abs_det_B = self.constraint.psi_with_jvp(eta)
+            psi, W, log_abs_det_B = self.constraint.psi_with_jvp(eta)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
-            lik = 0.5 * (eps * eps).sum(-1)                # U_lik = ½‖ψ‖²
+            lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
             base = 0.5 * (eta * eta).sum(-1) + log_abs_det_B
             if grad:
-                G = eye + beta_mat * gram
+                G = eye + _bcast_beta(beta, 2) * gram
                 V = base + beta * lik + 0.5 * torch.logdet(G)
                 (grad_V,) = torch.autograd.grad(V.sum(), eta)
 
         U = TemperedAffine(lik.detach(), base.detach(), beta)
         metric = TemperedMetric(gram.detach(), eye.expand(eta.shape[0], n, n), beta)
-        out = (U, metric, eps.detach(), W.detach())
+        out = (U, metric, psi.detach(), W.detach())
         return out + (grad_V.detach(),) if grad else out
 
     # ---- integrator hooks -------------------------------------------------- #
@@ -413,7 +413,7 @@ class ChartRATTLE(HamiltonianSampler):
         eta0, pi0, g0 = state.q, state.p, state.grad_V
         psi0, W0 = state.psi, state.W
         chol_G0 = state.metric.L
-        beta_col = self._beta_col()
+        beta_col = _bcast_beta(self.beta, 1)
 
         rhs = h * pi0 - 0.5 * h * h * g0
         eta_init = eta0 if state.deta is None else eta0 + state.deta
@@ -436,9 +436,8 @@ class ChartRATTLE(HamiltonianSampler):
                                 deta=(eta1 - eta0))
 
     def acceptance_delta(self, new, old):
-        """``delta_H = H(new) − H(old)`` with RMHMC's Hamiltonian, forced to +inf
-        where the position solve did not converge (residual over ``fp_tol``, or
-        non-finite)."""
+        """``delta_H = H(new) − H(old)``, forced to +inf where the position solve
+        did not converge (residual over ``fp_tol``, or non-finite)."""
         H_new = _hamiltonian(new.q, new.p, new.U.value, new.metric)
         H_old = _hamiltonian(old.q, old.p, old.U.value, old.metric)
         delta = H_new - H_old

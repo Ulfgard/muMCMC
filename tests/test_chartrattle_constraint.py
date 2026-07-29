@@ -1,7 +1,7 @@
 """Constraint / evaluate_model tests for ChartRATTLE.
 
 The geometry and potential rest on the inverse map ψ(η) = φ_η⁻¹(x). evaluate_model
-turns a constraint into the RMHMC-shaped pieces (U a TemperedAffine, G_M a
+turns a constraint into the tempered pieces (U a TemperedAffine, G_M a
 TemperedMetric). Here we check, against closed forms, that:
 
 1. G_M = I + β Wᵀ W and its Cholesky are what evaluate_model returns.
