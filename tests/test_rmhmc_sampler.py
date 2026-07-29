@@ -35,6 +35,7 @@ def model_qdep(theta):
 
 def make_sampler(model_fn=model_simple, *, adapt=False, **kw):
     space = UnconstrainedSpace([f"x{i}" for i in range(D)])
+    kw.setdefault("step_size", 0.1)
     return RMHMC(model_fn, space, adapt_step_size=adapt, **kw)
 
 

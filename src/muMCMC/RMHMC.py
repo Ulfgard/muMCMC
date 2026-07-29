@@ -409,7 +409,8 @@ class RMHMC(HamiltonianSampler):
     space
         Parameter space object (priors, transform, free/fixed split).
     step_size : float
-        Integration step size (adapted during warmup when adapting).
+        Integration step size, required (no default). Adapted during warmup when
+        adapting.
     num_steps : int
         Number of leapfrog substeps per transition.
     adapt_step_size : bool
@@ -461,7 +462,7 @@ class RMHMC(HamiltonianSampler):
         model_fn: Callable,
         space,
         *,
-        step_size: float = 0.1,
+        step_size: float,
         num_steps: int = 10,
         adapt_step_size: bool = True,
         adaptation_sigma: float = 0.1,

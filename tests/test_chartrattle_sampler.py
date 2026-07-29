@@ -7,25 +7,34 @@ integrator internals live in test_chartrattle_solver.py. Recovery is checked
 against the exact Gaussian induced by an affine map and against a quadrature
 reference for the funnel.
 """
+import math
+
 import torch
 import pytest
 
 from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState, ChartConstraint
 from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.PT import PT
 
 torch.set_default_dtype(torch.float64)
 
 
 class FunnelChart(ChartConstraint):
-    def __init__(self, sigma, x):
-        super().__init__(x)
+    def __init__(self, sigma, x, beta=1.0):
+        super().__init__(x, beta)
         self.s = sigma
 
+    def _sqrt_beta(self):
+        b = self.beta
+        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
+
     def psi(self, eta):
-        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+        return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
+        b = self.beta
+        log_b = b.log() if torch.is_tensor(b) else math.log(b)
+        return 0.5 * self.x.shape[-1] * (self.s * eta[:, 0] - log_b)
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
@@ -62,6 +71,7 @@ def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
     torch.manual_seed(seed)
     c = FunnelChart(sigma, torch.randn(m))
     kw.setdefault("adapt_step_size", False)
+    kw.setdefault("step_size", 0.1)
     return ChartRATTLE(c, UnconstrainedSpace(["v"]), **kw)
 
 
@@ -97,7 +107,7 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"]), adapt_step_size=False)
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"]), step_size=0.1, adapt_step_size=False)
     N = 40000
     state = s.init(torch.zeros(N, 2))
     state = s.sample_momentum(state)
@@ -238,3 +248,35 @@ def test_recovers_funnel_posterior_against_quadrature():
     assert abs(float(v.mean()) - float(mean_q)) < 0.03
     assert abs(float(v.std()) - float(sd_q)) < 0.03
     assert int(s.diagnostics()["num_divergences"].sum()) == 0
+
+
+# ========================================================================== #
+#  parallel tempering                                                        #
+# ========================================================================== #
+
+def test_pt_runs_swaps_and_recovers_target_mean():
+    # ChartRATTLE as a PT exploration kernel: the constraint receives a per-
+    # replica beta (Sigma / beta), the state exposes the temperature-free U_lik
+    # for the swap ratio, and reorder retempers. The target chain (beta = 1)
+    # recovers the funnel posterior mean.
+    sigma, m = 3.0, 6
+    torch.manual_seed(7)
+    eta_true = torch.randn(1)
+    xobs = torch.exp(sigma * eta_true / 2) * torch.randn(m)
+    grid = torch.linspace(-8, 8, 8001)
+    log_post = -(0.5 * grid * grid + 0.5 * torch.exp(-sigma * grid) * (xobs * xobs).sum()
+                 + 0.5 * m * sigma * grid)
+    mean_q = float((torch.softmax(log_post, 0) * grid).sum())
+
+    kernel = ChartRATTLE(FunnelChart(sigma, xobs), UnconstrainedSpace(["v"]),
+                         step_size=0.06, num_steps=12, adapt_step_size=False,
+                         solver="anderson", fp_tol=1e-9)
+    pt = PT(kernel, betas=torch.tensor([0.0, 0.25, 0.5, 1.0]))
+    state = pt.init(torch.zeros(24, 1))
+    for _ in range(400):
+        state = pt.step(state)
+
+    diag = pt.diagnostics()
+    assert diag["swap_accept_rate"].shape == (3,)
+    assert float(diag["swap_accept_rate"][-1]) > 0.1     # hot pairs communicate
+    assert abs(float(state.q.reshape(-1).mean()) - mean_q) < 0.05

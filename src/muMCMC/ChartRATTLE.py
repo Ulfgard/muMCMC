@@ -83,6 +83,20 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate
 #  machinery as RMHMC's dH/dq, and the sole gradient in the scheme.            #
 #                                                                              #
 # =========================================================================== #
+#                                                                              #
+#  Tempering                                                                   #
+#                                                                              #
+#  Inverse temperature β lives on the constraint and softens the observation.  #
+#  In the scale family Σ -> Σ/β, so ψ_β = √β ψ₁ and the chart target is         #
+#                                                                              #
+#      e^{−½‖η‖² − ½ log det Σ}·e^{−β U_lik},      U_lik = ½‖ψ₁‖² = ½‖ψ_β‖²/β,  #
+#                                                                              #
+#  base·e^{−β U_lik} with a temperature-free U_lik, so parallel tempering      #
+#  swaps are valid. The sampler pushes its per-replica β into the constraint   #
+#  and exposes U_lik on the state. Note β = 0 is the Σ-weighted prior, not the #
+#  N(0, I) prior (the ½ log det Σ term stays in the base).                     #
+#                                                                              #
+# =========================================================================== #
 
 
 # ---- Chart geometry ------------------------------------------------------ #
@@ -137,10 +151,16 @@ class ChartConstraint:
     ----------
     x : (m,)
         Conditioning value the manifold is defined by, shared across chains.
+    beta : float or (N,) Tensor
+        Inverse temperature, per chain. A subclass softens the constraint by
+        ``beta`` (the scale family divides Sigma by ``beta``), so ``beta = 1`` is
+        the posterior and ``beta`` -> 0 flattens the data fit. Set by the sampler
+        from its ``beta`` (parallel tempering fills it per replica).
     """
 
-    def __init__(self, x: torch.Tensor):
+    def __init__(self, x: torch.Tensor, beta=1.0):
         self.x = x
+        self.beta = beta
 
     # ---- subclass hooks ---------------------------------------------------- #
 
@@ -205,13 +225,20 @@ class LocationScaleChart(ChartConstraint):
         Observation.
     """
 
-    def __init__(self, mean: Callable, cov: Callable, x: torch.Tensor):
-        super().__init__(x)
+    def __init__(self, mean: Callable, cov: Callable, x: torch.Tensor, beta=1.0):
+        super().__init__(x, beta)
         self.mean = mean
         self.cov = cov
 
     def _factor(self, eta):
-        return self.mean(eta), torch.linalg.cholesky_ex(self.cov(eta)).L
+        # Tempering softens the observation: Sigma_beta = Sigma / beta.
+        b = self.beta
+        Sigma = self.cov(eta)
+        if torch.is_tensor(b) and b.ndim > 0:
+            Sigma = Sigma / b.reshape(-1, 1, 1)
+        elif b != 1.0:
+            Sigma = Sigma / b
+        return self.mean(eta), torch.linalg.cholesky_ex(Sigma).L
 
     def psi(self, eta):
         mu, L = self._factor(eta)
@@ -289,6 +316,24 @@ def _chart_hamiltonian(local: ChartLocal, pi: torch.Tensor) -> torch.Tensor:
 
 # ---- Chain state --------------------------------------------------------- #
 
+class _LikPotential:
+    """Temperature-free likelihood potential U_lik = ½‖ψ₁‖², carried on the state
+    for parallel tempering. Exposes ``lik`` and travels under reorder / select.
+    ``base`` is absent (the sampler forms energies directly), present only so the
+    PT swap reads ``U.lik``."""
+
+    __slots__ = ("lik",)
+
+    def __init__(self, lik):
+        self.lik = lik
+
+    def reorder(self, perm):
+        return _LikPotential(self.lik[perm])
+
+    def select(self, mask, other):
+        return _LikPotential(torch.where(mask, self.lik, other.lik))
+
+
 class ChartRATTLEState:
     """Working state of one ChartRATTLE trajectory, batched over ``(N,)`` chains.
 
@@ -308,20 +353,26 @@ class ChartRATTLEState:
         None at a trajectory start.
     """
 
-    def __init__(self, q, pi=None, local=None, grad_V=None, deta=None):
+    def __init__(self, q, pi=None, local=None, grad_V=None, deta=None, U=None):
         self.q = q
         self.pi = pi
         self.local = local
         self.grad_V = grad_V
         self.deta = deta
+        self.U = U                                     # _LikPotential, for PT swaps
 
     def reorder(self, perm):
+        # A swap relabels a config to a new temperature slot. q, U (the
+        # temperature-free likelihood) and the momentum permute directly. The
+        # bundle and grad_V are retempered by the next sample_momentum, which
+        # re-evaluates the endpoint at the slot's beta.
         return ChartRATTLEState(
             q=self.q[perm],
             pi=None if self.pi is None else self.pi[perm],
             local=None if self.local is None else self.local.reorder(perm),
             grad_V=None if self.grad_V is None else self.grad_V[perm],
             deta=None if self.deta is None else self.deta[perm],
+            U=None if self.U is None else self.U.reorder(perm),
         )
 
     def select_accepted(self, accepted, other):
@@ -335,6 +386,7 @@ class ChartRATTLEState:
             self.local.select(accepted, other.local),
             torch.where(pick, self.grad_V, other.grad_V),
             deta=None,
+            U=None if self.U is None else self.U.select(accepted, other.U),
         )
 
 
@@ -361,7 +413,9 @@ class ChartRATTLE(HamiltonianSampler):
         Identity unconstrained space over the θ (= η) names, no prior (the
         N(0, I) prior is in V).
     step_size : float
-        Integration step size (adapted during warmup when adapting).
+        Integration step size, required (no default). When adapting, start it
+        small: the step is grown from here, so a too-large start begins above the
+        solver-convergence cliff and cannot recover.
     num_steps : int
         RATTLE substeps per transition.
     adapt_step_size : bool
@@ -394,7 +448,7 @@ class ChartRATTLE(HamiltonianSampler):
         constraint: ChartConstraint,
         space,
         *,
-        step_size: float = 0.1,
+        step_size: float,
         num_steps: int = 10,
         adapt_step_size: bool = True,
         adaptation_sigma: float = 0.1,
@@ -437,17 +491,32 @@ class ChartRATTLE(HamiltonianSampler):
 
     # ---- integrator hooks -------------------------------------------------- #
 
+    def _u_lik(self, eps):
+        """Temperature-free likelihood potential U_lik = ½‖ψ₁‖² = ½‖ψ_β‖² / β,
+        the parallel-tempering swap statistic (``ψ_β = √β ψ₁`` in the scale
+        family)."""
+        b = self.constraint.beta
+        b = b.reshape(-1) if (torch.is_tensor(b) and b.ndim > 0) else b
+        return 0.5 * (eps * eps).sum(-1) / b
+
     def build_initial_state(self, q):
-        """Evaluate the constraint at ``q`` = η and return the initial state."""
+        """Evaluate the constraint at ``q`` = η and return the initial state. The
+        sampler's per-replica ``beta`` is pushed into the constraint here."""
+        self.constraint.beta = self.beta
         z = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
         self._step_residual = z.clone()
         self._step_iters = z.clone()
         local, grad_V = self.constraint.endpoint(q)
-        return ChartRATTLEState(q, None, local, grad_V, None)
+        return ChartRATTLEState(q, None, local, grad_V, None,
+                                U=_LikPotential(self._u_lik(local.eps)))
 
     def sample_momentum(self, state):
-        """Draw the chart momentum π ~ N(0, G_M(η)) = L_G ξ and reset the
-        per-transition solver scratch and the warm-start displacement."""
+        """Re-evaluate the endpoint at ``q`` (retempering it to the current
+        replica ``beta`` after a swap), draw the chart momentum π ~ N(0, G_M(η)),
+        and reset the per-transition solver scratch and warm-start displacement."""
+        self.constraint.beta = self.beta
+        state.local, state.grad_V = self.constraint.endpoint(state.q)
+        state.U = _LikPotential(self._u_lik(state.local.eps))
         N, n = state.q.shape
         z = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
         self._step_residual = z.clone()
@@ -487,7 +556,8 @@ class ChartRATTLE(HamiltonianSampler):
 
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters = torch.maximum(self._step_iters, iters.to(h.dtype))
-        return ChartRATTLEState(eta1, pi1, L1, g1, deta=(eta1 - eta0))
+        return ChartRATTLEState(eta1, pi1, L1, g1, deta=(eta1 - eta0),
+                                U=_LikPotential(self._u_lik(eps1)))
 
     def acceptance_delta(self, new, old):
         """``delta_H = H(new) − H(old)``, forced to +inf where the position solve
@@ -507,16 +577,27 @@ class ChartRATTLE(HamiltonianSampler):
 
     def adapt(self, accept_prob, delta_H):
         """REINFORCE step-size adaptation from this transition's energy error and
-        worst solver residual and iteration count. The ``exp(-|delta_H|)`` term
+        worst solver residual and iteration count. The ``exp(-w|delta_H|)`` term
         brakes the step as the energy error grows, so from a small start the step
-        settles below the solver-convergence cliff rather than running away."""
+        settles below the solver-convergence cliff rather than running away.
+
+        The energy weight ``w`` is heavier than RMHMC's ``w = 1`` because the
+        chart solve stays cheap (Anderson keeps the iteration count low even as
+        the step grows), so the throughput reward would otherwise push the step
+        past the divergence edge before the brake engages. ``w = 4`` settles the
+        funnel near 0.99 acceptance with no divergences.
+
+        A diverged trajectory leaves a non-finite residual (the step is already
+        rejected). Charging it zero efficiency, so maximum finite cost, points the
+        step down instead of poisoning the adapter with a non-finite update."""
         floor = 1.0e-3
+        energy_weight = 4.0
         num_iters = self._step_iters
         solver_penalty = torch.exp(-self._step_residual / self.step_size)
-        delta_H_penalty = torch.exp(-delta_H.abs())
-        f_t = (-0.5 * torch.log(
-            solver_penalty * delta_H_penalty * self.step_size / num_iters + floor
-        ) / abs(math.log(floor)))
+        delta_H_penalty = torch.exp(-energy_weight * delta_H.abs())
+        efficiency = solver_penalty * delta_H_penalty * self.step_size / num_iters
+        efficiency = torch.nan_to_num(efficiency, nan=0.0, posinf=0.0, neginf=0.0)
+        f_t = -0.5 * torch.log(efficiency + floor) / abs(math.log(floor))
         self._step_size_adapter.update(f_t)
 
     def reset_extra_diagnostics(self):

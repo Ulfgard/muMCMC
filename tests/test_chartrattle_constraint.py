@@ -12,6 +12,8 @@ we check, against closed forms, that:
    map the induced posterior is the exact Gaussian.
 5. The endpoint bundle is detached (no autograd graph pinned).
 """
+import math
+
 import torch
 import pytest
 
@@ -24,17 +26,24 @@ torch.set_default_dtype(torch.float64)
 
 class FunnelChart(ChartConstraint):
     """Neal funnel x = e^{σ η / 2} ε with η ~ N(0, 1). Closed-form geometry:
-    ψ = e^{−σ η / 2} x, W = (σ/2) ψ, log|det B| = (m/2) σ η."""
+    ψ_β = √β e^{−σ η / 2} x, W = (σ/2) ψ_β, log|det B| = (m/2)(σ η − log β).
+    Tempering divides the covariance by β."""
 
-    def __init__(self, sigma, x):
-        super().__init__(x)
+    def __init__(self, sigma, x, beta=1.0):
+        super().__init__(x, beta)
         self.s = sigma
 
+    def _sqrt_beta(self):
+        b = self.beta
+        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
+
     def psi(self, eta):
-        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+        return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
+        b = self.beta
+        log_b = b.log() if torch.is_tensor(b) else math.log(b)
+        return 0.5 * self.x.shape[-1] * (self.s * eta[:, 0] - log_b)
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
@@ -196,3 +205,41 @@ def test_endpoint_bundle_is_detached():
     local, gV = ls.endpoint(eta)
     for t in (local.eps, local.W, local.chol_G, local.V, gV):
         assert not t.requires_grad
+
+
+# ========================================================================== #
+#  6. Tempering: covariance scaling and the temperature-free U_lik           #
+# ========================================================================== #
+
+def test_covariance_scaling_tempers_the_target():
+    # beta scales Sigma -> Sigma/beta. The chart target's beta-dependence is
+    # exp(-beta * 1/2 ||psi_1||^2), so V - 1/2 logdet G_M matches
+    # 1/2||eta||^2 + 1/2 logdet Sigma + beta * 1/2 (x-mu)^T Sigma^{-1}(x-mu).
+    torch.manual_seed(5)
+    x = torch.randn(6)
+    sigma = 3.0
+    fun = FunnelChart(sigma, x)
+    eta = torch.randn(30, 1)
+    fun.beta = 0.4
+    local, _ = fun.endpoint(eta)
+    half_logdet_G = torch.log(local.chol_G.diagonal(dim1=-2, dim2=-1)).sum(-1)
+    lhs = local.V - half_logdet_G
+    e = eta[:, 0]
+    neg_log_post = (0.5 * e * e + 0.5 * 6 * sigma * e
+                    + fun.beta * 0.5 * torch.exp(-sigma * e) * (x * x).sum())
+    assert torch.allclose(lhs - lhs.mean(), neg_log_post - neg_log_post.mean(), atol=1e-9)
+
+
+def test_u_lik_is_temperature_free():
+    # U_lik = 1/2 ||psi_beta||^2 / beta = 1/2 ||psi_1||^2 is the same function of
+    # eta at every temperature, so parallel-tempering swaps are valid.
+    torch.manual_seed(6)
+    fun = FunnelChart(3.0, torch.randn(5))
+    eta = torch.randn(8, 1)
+    uliks = []
+    for beta in (1.0, 0.5, 0.1):
+        fun.beta = beta
+        local, _ = fun.endpoint(eta)
+        uliks.append(0.5 * (local.eps ** 2).sum(-1) / beta)
+    assert torch.allclose(uliks[0], uliks[1], atol=1e-10)
+    assert torch.allclose(uliks[0], uliks[2], atol=1e-10)

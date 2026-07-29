@@ -206,7 +206,7 @@ def test_evaluate_model_assembles_potential_and_metric():
         prior_metric_fn=lambda theta: torch.eye(3, dtype=theta.dtype).expand(
             *theta.shape[:-1], 3, 3),
     )
-    s = RMHMC(model, space, adapt_step_size=False)
+    s = RMHMC(model, space, step_size=0.1, adapt_step_size=False)
     z = torch.randn(5, 3)
     beta = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
 
