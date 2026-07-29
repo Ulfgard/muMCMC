@@ -15,9 +15,8 @@ states, checking the properties that make it a valid MCMC proposal:
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import (
-    ChartRATTLE, ChartRATTLEState, ChartConstraint, _chart_hamiltonian,
-)
+from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState, ChartConstraint
+from muMCMC.RMHMC import _hamiltonian
 from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)
@@ -76,9 +75,18 @@ def _affine_sampler(n=2, m=5, seed=0, **kw):
 
 def _seed_state(sampler, eta):
     """A momentum-carrying start state at ``eta`` (as sample_momentum builds it)."""
-    local, grad_V = sampler.constraint.endpoint(eta)
-    st = ChartRATTLEState(eta, None, local, grad_V, None)
+    U, metric, psi, W, grad_V = sampler.evaluate_model(eta, grad=True)
+    st = ChartRATTLEState(eta, None, U, metric, psi, W, grad_V, None)
     return sampler.sample_momentum(st)
+
+
+def _restart(st, q, p):
+    """A fresh trajectory state at (q, p) reusing st's endpoint bundle."""
+    return ChartRATTLEState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
+
+
+def _H(st):
+    return _hamiltonian(st.q, st.p, st.U.value, st.metric)
 
 
 # ========================================================================== #
@@ -119,12 +127,10 @@ def test_step_is_time_reversible(h):
     st = _seed_state(s, torch.randn(5, 1))
     hh = torch.full((5,), h)
 
-    fwd = s.integrate(ChartRATTLEState(st.q.clone(), st.pi.clone(),
-                                       st.local, st.grad_V, None), hh)
-    back = s.integrate(ChartRATTLEState(fwd.q.clone(), -fwd.pi.clone(),
-                                        fwd.local, fwd.grad_V, None), hh)
+    fwd = s.integrate(_restart(st, st.q.clone(), st.p.clone()), hh)
+    back = s.integrate(_restart(fwd, fwd.q.clone(), -fwd.p.clone()), hh)
     assert torch.allclose(back.q, st.q, atol=1e-9)
-    assert torch.allclose(back.pi, -st.pi, atol=1e-9)
+    assert torch.allclose(back.p, -st.p, atol=1e-9)
 
 
 def test_affine_step_is_time_reversible():
@@ -132,10 +138,10 @@ def test_affine_step_is_time_reversible():
     torch.manual_seed(4)
     st = _seed_state(s, torch.randn(4, n))
     hh = torch.full((4,), 0.4)
-    fwd = s.integrate(ChartRATTLEState(st.q.clone(), st.pi.clone(), st.local, st.grad_V, None), hh)
-    back = s.integrate(ChartRATTLEState(fwd.q.clone(), -fwd.pi.clone(), fwd.local, fwd.grad_V, None), hh)
+    fwd = s.integrate(_restart(st, st.q.clone(), st.p.clone()), hh)
+    back = s.integrate(_restart(fwd, fwd.q.clone(), -fwd.p.clone()), hh)
     assert torch.allclose(back.q, st.q, atol=1e-9)
-    assert torch.allclose(back.pi, -st.pi, atol=1e-9)
+    assert torch.allclose(back.p, -st.p, atol=1e-9)
 
 
 # ========================================================================== #
@@ -149,7 +155,7 @@ def test_anderson_matches_picard_endpoint():
         torch.manual_seed(5)
         st = _seed_state(s, torch.randn(6, 1))
         out = s.integrate(st, torch.full((6,), 0.3))
-        return out.q, out.pi
+        return out.q, out.p
     qp, pp = run("picard")
     qa, pa = run("anderson")
     assert torch.allclose(qa, qp, atol=1e-9)
@@ -187,13 +193,12 @@ def test_energy_error_is_second_order_in_step():
                             solver="picard", fp_tol=1e-12, fp_max_iter=300)
         torch.manual_seed(7)
         st = _seed_state(s, torch.zeros(64, 1))
-        H0 = _chart_hamiltonian(st.local, st.pi)
+        H0 = _H(st)
         hh = torch.full((64,), step)
         prop = st
         for _ in range(num_steps):
             prop = s.integrate(prop, hh)
-        H1 = _chart_hamiltonian(prop.local, prop.pi)
-        return (H1 - H0).abs().median()
+        return (_H(prop) - H0).abs().median()
 
     coarse = dH_at(0.08, 10)
     mid = dH_at(0.04, 20)

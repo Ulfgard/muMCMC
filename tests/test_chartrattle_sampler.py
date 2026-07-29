@@ -5,7 +5,8 @@ Adaptation is finicky for a Verlet-type integrator with a solver-convergence
 cliff, so it is out of scope here: every sampler runs at a fixed step. The
 integrator internals live in test_chartrattle_solver.py. Recovery is checked
 against the exact Gaussian induced by an affine map and against a quadrature
-reference for the funnel.
+reference for the funnel; parallel tempering rides on the base TemperedAffine /
+TemperedMetric that evaluate_model returns.
 """
 import torch
 import pytest
@@ -18,19 +19,15 @@ torch.set_default_dtype(torch.float64)
 
 
 class FunnelChart(ChartConstraint):
-    def __init__(self, sigma, x, beta=1.0):
-        super().__init__(x, beta)
+    def __init__(self, sigma, x):
+        super().__init__(x)
         self.s = sigma
 
-    def _sqrt_beta(self):
-        b = self.beta
-        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
-
     def psi(self, eta):
-        return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]     # untempered, no β-normalizer
+        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
@@ -76,6 +73,10 @@ def _endpoint_state(sampler, eta):
     return sampler.sample_momentum(sampler.init(eta))
 
 
+def _restart(st, q, p):
+    return ChartRATTLEState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
+
+
 # ========================================================================== #
 #  init                                                                      #
 # ========================================================================== #
@@ -87,8 +88,8 @@ def test_init_sizes_step_size_and_resets_counters():
     assert torch.allclose(s.step_size, torch.full((5,), 0.25))
     assert s._step == 0
     assert torch.equal(s._accepted, torch.zeros(5, dtype=torch.long))
-    assert state.local is not None and state.grad_V is not None
-    assert state.pi is None                       # momentum drawn in step()
+    assert state.U is not None and state.metric is not None
+    assert state.p is None                        # momentum drawn in step()
     assert torch.allclose(s._residual_sum, torch.zeros(5))
 
 
@@ -105,10 +106,9 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
     s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"]), step_size=0.1, adapt_step_size=False)
     N = 40000
-    state = s.init(torch.zeros(N, 2))
-    state = s.sample_momentum(state)
-    G = state.local.chol_G[0] @ state.local.chol_G[0].transpose(-2, -1)
-    emp = (state.pi.transpose(0, 1) @ state.pi) / N
+    state = s.sample_momentum(s.init(torch.zeros(N, 2)))
+    G = state.metric.value[0]
+    emp = (state.p.transpose(0, 1) @ state.p) / N
     assert torch.allclose(emp, G, rtol=0.03, atol=0.02)   # Monte Carlo covariance
 
 
@@ -119,7 +119,7 @@ def test_sample_momentum_covariance_is_the_chart_metric():
 def test_failed_solve_is_rejected_even_when_energy_matches():
     s = _funnel_sampler(step_size=0.1, num_steps=1, fp_tol=1e-8)
     old = _endpoint_state(s, torch.zeros(3, 1))
-    new = ChartRATTLEState(old.q.clone(), old.pi.clone(), old.local, old.grad_V, None)
+    new = _restart(old, old.q.clone(), old.p.clone())
     s._step_residual = torch.full((3,), 1e-3)     # solve failed (>> fp_tol)
     out = s.accept(new, old)
     assert torch.allclose(out.q, old.q)           # rejected despite delta_H ~ 0
@@ -129,7 +129,7 @@ def test_failed_solve_is_rejected_even_when_energy_matches():
 def test_non_finite_solve_is_rejected():
     s = _funnel_sampler(step_size=0.1, num_steps=1, fp_tol=1e-8)
     old = _endpoint_state(s, torch.zeros(2, 1))
-    new = ChartRATTLEState(old.q.clone(), old.pi.clone(), old.local, old.grad_V, None)
+    new = _restart(old, old.q.clone(), old.p.clone())
     s._step_residual = torch.tensor([float("nan"), 1e-12])
     out = s.accept(new, old)
     assert torch.allclose(out.q[0], old.q[0])     # nan residual -> rejected
@@ -145,9 +145,10 @@ def test_reorder_permutes_state():
     perm = torch.tensor([2, 0, 1])
     r = state.reorder(perm)
     assert torch.equal(r.q, state.q[perm])
-    assert torch.equal(r.pi, state.pi[perm])
-    assert torch.equal(r.local.W, state.local.W[perm])
-    assert torch.equal(r.grad_V, state.grad_V[perm])
+    assert torch.equal(r.p, state.p[perm])
+    assert torch.equal(r.W, state.W[perm])
+    assert torch.equal(r.U.lik, state.U.lik[perm])
+    assert r.grad_V is None                       # dropped, retempered next step
 
 
 # ========================================================================== #
@@ -172,7 +173,7 @@ def test_step_runs_exactly_num_steps_substeps():
 def test_step_returns_complete_state():
     s = _funnel_sampler(num_steps=3)
     out = s.step(s.init(torch.zeros(2, 1)))
-    assert out.local is not None and out.grad_V is not None and out.pi is not None
+    assert out.U is not None and out.metric is not None and out.p is not None
     assert out.q.shape == (2, 1)
 
 
@@ -231,8 +232,7 @@ def test_recovers_funnel_posterior_against_quadrature():
     grid = torch.linspace(-8, 8, 8001)
     log_post = -(0.5 * grid * grid + 0.5 * torch.exp(-sigma * grid) * (xobs * xobs).sum()
                  + 0.5 * m * sigma * grid)
-    w = torch.exp(log_post - log_post.max())
-    w = w / w.sum()
+    w = torch.softmax(log_post, dim=0)
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
@@ -251,9 +251,9 @@ def test_recovers_funnel_posterior_against_quadrature():
 # ========================================================================== #
 
 def test_pt_runs_swaps_and_recovers_target_mean():
-    # ChartRATTLE as a PT exploration kernel: the constraint receives a per-
-    # replica beta (Sigma / beta), the state exposes the temperature-free U_lik
-    # for the swap ratio, and reorder retempers. The target chain (beta = 1)
+    # ChartRATTLE as a PT exploration kernel: evaluate_model returns U / G_M as a
+    # TemperedAffine / TemperedMetric, so the swap statistic U.lik and the
+    # retempering reorder ride on the base machinery. The target chain (β = 1)
     # recovers the funnel posterior mean.
     sigma, m = 3.0, 6
     torch.manual_seed(7)

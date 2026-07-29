@@ -1,11 +1,13 @@
-from typing import Callable, Tuple
+from typing import Callable
 import math
+from contextlib import nullcontext
 
 import torch
 
 from .HamiltonianSampler import HamiltonianSampler
 from .adapters import Reinforce, NoAdaptation
-from .RMHMC import _PicardUpdate, _AndersonUpdate
+from .spaces import TemperedAffine, TemperedMetric
+from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian
 
 # =========================================================================== #
 #                                                                              #
@@ -20,167 +22,91 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate
 #                                                                              #
 #      M = { z : φ_η(ε) = x }.                                                 #
 #                                                                              #
-#  Constrained dynamics on M with potential U leaves e^{−U} σ_M invariant.     #
-#  The co-area formula gives the law of z given X = x as                       #
-#                                                                              #
-#      e^{−‖z‖²/2} det Λ^{−1/2},      Λ = ∇g ∇gᵀ = A Aᵀ + B Bᵀ,                #
-#      A = ∂_η φ,   B = ∂_ε φ,                                                  #
-#                                                                              #
-#  so U(z) = ½‖z‖² + ½ log det Λ, and the η-marginal of the constrained        #
-#  chain is p(θ | x). The ½ log det Λ term is the co-area Jacobian of the      #
-#  conditioning. It is owned here, not by the user.                            #
+#  The η-marginal of the constrained chain is p(θ | x). The co-area Jacobian   #
+#  ½ log det Λ is owned here, not by the user.                                 #
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
-#  Chart                                                                       #
+#  Energy = RMHMC energy                                                       #
 #                                                                              #
-#  M is a graph over η. With ψ(η) = φ_η⁻¹(x) and Z(η) = (η, ψ(η)),             #
+#  With ψ(η) = φ_η⁻¹(x) and W = −∂ψ/∂η = B⁻¹A, the target is e^{−U} with        #
 #                                                                              #
-#      T(η) = ∂Z/∂η = [ I ; −W ],    W = −∂ψ/∂η = B⁻¹A,                        #
-#      G_M(η) = Tᵀ T = I + Wᵀ W.                                               #
+#      U(η) = ½‖η‖² + log|det B| + β·½‖ψ‖²,     G_M(η) = I + β Wᵀ W,           #
 #                                                                              #
-#  The chart potential is                                                      #
+#  U affine in β (a TemperedAffine, lik = ½‖ψ‖², base = ½‖η‖² + log|det B|),    #
+#  G_M affine in β (a TemperedMetric, A_lik = Wᵀ W, A_prior = I). These are     #
+#  exactly what evaluate_model returns, so the Hamiltonian                      #
 #                                                                              #
-#      V(η) = ½‖η‖² + ½‖ψ‖² + log|det B| + ½ log det G_M,                      #
+#      H = U + ½ πᵀ G_M⁻¹ π + ½ log det G_M                                    #
 #                                                                              #
-#  and RATTLE in the chart reads e^{−V} √det G_M dη ∝ p(θ | x) dη. The         #
-#  Hamiltonian is H(η, π) = V(η) + ½ πᵀ G_M(η)⁻¹ π with momentum               #
-#  π ~ N(0, G_M(η)), whose Gaussian normalizer supplies the √det G_M.          #
-#                                                                              #
-# =========================================================================== #
-#                                                                              #
-#  Step  (η0, π0) -> (η1, π1)                                                  #
-#                                                                              #
-#  Position solve, n equations in η1, the RATTLE orthogonality of the move:    #
-#                                                                              #
-#      F(η1) = (η1 − η0) − W0ᵀ(ψ(η1) − ε0) − h π0 + (h²/2) ∇V(η0) = 0,         #
-#      DF(η1) = I + W0ᵀ W1,    DF(η0) = G_M(η0).                              #
-#                                                                              #
-#  Frozen-Jacobian iteration, one Cholesky of G_M(η0) reused across steps:     #
-#                                                                              #
-#      η^{k+1} = η^k − G_M(η0)⁻¹ F(η^k).                                       #
-#                                                                              #
-#  Only ψ(η^k) is evaluated in the loop. The updater is pluggable: Picard      #
-#  and Anderson both drive the preconditioned residual G_M(η0)⁻¹ F to zero.    #
-#  Momentum is explicit,                                                        #
-#                                                                              #
-#      π1 = (1/h)[(η1 − η0) − W1ᵀ(ε1 − ε0)] − (h/2) ∇V(η1).                    #
-#                                                                              #
-#  The scheme is self-adjoint, so reversible up to the solve. v1 runs no       #
-#  reverse-projection check and rejects a failed solve (+inf energy), as       #
-#  RMHMC does.                                                                  #
+#  is RMHMC's _hamiltonian, tempering / parallel tempering ride on the base     #
+#  TemperedAffine / TemperedMetric (reorder retempers with no re-evaluation),   #
+#  and PT reads the temperature-free U_lik = ½‖ψ‖² off U.lik. Only the          #
+#  integrator is ChartRATTLE-specific.                                         #
 #                                                                              #
 # =========================================================================== #
 #                                                                              #
-#  Constraint interface                                                        #
+#  Step  (η0, π0) -> (η1, π1)  (β scales the untempered ψ, W)                  #
 #                                                                              #
-#      psi(η)           -> ε                    inner-loop workhorse           #
+#      F(η1) = (η1 − η0) − β W0ᵀ(ψ(η1) − ψ0) − h π0 + (h²/2) ∇V(η0) = 0,       #
+#      DF(η0) = I + β W0ᵀ W0 = G_M(η0),                                        #
+#      η^{k+1} = η^k − G_M(η0)⁻¹ F(η^k),                                       #
+#      π1 = (1/h)[(η1 − η0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(η1),                  #
+#                                                                              #
+#  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), η)      #
+#  (RMHMC's dH/dq). Only ψ(η^k) is evaluated in the loop, preconditioned by     #
+#  one Cholesky of G_M(η0) (the metric's own factor). The scheme is             #
+#  self-adjoint, so reversible up to the solve. v1 runs no reverse-projection   #
+#  check and rejects a failed solve (+inf energy), as RMHMC does.              #
+#                                                                              #
+# =========================================================================== #
+#                                                                              #
+#  Constraint interface (untempered)                                           #
+#                                                                              #
+#      psi(η)           -> ψ = φ_η⁻¹(x)         inner-loop workhorse           #
 #      log_abs_det_B(η) -> log|det B|           = ½ log det Σ for a scale       #
 #                                                                              #
 #  W = −∂ψ/∂η follows from one reverse pass per latent (classic autograd, no   #
-#  vmap). A subclass with explicit Jacobians overrides psi_with_jvp to return  #
-#  (ε, W, log|det B|) directly. ∇V is one autograd.grad(V.sum(), η), the same  #
-#  machinery as RMHMC's dH/dq, and the sole gradient in the scheme.            #
-#                                                                              #
-# =========================================================================== #
-#                                                                              #
-#  Tempering                                                                   #
-#                                                                              #
-#  Inverse temperature β lives on the constraint and softens the observation.  #
-#  In the scale family the tempered residual is ψ_β = √β ψ₁ (i.e. Σ -> Σ/β),    #
-#  and the chart target is                                                      #
-#                                                                              #
-#      e^{−½‖η‖² − ½ log det Σ}·e^{−β U_lik},      U_lik = ½‖ψ₁‖²,             #
-#                                                                              #
-#  base·e^{−β U_lik} with a temperature-free U_lik, so parallel-tempering       #
-#  swaps are valid. log|det B| is the untempered ½ log det Σ, with no           #
-#  β-normalizer, so the potential stays finite as β -> 0. The sampler pushes    #
-#  its per-replica β into the constraint and exposes U_lik on the state. The    #
-#  scale family needs β > 0.                                                    #
+#  vmap); override psi_with_jvp with explicit Jacobians to skip it. The         #
+#  constraint is temperature-free: β enters only in evaluate_model. Tempering   #
+#  in the scale family softens the observation (Σ -> Σ/β), and the potential    #
+#  carries the untempered ½ log det Σ, so it stays finite as β -> 0; the scale  #
+#  family needs β > 0.                                                         #
 #                                                                              #
 # =========================================================================== #
 
 
-# ---- Chart geometry ------------------------------------------------------ #
-
-class ChartLocal:
-    """Per-endpoint bundle from one endpoint evaluation, batched over chains.
-
-    Attributes
-    ----------
-    eps : (N, m)
-        ψ(η), the latent on M.
-    W : (N, m, n)
-        −∂ψ/∂η. The induced metric is G_M = I + Wᵀ W.
-    chol_G : (N, n, n)
-        Lower Cholesky of G_M(η), the position-solve preconditioner.
-    V : (N,)
-        Chart potential V(η).
-    """
-
-    def __init__(self, eps: torch.Tensor, W: torch.Tensor,
-                 chol_G: torch.Tensor, V: torch.Tensor):
-        self.eps = eps
-        self.W = W
-        self.chol_G = chol_G
-        self.V = V
-
-    def select(self, mask: torch.Tensor, other: "ChartLocal") -> "ChartLocal":
-        """This bundle where ``mask`` is True, ``other`` where False, per chain."""
-        m1 = mask[..., None]
-        m2 = mask[..., None, None]
-        return ChartLocal(
-            torch.where(m1, self.eps, other.eps),
-            torch.where(m2, self.W, other.W),
-            torch.where(m2, self.chol_G, other.chol_G),
-            torch.where(mask, self.V, other.V),
-        )
-
-    def reorder(self, perm: torch.Tensor) -> "ChartLocal":
-        return ChartLocal(self.eps[perm], self.W[perm], self.chol_G[perm], self.V[perm])
-
+# ---- Constraint ---------------------------------------------------------- #
 
 class ChartConstraint:
     """Constraint M = {(η, ε) : φ_η(ε) = x} exposed through the inverse map.
 
-    A subclass supplies the batched inverse ``psi(η)`` = φ_η⁻¹(x) (shape
-    ``(N, n)`` to ``(N, m)``) and ``log_abs_det_B(η)`` = log|det ∂_ε φ|. The
-    base derives W = −∂ψ/∂η by classic autograd, the metric G_M and its
-    Cholesky, and ∇V. Override ``psi_with_jvp`` to return (ε, W, log|det B|)
-    from explicit Jacobians and skip the autograd of W.
+    A subclass supplies the batched, temperature-free inverse ``psi(η)`` =
+    φ_η⁻¹(x) (shape ``(N, n)`` to ``(N, m)``) and ``log_abs_det_B(η)`` =
+    log|det ∂_ε φ|. The sampler derives W = −∂ψ/∂η, the potential, and the
+    metric, and applies the inverse temperature. Override ``psi_with_jvp`` to
+    return (ψ, W, log|det B|) from explicit Jacobians.
 
     Parameters
     ----------
     x : (m,)
         Conditioning value the manifold is defined by, shared across chains.
-    beta : float or (N,) Tensor
-        Inverse temperature, per chain. A subclass softens the constraint by
-        ``beta`` (the scale family divides Sigma by ``beta``), so ``beta = 1`` is
-        the posterior and smaller ``beta`` inflates the observation noise. Must
-        stay ``> 0``: ``beta -> 0`` sends ``Sigma / beta -> inf``, outside the
-        family. Set by the sampler from its ``beta`` (parallel tempering fills it
-        per replica).
     """
 
-    def __init__(self, x: torch.Tensor, beta=1.0):
+    def __init__(self, x: torch.Tensor):
         self.x = x
-        self.beta = beta
-
-    # ---- subclass hooks ---------------------------------------------------- #
 
     def psi(self, eta: torch.Tensor) -> torch.Tensor:
-        """ε = φ_η⁻¹(x) at the bound x, batched. Inner-loop workhorse."""
+        """ψ = φ_η⁻¹(x), batched. Inner-loop workhorse."""
         raise NotImplementedError
 
     def log_abs_det_B(self, eta: torch.Tensor) -> torch.Tensor:
         """log|det ∂_ε φ| at η, batched ``(N,)``."""
         raise NotImplementedError
 
-    # ---- derived ----------------------------------------------------------- #
-
     def psi_with_jvp(self, eta: torch.Tensor):
-        """(ε, W, log|det B|) at η, W = −∂ψ/∂η computed by one reverse pass per
-        latent. ``eta`` must require grad. Override with explicit Jacobians."""
+        """(ψ, W, log|det B|) at η, W = −∂ψ/∂η by one reverse pass per latent.
+        ``eta`` must require grad. Override with explicit Jacobians."""
         eps = self.psi(eta)
         m = eps.shape[-1]
         cols = [torch.autograd.grad(eps[:, i].sum(), eta, retain_graph=True,
@@ -189,25 +115,6 @@ class ChartConstraint:
         W = -torch.stack(cols, dim=1)                      # (N, m, n)
         return eps, W, self.log_abs_det_B(eta)
 
-    def endpoint(self, eta: torch.Tensor) -> Tuple[ChartLocal, torch.Tensor]:
-        """One evaluation at η returning ``(ChartLocal, ∇V)``.
-
-        ∇V = ∂V/∂η by a single ``autograd.grad(V.sum(), η)``, as RMHMC takes
-        dH/dq. Everything is detached into the bundle, so no graph is pinned
-        across steps."""
-        eta = eta.detach().requires_grad_(True)
-        with torch.enable_grad():
-            eps, W, log_abs_det_B = self.psi_with_jvp(eta)
-            n = eta.shape[-1]
-            eye = torch.eye(n, dtype=eta.dtype, device=eta.device)
-            G = eye + W.transpose(-2, -1) @ W
-            V = (0.5 * (eta * eta).sum(-1) + 0.5 * (eps * eps).sum(-1)
-                 + log_abs_det_B + 0.5 * torch.logdet(G))
-            (grad_V,) = torch.autograd.grad(V.sum(), eta)
-        chol_G = torch.linalg.cholesky_ex(G.detach()).L
-        local = ChartLocal(eps.detach(), W.detach(), chol_G, V.detach())
-        return local, grad_V.detach()
-
 
 class LocationScaleChart(ChartConstraint):
     """Conditionally-Gaussian layer x | η ~ N(μ(η), Σ(η)).
@@ -215,9 +122,9 @@ class LocationScaleChart(ChartConstraint):
     φ_η(ε) = μ(η) + L(η) ε with Σ(η) = L(η) L(η)ᵀ, so ψ(η) = L(η)⁻¹(x − μ(η))
     and log|det B| = ½ log det Σ. ``mean`` and ``cov`` are batched callables
     (η shape ``(N, n)`` to ``(N, m)`` and ``(N, m, m)`` SPD), differentiable in
-    η. W is taken by the autograd default. ``cholesky_ex`` returns a non-finite
-    factor rather than raising on a diverged η, so a bad chain is rejected
-    downstream instead of crashing the batch.
+    η. Temperature-free: the sampler tempers by scaling the residual by √β.
+    ``cholesky_ex`` returns a non-finite factor rather than raising on a
+    diverged η, so a bad chain is rejected downstream instead of crashing.
 
     Parameters
     ----------
@@ -229,49 +136,40 @@ class LocationScaleChart(ChartConstraint):
         Observation.
     """
 
-    def __init__(self, mean: Callable, cov: Callable, x: torch.Tensor, beta=1.0):
-        super().__init__(x, beta)
+    def __init__(self, mean: Callable, cov: Callable, x: torch.Tensor):
+        super().__init__(x)
         self.mean = mean
         self.cov = cov
 
-    def _sqrt_beta(self):
-        b = self.beta
-        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
-
     def _factor(self, eta):
-        # Untempered factor. Tempering scales the residual by √β (equivalently
-        # Sigma -> Sigma/beta) without forming Sigma/beta, so nothing diverges as
-        # beta -> 0 and log|det B| carries no beta-normalizer.
         return self.mean(eta), torch.linalg.cholesky_ex(self.cov(eta)).L
 
     def psi(self, eta):
         mu, L = self._factor(eta)
-        psi1 = torch.linalg.solve_triangular(
+        return torch.linalg.solve_triangular(
             L, (self.x - mu).unsqueeze(-1), upper=False).squeeze(-1)
-        return self._sqrt_beta() * psi1
 
     def log_abs_det_B(self, eta):
-        _, L = self._factor(eta)                           # untempered ½ log det Sigma
+        _, L = self._factor(eta)
         return torch.log(L.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
 
 
 # ---- Position solve ------------------------------------------------------ #
 
-def _solve_position(constraint, eta0, eps0, W0, chol_G0, rhs, eta_init,
+def _solve_position(constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init,
                     solver, max_iter, tol):
-    """Solve F(η) = (η − η0) − W0ᵀ(ψ(η) − ε0) − rhs = 0, preconditioned by
-    G_M(η0), batched over chains. ``rhs`` folds the momentum half step,
-    ``rhs = h π0 − (h²/2) ∇V(η0)``. Each chain iterates until ‖F‖∞ < tol or it
-    blows up (non-finite, or ‖F‖∞ over 10x its start), frozen thereafter, up to
-    ``max_iter``. ``eta_init`` seeds the iterate. Returns (η1, iters, residual)."""
+    """Solve F(η) = (η − η0) − β W0ᵀ(ψ(η) − ψ0) − rhs = 0, preconditioned by
+    G_M(η0), batched over chains. ``beta_col`` broadcasts β over ``(N, n)``.
+    Each chain iterates until ‖F‖∞ < tol or it blows up (non-finite, or ‖F‖∞
+    over 10x its start), frozen thereafter, up to ``max_iter``. Returns
+    (η1, iters, residual)."""
     N, n = eta0.shape
     W0t = W0.transpose(-2, -1)                             # (N, n, m)
 
     def residual_fn(eta):
-        eps = constraint.psi(eta)                          # (N, m)
-        F = (eta - eta0) \
-            - (W0t @ (eps - eps0).unsqueeze(-1)).squeeze(-1) \
-            - rhs
+        psi = constraint.psi(eta)                          # (N, m), untempered
+        corr = (W0t @ (psi - psi0).unsqueeze(-1)).squeeze(-1)
+        F = (eta - eta0) - beta_col * corr - rhs
         pre = torch.cholesky_solve(F.unsqueeze(-1), chol_G0).squeeze(-1)   # G⁻¹ F
         return F, pre
 
@@ -279,14 +177,14 @@ def _solve_position(constraint, eta0, eps0, W0, chol_G0, rhs, eta_init,
     eta = eta_init.clone()
     with torch.no_grad():
         F, pre = residual_fn(eta)
-        F_init = F.abs().amax(-1)                           # (N,)
+        F_init = F.abs().amax(-1)
 
         done = torch.zeros(N, dtype=torch.bool, device=eta0.device)
         iters = torch.full((N,), max_iter, dtype=torch.long, device=eta0.device)
         residual = F_init.clone()
 
         for i in range(1, max_iter + 1):
-            eta_next = updater.propose(eta, pre)           # Picard or Anderson
+            eta_next = updater.propose(eta, pre)
             F_next, pre_next = residual_fn(eta_next)
             F_norm = F_next.abs().amax(-1)
 
@@ -311,73 +209,55 @@ def _solve_position(constraint, eta0, eps0, W0, chol_G0, rhs, eta_init,
     return eta.detach(), iters, residual.detach()
 
 
-# ---- Chart energy -------------------------------------------------------- #
-
-def _chart_hamiltonian(local: ChartLocal, pi: torch.Tensor) -> torch.Tensor:
-    """H = V(η) + ½ πᵀ G_M(η)⁻¹ π, with G_M via its Cholesky."""
-    Ginv_pi = torch.cholesky_solve(pi.unsqueeze(-1), local.chol_G).squeeze(-1)
-    return local.V + 0.5 * (pi * Ginv_pi).sum(-1)
-
-
 # ---- Chain state --------------------------------------------------------- #
-
-class _LikPotential:
-    """Temperature-free likelihood potential U_lik = ½‖ψ₁‖², carried on the state
-    for parallel tempering. Exposes ``lik`` and travels under reorder / select.
-    ``base`` is absent (the sampler forms energies directly), present only so the
-    PT swap reads ``U.lik``."""
-
-    __slots__ = ("lik",)
-
-    def __init__(self, lik):
-        self.lik = lik
-
-    def reorder(self, perm):
-        return _LikPotential(self.lik[perm])
-
-    def select(self, mask, other):
-        return _LikPotential(torch.where(mask, self.lik, other.lik))
-
 
 class ChartRATTLEState:
     """Working state of one ChartRATTLE trajectory, batched over ``(N,)`` chains.
 
+    Mirrors ``RMHMCState`` (``q, p, U, metric``) plus the untempered geometry
+    ``psi, W`` the RATTLE solve needs, and the force ``grad_V``. ``U`` / ``metric``
+    are a ``TemperedAffine`` / ``TemperedMetric``, so a parallel-tempering swap
+    retempers them under ``reorder`` with no re-evaluation; ``psi``, ``W`` are
+    temperature-free and just permute; ``grad_V`` (not β-affine) is dropped and
+    recomputed at the new temperature by the next :meth:`sample_momentum`.
+
     Attributes
     ----------
-    q : (N, n)
-        Chart position η. Named ``q`` for the driver, which reads it as the
-        sample and maps it through the identity space to θ.
-    pi : (N, n) or None
-        Chart momentum. Drawn by :meth:`ChartRATTLE.sample_momentum`.
-    local : ChartLocal
-        Endpoint bundle at η.
-    grad_V : (N, n)
-        ∇V(η).
+    q, p : (N, n)
+        Chart position η and momentum π. ``q`` is read as the sample.
+    U : TemperedAffine
+        Potential, ``U.value`` the ``(N,)`` energy, ``U.lik`` the PT swap statistic.
+    metric : TemperedMetric
+        Chart metric G_M(η).
+    psi, W : (N, m), (N, m, n)
+        Untempered ψ(η) and W = −∂ψ/∂η.
+    grad_V : (N, n) or None
+        ∇V(η); None after a swap, until recomputed.
     deta : (N, n) or None
-        Last position displacement, used to warm-start the next substep's solve.
-        None at a trajectory start.
+        Last displacement, warm-starts the next solve. None at a trajectory start.
     """
 
-    def __init__(self, q, pi=None, local=None, grad_V=None, deta=None, U=None):
+    def __init__(self, q, p=None, U=None, metric=None, psi=None, W=None,
+                 grad_V=None, deta=None):
         self.q = q
-        self.pi = pi
-        self.local = local
+        self.p = p
+        self.U = U
+        self.metric = metric
+        self.psi = psi
+        self.W = W
         self.grad_V = grad_V
         self.deta = deta
-        self.U = U                                     # _LikPotential, for PT swaps
 
     def reorder(self, perm):
-        # A swap relabels a config to a new temperature slot. q, U (the
-        # temperature-free likelihood) and the momentum permute directly. The
-        # bundle and grad_V are retempered by the next sample_momentum, which
-        # re-evaluates the endpoint at the slot's beta.
         return ChartRATTLEState(
             q=self.q[perm],
-            pi=None if self.pi is None else self.pi[perm],
-            local=None if self.local is None else self.local.reorder(perm),
-            grad_V=None if self.grad_V is None else self.grad_V[perm],
-            deta=None if self.deta is None else self.deta[perm],
+            p=None if self.p is None else self.p[perm],
             U=None if self.U is None else self.U.reorder(perm),
+            metric=None if self.metric is None else self.metric.reorder(perm),
+            psi=None if self.psi is None else self.psi[perm],
+            W=None if self.W is None else self.W[perm],
+            grad_V=None,                                   # retempered next step
+            deta=None if self.deta is None else self.deta[perm],
         )
 
     def select_accepted(self, accepted, other):
@@ -387,11 +267,13 @@ class ChartRATTLEState:
         pick = accepted.unsqueeze(-1)
         return ChartRATTLEState(
             torch.where(pick, self.q, other.q),
-            torch.where(pick, self.pi, other.pi),
-            self.local.select(accepted, other.local),
+            torch.where(pick, self.p, other.p),
+            self.U.select(accepted, other.U),
+            self.metric.select(accepted, other.metric),
+            torch.where(pick, self.psi, other.psi),
+            torch.where(pick[..., None], self.W, other.W),
             torch.where(pick, self.grad_V, other.grad_V),
             deta=None,
-            U=None if self.U is None else self.U.select(accepted, other.U),
         )
 
 
@@ -399,10 +281,11 @@ class ChartRATTLEState:
 #                                                                              #
 #  ChartRATTLE sampler                                                         #
 #                                                                              #
-#  Runs in the η chart. The N(0, I) top-level prior is baked into V, so the    #
+#  Runs in the η chart. The N(0, I) top-level prior is baked into U, so the     #
 #  space is the identity UnconstrainedSpace over the θ names and the driver     #
-#  reads q = η off as θ. The model is a ChartConstraint, so evaluate_model of   #
-#  the MCMCSampler base is unused.                                             #
+#  reads q = η off as θ. evaluate_model is overridden to build U (TemperedAffine)#
+#  and G_M (TemperedMetric) from the constraint, so tempering and PT ride on    #
+#  the base machinery; only integrate is ChartRATTLE-specific.                 #
 #                                                                              #
 # =========================================================================== #
 
@@ -416,7 +299,7 @@ class ChartRATTLE(HamiltonianSampler):
         The reparameterization inverse ψ(η) = φ_η⁻¹(x) and its geometry.
     space
         Identity unconstrained space over the θ (= η) names, no prior (the
-        N(0, I) prior is in V).
+        N(0, I) prior is in U).
     step_size : float
         Integration step size, required (no default). When adapting, start it
         small: the step is grown from here, so a too-large start begins above the
@@ -444,8 +327,7 @@ class ChartRATTLE(HamiltonianSampler):
     Notes
     -----
     A failed position solve (max residual over ``fp_tol``, or non-finite) is
-    rejected with +inf energy, so a non-reversible move never enters the chain.
-    No reverse-projection check is run in v1.
+    rejected with +inf energy. No reverse-projection check is run in v1.
     """
 
     def __init__(
@@ -480,7 +362,7 @@ class ChartRATTLE(HamiltonianSampler):
         log_eps = math.log(step_size)
         adapter = (Reinforce(sigma=adaptation_sigma, init=log_eps)
                    if adapt_step_size else NoAdaptation(init=log_eps))
-        super().__init__(None, space, requires_metric=False, num_steps=num_steps,
+        super().__init__(None, space, requires_metric=True, num_steps=num_steps,
                          adapter=adapter, divergence_threshold=divergence_threshold,
                          trajectory_length=num_steps * step_size)
 
@@ -494,81 +376,104 @@ class ChartRATTLE(HamiltonianSampler):
         self.register_diagnostic("fp_iters_max", lambda: self._fp_iters_max)
         self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
+    # ---- model evaluation (the extension point) ---------------------------- #
+
+    def _beta_col(self):
+        """β reshaped to broadcast over ``(N, n)`` / ``(N, m)`` (scalar stays scalar)."""
+        b = self.beta
+        return b.reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else b
+
+    def evaluate_model(self, z_free, beta=None, grad=False):
+        """``(U, metric, psi, W[, grad_V])`` at η = ``z_free``.
+
+        ``U`` (TemperedAffine) is first so the exact potential is queryable from
+        outside at any temperature: ``U = ½‖η‖² + log|det B| + β·½‖ψ‖²``. ``metric``
+        is the chart metric ``G_M = I + β WᵀW`` (TemperedMetric). ``psi``, ``W``
+        are the untempered geometry the solve needs. With ``grad`` the force
+        ``∇V = ∇(U + ½ log det G_M)`` is returned too (one autograd.grad)."""
+        beta = self.beta if beta is None else beta
+        eta = z_free.detach().requires_grad_(True) if grad else z_free
+        n = eta.shape[-1]
+        eye = torch.eye(n, dtype=eta.dtype, device=eta.device)
+        beta_mat = beta.reshape(-1, 1, 1) if (torch.is_tensor(beta) and beta.ndim > 0) else beta
+
+        with torch.enable_grad() if grad else nullcontext():
+            eps, W, log_abs_det_B = self.constraint.psi_with_jvp(eta)
+            gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
+            lik = 0.5 * (eps * eps).sum(-1)                # U_lik = ½‖ψ‖²
+            base = 0.5 * (eta * eta).sum(-1) + log_abs_det_B
+            if grad:
+                G = eye + beta_mat * gram
+                V = base + beta * lik + 0.5 * torch.logdet(G)
+                (grad_V,) = torch.autograd.grad(V.sum(), eta)
+
+        U = TemperedAffine(lik.detach(), base.detach(), beta)
+        metric = TemperedMetric(gram.detach(), eye.expand(eta.shape[0], n, n), beta)
+        out = (U, metric, eps.detach(), W.detach())
+        return out + (grad_V.detach(),) if grad else out
+
     # ---- integrator hooks -------------------------------------------------- #
 
-    def _u_lik(self, eps):
-        """Temperature-free likelihood potential U_lik = ½‖ψ₁‖² = ½‖ψ_β‖² / β,
-        the parallel-tempering swap statistic (``ψ_β = √β ψ₁`` in the scale
-        family)."""
-        b = self.constraint.beta
-        b = b.reshape(-1) if (torch.is_tensor(b) and b.ndim > 0) else b
-        return 0.5 * (eps * eps).sum(-1) / b
-
-    def build_initial_state(self, q):
-        """Evaluate the constraint at ``q`` = η and return the initial state. The
-        sampler's per-replica ``beta`` is pushed into the constraint here."""
-        self.constraint.beta = self.beta
+    def _reset_step_scratch(self, q):
         z = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
         self._step_residual = z.clone()
         self._step_iters = z.clone()
-        local, grad_V = self.constraint.endpoint(q)
-        return ChartRATTLEState(q, None, local, grad_V, None,
-                                U=_LikPotential(self._u_lik(local.eps)))
+
+    def build_initial_state(self, q):
+        """Evaluate the constraint at ``q`` = η and return the initial state. The
+        sampler's ``beta`` (per replica under PT) tempers the returned U / metric."""
+        self._reset_step_scratch(q)
+        U, metric, psi, W, grad_V = self.evaluate_model(q, grad=True)
+        return ChartRATTLEState(q, None, U, metric, psi, W, grad_V, None)
 
     def sample_momentum(self, state):
-        """Re-evaluate the endpoint at ``q`` (retempering it to the current
-        replica ``beta`` after a swap), draw the chart momentum π ~ N(0, G_M(η)),
-        and reset the per-transition solver scratch and warm-start displacement."""
-        self.constraint.beta = self.beta
-        state.local, state.grad_V = self.constraint.endpoint(state.q)
-        state.U = _LikPotential(self._u_lik(state.local.eps))
-        N, n = state.q.shape
-        z = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
-        self._step_residual = z.clone()
-        self._step_iters = z.clone()
-        xi = torch.randn(N, n, dtype=state.q.dtype, device=state.q.device)
-        state.pi = (state.local.chol_G @ xi.unsqueeze(-1)).squeeze(-1).detach()
+        """Draw π ~ N(0, G_M(η)) from the metric and reset the solver scratch. A
+        post-swap state (``grad_V`` dropped by reorder) is retempered here by
+        re-evaluating the force at the replica's temperature."""
+        self._reset_step_scratch(state.q)
+        if state.grad_V is None:
+            (state.U, state.metric, state.psi, state.W,
+             state.grad_V) = self.evaluate_model(state.q, grad=True)
+        state.p = state.metric.sample_momentum()
         state.deta = None
         return state
 
     def integrate(self, state, step_size):
         """One RATTLE substep at ``step_size``, tracking the worst position-solve
-        residual and iteration count over the transition. The solve is
-        warm-started by the previous substep's displacement, which changes only
-        the iteration count and not the fixed point."""
+        residual and iteration count. The solve is warm-started by the previous
+        displacement, which changes only the iteration count, not the fixed point."""
         h = step_size.unsqueeze(-1)                        # (N, 1)
-        eta0 = state.q
-        L0 = state.local
-        g0 = state.grad_V
-        pi0 = state.pi
-        eps0, W0, chol_G0 = L0.eps, L0.W, L0.chol_G
+        eta0, pi0, g0 = state.q, state.p, state.grad_V
+        psi0, W0 = state.psi, state.W
+        chol_G0 = state.metric.L
+        beta_col = self._beta_col()
 
         rhs = h * pi0 - 0.5 * h * h * g0
         eta_init = eta0 if state.deta is None else eta0 + state.deta
         eta1, iters, residual = _solve_position(
-            self.constraint, eta0, eps0, W0, chol_G0, rhs, eta_init,
+            self.constraint, eta0, psi0, W0, beta_col, chol_G0, rhs, eta_init,
             self._solver, self._fp_max_iter, self._fp_tol)
 
-        # A diverged chain (non-finite η1, residual over tol) is rejected by
-        # acceptance_delta. Fall its position back to η0 so the endpoint eval
-        # stays finite and never crashes the batch.
+        # A diverged chain (non-finite η1) is rejected by acceptance_delta. Fall
+        # its position back to η0 so the model eval stays finite.
         finite = torch.isfinite(eta1).all(-1, keepdim=True)
         eta1 = torch.where(finite, eta1, eta0)
-        L1, g1 = self.constraint.endpoint(eta1)
-        eps1, W1 = L1.eps, L1.W
-        W1t_de = (W1.transpose(-2, -1) @ (eps1 - eps0).unsqueeze(-1)).squeeze(-1)
-        pi1 = ((eta1 - eta0) - W1t_de) / h - 0.5 * h * g1
+        U1, metric1, psi1, W1, g1 = self.evaluate_model(eta1, grad=True)
+
+        corr = (W1.transpose(-2, -1) @ (psi1 - psi0).unsqueeze(-1)).squeeze(-1)
+        pi1 = ((eta1 - eta0) - beta_col * corr) / h - 0.5 * h * g1
 
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters = torch.maximum(self._step_iters, iters.to(h.dtype))
-        return ChartRATTLEState(eta1, pi1, L1, g1, deta=(eta1 - eta0),
-                                U=_LikPotential(self._u_lik(eps1)))
+        return ChartRATTLEState(eta1, pi1, U1, metric1, psi1, W1, g1,
+                                deta=(eta1 - eta0))
 
     def acceptance_delta(self, new, old):
-        """``delta_H = H(new) − H(old)``, forced to +inf where the position solve
-        did not converge (max residual over ``fp_tol``, or non-finite)."""
-        H_new = _chart_hamiltonian(new.local, new.pi)
-        H_old = _chart_hamiltonian(old.local, old.pi)
+        """``delta_H = H(new) − H(old)`` with RMHMC's Hamiltonian, forced to +inf
+        where the position solve did not converge (residual over ``fp_tol``, or
+        non-finite)."""
+        H_new = _hamiltonian(new.q, new.p, new.U.value, new.metric)
+        H_old = _hamiltonian(old.q, old.p, old.U.value, old.metric)
         delta = H_new - H_old
 
         self._residual_sum = self._residual_sum + self._step_residual
@@ -576,25 +481,16 @@ class ChartRATTLE(HamiltonianSampler):
         self._fp_iters_sum = self._fp_iters_sum + self._step_iters
         self._fp_iters_max = torch.maximum(self._fp_iters_max, self._step_iters)
 
-        # ``~(res <= tol)`` also flags a non-finite residual as failed.
         solve_failed = ~(self._step_residual <= self._fp_tol)
         return torch.where(solve_failed, delta.new_full((), float("inf")), delta)
 
     def adapt(self, accept_prob, delta_H):
         """REINFORCE step-size adaptation from this transition's energy error and
-        worst solver residual and iteration count. The ``exp(-w|delta_H|)`` term
+        worst solver residual and iteration count. The ``exp(-4|delta_H|)`` term
         brakes the step as the energy error grows, so from a small start the step
-        settles below the solver-convergence cliff rather than running away.
-
-        The energy weight ``w`` is heavier than RMHMC's ``w = 1`` because the
-        chart solve stays cheap (Anderson keeps the iteration count low even as
-        the step grows), so the throughput reward would otherwise push the step
-        past the divergence edge before the brake engages. ``w = 4`` settles the
-        funnel near 0.99 acceptance with no divergences.
-
-        A diverged trajectory leaves a non-finite residual (the step is already
-        rejected). Charging it zero efficiency, so maximum finite cost, points the
-        step down instead of poisoning the adapter with a non-finite update."""
+        settles below the solver-convergence cliff rather than running away. A
+        diverged step leaves a non-finite residual (already rejected); charging it
+        zero efficiency points the step down instead of poisoning the adapter."""
         floor = 1.0e-3
         energy_weight = 4.0
         num_iters = self._step_iters

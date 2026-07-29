@@ -1,45 +1,39 @@
-"""Constraint-layer tests for ChartRATTLE.
+"""Constraint / evaluate_model tests for ChartRATTLE.
 
-The chart geometry and potential rest on the inverse map ψ(η) = φ_η⁻¹(x). Here
-we check, against closed forms, that:
+The geometry and potential rest on the inverse map ψ(η) = φ_η⁻¹(x). evaluate_model
+turns a constraint into the RMHMC-shaped pieces (U a TemperedAffine, G_M a
+TemperedMetric). Here we check, against closed forms, that:
 
-1. The metric G_M = I + Wᵀ W and its Cholesky are what the endpoint returns.
-2. The explicit-Jacobian fast path (psi_with_jvp overridden) agrees with the
-   classic-autograd default (W by reverse pass, ∇V by autograd.grad).
-3. ∇V matches an independent finite difference of V.
-4. The chart target reproduces the closed-form posterior: for the funnel,
-   V − ½ log det G_M equals −log p(η | x) up to a constant, and for an affine
-   map the induced posterior is the exact Gaussian.
-5. The endpoint bundle is detached (no autograd graph pinned).
+1. G_M = I + β Wᵀ W and its Cholesky are what evaluate_model returns.
+2. The explicit-Jacobian fast path agrees with the classic-autograd W, and ∇V
+   matches a finite difference.
+3. The potential U.value is exactly −log p(η | x): the funnel posterior, the
+   affine Gaussian, and the β-tempered funnel.
+4. U.lik = ½‖ψ‖² is the temperature-free swap statistic.
+5. The returned pieces are detached (no autograd graph pinned).
 """
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import ChartConstraint, LocationScaleChart
+from muMCMC.ChartRATTLE import ChartRATTLE, ChartConstraint, LocationScaleChart
+from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)
 
 
-# ---- explicit-Jacobian test constraints ---------------------------------- #
-
 class FunnelChart(ChartConstraint):
-    """Neal funnel x = e^{σ η / 2} ε with η ~ N(0, 1). Closed-form geometry:
-    ψ_β = √β e^{−σ η / 2} x, W = (σ/2) ψ_β, log|det B| = (m/2)(σ η − log β).
-    Tempering divides the covariance by β."""
+    """Neal funnel x = e^{σ η / 2} ε with η ~ N(0, 1). ψ = e^{−σ η / 2} x,
+    W = (σ/2) ψ, log|det B| = (m/2) σ η. Temperature-free."""
 
-    def __init__(self, sigma, x, beta=1.0):
-        super().__init__(x, beta)
+    def __init__(self, sigma, x):
+        super().__init__(x)
         self.s = sigma
 
-    def _sqrt_beta(self):
-        b = self.beta
-        return b.sqrt().reshape(-1, 1) if (torch.is_tensor(b) and b.ndim > 0) else float(b) ** 0.5
-
     def psi(self, eta):
-        return self._sqrt_beta() * torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
 
     def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]     # untempered, no β-normalizer
+        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
 
     def psi_with_jvp(self, eta):
         eps = self.psi(eta)
@@ -53,12 +47,12 @@ class AffineChart(ChartConstraint):
     def __init__(self, A, B, c, x):
         super().__init__(x)
         Binv = torch.linalg.inv(B)
-        self.W_const = Binv @ A                      # (m, n)
-        self.d = Binv @ (x - c)                      # (m,)
+        self.W_const = Binv @ A
+        self.d = Binv @ (x - c)
         self.ldB = torch.linalg.slogdet(B).logabsdet
 
     def psi(self, eta):
-        return self.d - eta @ self.W_const.transpose(-2, -1)   # (N, m)
+        return self.d - eta @ self.W_const.transpose(-2, -1)
 
     def log_abs_det_B(self, eta):
         return self.ldB.expand(eta.shape[0])
@@ -68,12 +62,20 @@ class AffineChart(ChartConstraint):
         return self.psi(eta), self.W_const.expand(N, *self.W_const.shape), self.log_abs_det_B(eta)
 
     def posterior(self):
-        """Exact N(μ, Σ) of the η-marginal: Σ = (I + WᵀW)⁻¹, μ = Σ Wᵀ d."""
         n = self.W_const.shape[-1]
         G = torch.eye(n) + self.W_const.transpose(-2, -1) @ self.W_const
         Sigma = torch.linalg.inv(G)
         mu = Sigma @ (self.W_const.transpose(-2, -1) @ self.d)
         return mu, Sigma
+
+
+def _eval(constraint, eta, beta=1.0, grad=True):
+    """evaluate_model through a minimal sampler at the given temperature."""
+    n = eta.shape[-1]
+    s = ChartRATTLE(constraint, UnconstrainedSpace([f"v{i}" for i in range(n)]),
+                    step_size=0.1, adapt_step_size=False)
+    s.beta = beta
+    return s.evaluate_model(eta, grad=grad)
 
 
 def _funnel_pair(sigma=3.0, m=5, seed=0):
@@ -91,10 +93,20 @@ def _funnel_pair(sigma=3.0, m=5, seed=0):
 def test_metric_is_identity_plus_gram_and_cholesky_matches():
     c, _, _ = _funnel_pair()
     eta = torch.randn(6, 1)
-    local, _ = c.endpoint(eta)
+    _, metric, _, W = _eval(c, eta, grad=False)
     n = eta.shape[-1]
-    G = torch.eye(n) + local.W.transpose(-2, -1) @ local.W
-    assert torch.allclose(local.chol_G @ local.chol_G.transpose(-2, -1), G, atol=1e-10)
+    G = torch.eye(n) + W.transpose(-2, -1) @ W                # beta = 1
+    assert torch.allclose(metric.value, G, atol=1e-10)
+    assert torch.allclose(metric.L @ metric.L.transpose(-2, -1), G, atol=1e-10)
+
+
+def test_metric_scales_with_beta():
+    c, _, _ = _funnel_pair()
+    eta = torch.randn(4, 1)
+    _, m1, _, W = _eval(c, eta, beta=1.0, grad=False)
+    _, mb, _, _ = _eval(c, eta, beta=0.3, grad=False)
+    n = eta.shape[-1]
+    assert torch.allclose(mb.value, torch.eye(n) + 0.3 * W.transpose(-2, -1) @ W, atol=1e-10)
 
 
 # ========================================================================== #
@@ -102,29 +114,16 @@ def test_metric_is_identity_plus_gram_and_cholesky_matches():
 # ========================================================================== #
 
 def test_explicit_jacobian_matches_autograd_default():
-    # Same funnel through the explicit psi_with_jvp and through the
-    # classic-autograd W (LocationScaleChart). W, V and ∇V must agree.
+    # Same funnel through explicit psi_with_jvp and through the classic-autograd
+    # W (LocationScaleChart). W, U and ∇V must agree.
     fun, ls, _ = _funnel_pair()
     eta = torch.randn(8, 1)
-    lf, gf = fun.endpoint(eta)
-    ll, gl = ls.endpoint(eta)
-    assert torch.allclose(lf.W, ll.W, atol=1e-9)
-    assert torch.allclose(lf.V, ll.V, atol=1e-9)
+    Uf, mf, _, Wf, gf = _eval(fun, eta)
+    Ul, ml, _, Wl, gl = _eval(ls, eta)
+    assert torch.allclose(Wf, Wl, atol=1e-9)
+    assert torch.allclose(Uf.value, Ul.value, atol=1e-9)
     assert torch.allclose(gf, gl, atol=1e-8)
 
-
-def test_autograd_W_matches_analytic_funnel():
-    # The autograd default recovers W = (σ/2) ψ exactly.
-    fun, ls, _ = _funnel_pair()
-    eta = torch.randn(5, 1)
-    local, _ = ls.endpoint(eta)
-    W_ana = (fun.s / 2.0) * fun.psi(eta).unsqueeze(-1)
-    assert torch.allclose(local.W, W_ana, atol=1e-9)
-
-
-# ========================================================================== #
-#  3. ∇V against finite differences                                         #
-# ========================================================================== #
 
 def test_grad_V_matches_finite_difference():
     torch.manual_seed(1)
@@ -133,38 +132,36 @@ def test_grad_V_matches_finite_difference():
     B = B @ B.transpose(-2, -1)                       # SPD, so det > 0
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
     eta = torch.randn(3, 2)
-    _, gV = c.endpoint(eta)
+    _, _, _, _, gV = _eval(c, eta)
 
+    def V(e):
+        U, metric, _, _ = _eval(c, e, grad=False)
+        return U.value + 0.5 * metric.log_det_metric()
     h = 1e-6
     gfd = torch.zeros_like(eta)
     for j in range(eta.shape[-1]):
         ep = eta.clone(); ep[:, j] += h
         em = eta.clone(); em[:, j] -= h
-        gfd[:, j] = (c.endpoint(ep)[0].V - c.endpoint(em)[0].V) / (2 * h)
+        gfd[:, j] = (V(ep) - V(em)) / (2 * h)
     assert torch.allclose(gV, gfd, atol=1e-6)
 
 
 # ========================================================================== #
-#  4. Chart target reproduces the closed-form posterior                     #
+#  3. The potential is exactly −log p(η | x)                                #
 # ========================================================================== #
 
-def test_chart_target_matches_funnel_posterior():
-    # V − ½ log det G_M is −log p(η | x) up to an additive constant.
+def test_potential_matches_funnel_posterior():
     fun, _, x = _funnel_pair(sigma=3.0, m=6, seed=2)
     eta = torch.randn(50, 1)
-    local, _ = fun.endpoint(eta)
-    half_logdet_G = torch.log(local.chol_G.diagonal(dim1=-2, dim2=-1)).sum(-1)
-    lhs = local.V - half_logdet_G
-
+    U, _, _, _ = _eval(fun, eta, grad=False)
     e = eta[:, 0]
     neg_log_post = 0.5 * e * e + 0.5 * torch.exp(-fun.s * e) * (x * x).sum() \
         + 0.5 * x.shape[-1] * fun.s * e
-    assert torch.allclose(lhs - lhs.mean(), neg_log_post - neg_log_post.mean(), atol=1e-9)
+    assert torch.allclose(U.value - U.value.mean(),
+                          neg_log_post - neg_log_post.mean(), atol=1e-9)
 
 
-def test_affine_target_is_the_exact_gaussian():
-    # For an affine map the η-marginal is Gaussian. Check that the chart target
-    # exp(−V) √det G_M has that Gaussian's log-density up to a constant.
+def test_potential_is_the_exact_affine_gaussian():
     torch.manual_seed(3)
     A = torch.randn(5, 2)
     B = torch.eye(5) + 0.2 * torch.randn(5, 5)
@@ -174,13 +171,36 @@ def test_affine_target_is_the_exact_gaussian():
     prec = torch.linalg.inv(Sigma)
 
     eta = torch.randn(40, 2)
-    local, _ = c.endpoint(eta)
-    half_logdet_G = torch.log(local.chol_G.diagonal(dim1=-2, dim2=-1)).sum(-1)
-    log_target = -(local.V - half_logdet_G)          # log exp(−V) √det G_M
+    U, _, _, _ = _eval(c, eta, grad=False)
     d = eta - mu
-    log_gauss = -0.5 * torch.einsum("ni,ij,nj->n", d, prec, d)
-    assert torch.allclose(log_target - log_target.mean(),
-                          log_gauss - log_gauss.mean(), atol=1e-9)
+    neg_log_gauss = 0.5 * torch.einsum("ni,ij,nj->n", d, prec, d)
+    assert torch.allclose(U.value - U.value.mean(),
+                          neg_log_gauss - neg_log_gauss.mean(), atol=1e-9)
+
+
+def test_beta_tempers_the_data_fit_only():
+    # U.value = base + β·½‖ψ‖²: the Mahalanobis is scaled by β, the base (prior +
+    # log|det B|) is not, matching the β-tempered funnel posterior.
+    fun, _, x = _funnel_pair(sigma=3.0, m=6, seed=2)
+    eta = torch.randn(30, 1)
+    U, _, _, _ = _eval(fun, eta, beta=0.4, grad=False)
+    e = eta[:, 0]
+    neg_log_post = 0.5 * e * e + 0.5 * x.shape[-1] * fun.s * e \
+        + 0.4 * 0.5 * torch.exp(-fun.s * e) * (x * x).sum()
+    assert torch.allclose(U.value, neg_log_post, atol=1e-9)
+
+
+# ========================================================================== #
+#  4. U.lik: temperature-free swap statistic                                #
+# ========================================================================== #
+
+def test_u_lik_is_half_psi_squared_and_temperature_free():
+    fun, _, _ = _funnel_pair(sigma=3.0, m=5, seed=6)
+    eta = torch.randn(8, 1)
+    U1, _, psi, _ = _eval(fun, eta, beta=1.0, grad=False)
+    Ub, _, _, _ = _eval(fun, eta, beta=0.2, grad=False)
+    assert torch.allclose(U1.lik, 0.5 * (psi ** 2).sum(-1), atol=1e-10)
+    assert torch.allclose(U1.lik, Ub.lik, atol=1e-10)     # β-free
 
 
 def test_location_scale_log_abs_det_B_is_half_logdet_sigma():
@@ -192,50 +212,12 @@ def test_location_scale_log_abs_det_B_is_half_logdet_sigma():
 
 
 # ========================================================================== #
-#  5. Endpoint bundle carries no autograd graph                             #
+#  5. Detached                                                              #
 # ========================================================================== #
 
-def test_endpoint_bundle_is_detached():
+def test_evaluate_model_output_is_detached():
     _, ls, _ = _funnel_pair()
     eta = torch.randn(4, 1)
-    local, gV = ls.endpoint(eta)
-    for t in (local.eps, local.W, local.chol_G, local.V, gV):
+    U, metric, psi, W, gV = _eval(ls, eta)
+    for t in (U.value, U.lik, metric.value, metric.L, psi, W, gV):
         assert not t.requires_grad
-
-
-# ========================================================================== #
-#  6. Tempering: covariance scaling and the temperature-free U_lik           #
-# ========================================================================== #
-
-def test_covariance_scaling_tempers_the_target():
-    # beta scales Sigma -> Sigma/beta. The chart target's beta-dependence is
-    # exp(-beta * 1/2 ||psi_1||^2), so V - 1/2 logdet G_M matches
-    # 1/2||eta||^2 + 1/2 logdet Sigma + beta * 1/2 (x-mu)^T Sigma^{-1}(x-mu).
-    torch.manual_seed(5)
-    x = torch.randn(6)
-    sigma = 3.0
-    fun = FunnelChart(sigma, x)
-    eta = torch.randn(30, 1)
-    fun.beta = 0.4
-    local, _ = fun.endpoint(eta)
-    half_logdet_G = torch.log(local.chol_G.diagonal(dim1=-2, dim2=-1)).sum(-1)
-    lhs = local.V - half_logdet_G
-    e = eta[:, 0]
-    neg_log_post = (0.5 * e * e + 0.5 * 6 * sigma * e
-                    + fun.beta * 0.5 * torch.exp(-sigma * e) * (x * x).sum())
-    assert torch.allclose(lhs - lhs.mean(), neg_log_post - neg_log_post.mean(), atol=1e-9)
-
-
-def test_u_lik_is_temperature_free():
-    # U_lik = 1/2 ||psi_beta||^2 / beta = 1/2 ||psi_1||^2 is the same function of
-    # eta at every temperature, so parallel-tempering swaps are valid.
-    torch.manual_seed(6)
-    fun = FunnelChart(3.0, torch.randn(5))
-    eta = torch.randn(8, 1)
-    uliks = []
-    for beta in (1.0, 0.5, 0.1):
-        fun.beta = beta
-        local, _ = fun.endpoint(eta)
-        uliks.append(0.5 * (local.eps ** 2).sum(-1) / beta)
-    assert torch.allclose(uliks[0], uliks[1], atol=1e-10)
-    assert torch.allclose(uliks[0], uliks[2], atol=1e-10)
