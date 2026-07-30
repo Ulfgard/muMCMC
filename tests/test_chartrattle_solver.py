@@ -59,10 +59,16 @@ class AffineChart(ChartConstraint):
         return self.psi(eta), self.W_const.expand(N, *self.W_const.shape), self.log_abs_det_B(eta)
 
 
-def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
+def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_metric_fn=None, **kw):
     torch.manual_seed(seed)
     c = FunnelChart(sigma, torch.randn(m))
-    return ChartRATTLE(c, UnconstrainedSpace(["v"]), adapt_step_size=False, **kw)
+    space = UnconstrainedSpace(["v"], prior_metric_fn=prior_metric_fn)
+    return ChartRATTLE(c, space, adapt_step_size=False, **kw)
+
+
+def _scaled_metric(scale, n):
+    """A constant prior metric ``scale * I``, the shape a Gaussian prior has."""
+    return lambda th: scale * torch.eye(n).expand(th.shape[0], n, n)
 
 
 def _affine_sampler(n=2, m=5, seed=0, **kw):
@@ -144,13 +150,20 @@ def test_step_is_time_reversible(h):
     assert torch.allclose(back.p, -st.p, atol=1e-9)
 
 
-def test_step_preserves_volume_and_symplectic_form():
+@pytest.mark.parametrize("prior_metric_fn", [
+    None,
+    lambda th: torch.diag(torch.tensor([4.0, 0.25])).expand(th.shape[0], 2, 2),
+])
+def test_step_preserves_volume_and_symplectic_form(prior_metric_fn):
     # The step is the variational integrator of the discrete Lagrangian
-    #   S_h(q0,q1) = ||q1-q0||^2/(2h) + beta||psi1-psi0||^2/(2h) - (h/2)[V0+V1],
-    # so it is symplectic: M^T Omega M = Omega, hence det M = 1. That volume
+    #   S_h(q0,q1) = (q1-q0)^T M (q1-q0)/(2h) + beta||psi1-psi0||^2/(2h)
+    #                - (h/2)[V0+V1],
+    # so it is symplectic: J^T Omega J = Omega, hence det J = 1. That volume
     # property is the half of Metropolis exactness reversibility does not give,
-    # so it is worth pinning independently. Finite differences, since the step
-    # detaches and autograd cannot see through it.
+    # so it is worth pinning independently. Running it with an anisotropic M too
+    # checks that M reached every place it belongs, since a mismatch between the
+    # metric and the kinetic term would break the identity. Finite differences,
+    # since the step detaches and autograd cannot see through it.
     n, m, h = 2, 3, 0.3
     torch.manual_seed(11)
     A = 0.7 * torch.randn(m, n)
@@ -161,9 +174,11 @@ def test_step_preserves_volume_and_symplectic_form():
     chart = LocationScaleChart(lambda q: torch.tanh(q @ A.transpose(-2, -1)),
                                lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
                                torch.randn(m))
-    s = ChartRATTLE(chart, UnconstrainedSpace([f"v{i}" for i in range(n)]),
-                    step_size=h, num_steps=1, adapt_step_size=False,
-                    solver="anderson", fp_tol=1e-14, fp_max_iter=500)
+    space = UnconstrainedSpace([f"v{i}" for i in range(n)],
+                               prior_metric_fn=prior_metric_fn)
+    s = ChartRATTLE(chart, space, step_size=h, num_steps=1,
+                    adapt_step_size=False, solver="anderson",
+                    fp_tol=1e-14, fp_max_iter=500)
     s.init(torch.zeros(1, n))                     # seeds the solver diagnostics
 
     def step_map(z):
@@ -173,15 +188,15 @@ def test_step_preserves_volume_and_symplectic_form():
 
     z0 = torch.cat([torch.randn(n), torch.randn(n)])
     d = 1e-6
-    M = torch.stack([(step_map(z0 + d * e) - step_map(z0 - d * e)) / (2 * d)
+    J = torch.stack([(step_map(z0 + d * e) - step_map(z0 - d * e)) / (2 * d)
                      for e in torch.eye(2 * n)], dim=1)
 
     Omega = torch.zeros(2 * n, 2 * n)
     Omega[:n, n:] = torch.eye(n)
     Omega[n:, :n] = -torch.eye(n)
 
-    assert abs(float(torch.det(M)) - 1.0) < 1e-6                        # volume
-    assert float((M.T @ Omega @ M - Omega).abs().max()) < 1e-6          # symplectic
+    assert abs(float(torch.det(J)) - 1.0) < 1e-6                        # volume
+    assert float((J.T @ Omega @ J - Omega).abs().max()) < 1e-6          # symplectic
 
 
 def test_affine_step_is_time_reversible():
@@ -199,18 +214,40 @@ def test_affine_step_is_time_reversible():
 #  4. Anderson and Picard reach the same endpoint                           #
 # ========================================================================== #
 
-def test_anderson_matches_picard_endpoint():
-    def run(solver):
-        s = _funnel_sampler(step_size=0.3, num_steps=1, solver=solver,
+@pytest.mark.parametrize("solver", ["anderson", "newton"])
+def test_solvers_match_the_picard_endpoint(solver):
+    # All three rules solve the same position equation, so the endpoint is the
+    # solver's business only through the iteration count.
+    def run(kind):
+        s = _funnel_sampler(step_size=0.3, num_steps=1, solver=kind,
                             fp_tol=1e-12, fp_max_iter=300)
         torch.manual_seed(5)
         st = _seed_state(s, torch.randn(6, 1))
         out = s.integrate(st, torch.full((6,), 0.3))
         return out.q, out.p
     qp, pp = run("picard")
-    qa, pa = run("anderson")
-    assert torch.allclose(qa, qp, atol=1e-9)
-    assert torch.allclose(pa, pp, atol=1e-9)
+    qs, ps = run(solver)
+    assert torch.allclose(qs, qp, atol=1e-9)
+    assert torch.allclose(ps, pp, atol=1e-9)
+
+
+@pytest.mark.parametrize("solver", ["picard", "anderson", "newton"])
+def test_a_prior_metric_keeps_the_step_reversible(solver):
+    # With a constant prior metric M the discrete Lagrangian measures the q
+    # block by M, so F, the momentum line and G_M all carry it. If they had not
+    # moved together the step would stop being self-adjoint.
+    h = 0.3
+    s = _funnel_sampler(step_size=h, num_steps=1, solver=solver, fp_tol=1e-12,
+                        fp_max_iter=300, prior_metric_fn=_scaled_metric(7.0, 1))
+    torch.manual_seed(31)
+    st = _seed_state(s, torch.randn(5, 1))
+    hh = torch.full((5,), h)
+    assert torch.allclose(s.prior_metric(st.q), 7.0 * torch.eye(1))
+
+    fwd = s.integrate(_restart(st, st.q.clone(), st.p.clone()), hh)
+    back = s.integrate(_restart(fwd, fwd.q.clone(), -fwd.p.clone()), hh)
+    assert torch.allclose(back.q, st.q, atol=1e-9)
+    assert torch.allclose(back.p, -st.p, atol=1e-9)
 
 
 # ========================================================================== #

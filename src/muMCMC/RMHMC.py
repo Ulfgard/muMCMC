@@ -6,6 +6,7 @@ import math
 from .HamiltonianSampler import HamiltonianSampler
 from .spaces import TemperedMetric
 from .adapters import Reinforce, NoAdaptation
+from .solvers import FixedPointSolver
 
 # =========================================================================== #
 #                                                                             #
@@ -99,229 +100,41 @@ def _midpoint_map(
     return F_q, F_p
 
 
-#  ---- Fixed-point update rules -------------------------------------------  #
-#
-# An updater turns the current iterate/residual pair (z_k, r_k) into the next
-# proposal z_{k+1}.  ``r_k`` is the fixed-point residual z_k − F(z_k), so
-# ``F(z_k) = z_k − r_k`` and the Anderson residual (Walker & Ni's notation) is
-# ``f_k = F(z_k) − z_k = −r_k``.  A fresh updater is built per solve, so any
-# internal history it keeps is scoped to a single solve. An updater may carry a
-# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(q0)⁻¹ for
-# the ChartRATTLE position solve, absent for the RMHMC midpoint solve).
-#
-# Relaxed Picard (β < 1) pulls the iteration eigenvalues (β − 1) + β λ toward
-# (1 − β) on the real axis, taming the near-imaginary spectrum of the
-# implicit-midpoint map and trading convergence speed for stability.
-#
-# Anderson(m) (Walker & Ni 2011, Type-II) stacks the last m iterate/residual
-# differences and solves a small per-chain least squares.  On a linear map
-# Anderson(m ≥ 1) reaches the fixed point in one accelerated step. On the true
-# nonlinear map it typically converges in fewer iterations than Picard,
-# trading extra model evals for a cheap m×m solve.  β enters only the final
-# combination, not the γ least squares, whose conditioning is kept well-posed
-# by a scale-aware Tikhonov floor.
-
-class _PicardUpdate:
-    """Relaxed Picard iteration: z_{k+1} = z_k − β P r_k = (1−β) z_k + β F(z_k)
-    when P = I.
-
-    Stateless.
-
-    Parameters
-    ----------
-    beta : float
-        Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
-    precond : callable or None
-        Preconditioner P applied to the residual before the step. Default None
-        (P = I).
-    """
-
-    def __init__(self, beta=1.0, precond=None):
-        self.beta = float(beta)
-        self._precond = precond
-
-    def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions. ``precond`` overrides
-        the preconditioner. Omitted, this updater's own is carried over."""
-        return _PicardUpdate(self.beta, self._precond if precond is None else precond)
-
-    def propose(self, z, r):
-        if self._precond is not None:
-            r = self._precond(r)
-        return z - self.beta * r
-
-    def damped(self, factor):
-        """Copy with β scaled by ``factor``, same preconditioner (fallback
-        ladder)."""
-        return _PicardUpdate(self.beta * factor, self._precond)
-
-
-class _AndersonUpdate:
-    """Anderson(m) acceleration (Type-II, damping β) of the fixed-point map.
-
-    With f_k = F(z_k) − z_k = −r_k and the last ``m`` iterate/residual
-    differences stacked column-wise as ΔZ, ΔF, solve the per-chain least
-    squares γ = argmin ‖f_k − ΔF γ‖ and take
-
-        z_{k+1} = z_k + β f_k − (ΔZ + β ΔF) γ.
-
-    Parameters
-    ----------
-    history : int or None
-        History length ``m`` (past differences retained), ≥ 1, or None to
-        resolve to dim(q) when ``new`` is called.
-    beta : float
-        Under-relaxation factor in (0, 1]. Default 1.0 (undamped).
-    precond : callable or None
-        Preconditioner P applied to the residual before the step. Default None
-        (P = I).
-    """
-
-    # Relative / absolute Tikhonov floors for the least-squares solve.
-    reg_rel = 1e-10
-    reg_abs = 1e-14
-
-    def __init__(self, history=None, beta=1.0, precond=None):
-        self.history = history      # int, or None to resolve to dim(q) in new()
-        self.beta = float(beta)
-        self._precond = precond
-        self._Z = []   # committed iterates z_k        (each (N, 2d))
-        self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
-
-    def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions, resolving a None
-        ``history`` to ``d``. ``precond`` overrides the preconditioner. Omitted,
-        this updater's own is carried over."""
-        return _AndersonUpdate(
-            d if self.history is None else self.history, self.beta,
-            self._precond if precond is None else precond)
-
-    def propose(self, z, r):
-        if self._precond is not None:
-            r = self._precond(r)
-        self._Z.append(z)
-        self._F.append(-r)
-        if len(self._Z) > self.history + 1:    # keep at most `history` differences
-            self._Z.pop(0)
-            self._F.pop(0)
-
-        f_k = self._F[-1]                       # (N, 2d)
-        if len(self._Z) == 1:                   # no history yet: damped Picard step
-            return z + self.beta * f_k
-
-        dZ = torch.stack([self._Z[j] - self._Z[j - 1]
-                          for j in range(1, len(self._Z))], dim=-1)   # (N, 2d, mk)
-        dF = torch.stack([self._F[j] - self._F[j - 1]
-                          for j in range(1, len(self._F))], dim=-1)   # (N, 2d, mk)
-
-        N, _, mk = dF.shape
-        # Scale-aware Tikhonov floor for (near-)collinear or zero ΔF columns.
-        scale = (dF * dF).sum(-2).mean(-1)                # (N,) mean ‖ΔF_j‖²
-        reg   = self.reg_rel * scale + self.reg_abs       # (N,)
-        # Solve the damped least squares by QR on the stacked [ΔF; √reg·I], not
-        # the normal equations ΔFᵀΔF whose squared condition number overflows
-        # float64 at a stiff metric's column spread (collapsing Anderson).
-        eye   = torch.eye(mk, dtype=dF.dtype, device=dF.device)
-        A_aug = torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
-        b_aug = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(N, mk, 1)], dim=-2)
-        Q, R  = torch.linalg.qr(A_aug)
-        gamma = torch.linalg.solve_triangular(
-            R, Q.transpose(-2, -1) @ b_aug, upper=True)    # (N, mk, 1)
-
-        z_next = z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
-        return z_next
-
-    def damped(self, factor):
-        """Copy with β scaled by ``factor``, same history and preconditioner
-        (fallback ladder)."""
-        return _AndersonUpdate(self.history, self.beta * factor, self._precond)
-
-
 #  ---- Implicit midpoint step ---------------------------------------------  #
 
-def _fixed_point_solve(residual_fn, z_init, updater, max_iter, tol):
-    """Find ``z`` with ``residual_fn(z) = 0``, batched over chains, by
-    fixed-point iteration from ``z_init``. Each step the ``updater`` reads the
-    current iterate and its residual and returns the next iterate (relaxed
-    Picard or Anderson acceleration, optionally preconditioned). A chain stops
-    once its residual max-norm drops below ``tol``, or when it diverges. Returns
-    the solution, the per-chain iteration count, and the final residual max-norm.
+def _implicit_midpoint_step(q, p, eps, evaluate_model, solver, z_init=None):
+    """Solve RMHMC's implicit-midpoint equation z = F(z) for the step endpoint
+    z = (q_out, p_out), with F the midpoint map in :func:`_midpoint_map`.
 
-    ``residual_fn(z)`` returns the residual, one row per chain, detached from any
-    autograd graph."""
-    N = z_init.shape[0]
-    z = z_init
-    residual = residual_fn(z)
-    r0 = residual.abs().amax(-1)
+    Parameters
+    ----------
+    q, p : (N, d)
+        Start-of-step position and momentum.
+    eps : (N,)
+        Per-chain step size.
+    evaluate_model : callable
+        Maps q to (potential, metric).
+    solver : FixedPointSolver
+        Owns the update rule, the tolerance and the fallback ladder.
+    z_init : (N, 2d) or None
+        Warm start. None starts from ``(q, p)``, which is also where the fallback
+        ladder restarts.
 
-    done      = torch.zeros(N, dtype=torch.bool, device=z.device)
-    iters     = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
-    residual_norm = r0.clone()
-
-    for i in range(1, max_iter + 1):
-        z_next = updater.propose(z, residual)
-        residual_next = residual_fn(z_next)
-        r = residual_next.abs().amax(-1)
-
-        keep = done[..., None]
-        z = torch.where(keep, z, z_next)
-        residual = torch.where(keep, residual, residual_next)
-        residual_norm = torch.where(done, residual_norm, r)
-
-        # Divergence: non-finite, or grown far beyond the start (the tol
-        # conjunct spares a warm start whose residual began sub-tol).
-        diverged = ~done & (~torch.isfinite(r) | ((r > 1000.0 * r0) & (r > tol)))
-        done = done | diverged
-
-        converged = ~done & (residual_norm < tol)
-        iters = torch.where(converged, torch.full_like(iters, i), iters)
-        done = done | converged
-
-        if bool(done.all()):
-            break
-
-    return z.detach(), iters, residual_norm.detach()
-
-
-def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
-                            solver=None, fallback=(), z_init=None):
-    """Solve RMHMC's implicit-midpoint fixed-point equation z = F(z) for the
-    step endpoint z = (q_out, p_out), starting from ``(q, p)`` (F is the midpoint
-    map in :func:`_midpoint_map`). Returns the endpoint with the per-chain
-    iteration count and final residual.
-
-    ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
-    not converge are re-solved with progressively stronger under-relaxation.
-    Damping does not move the fixed point, so this resolves a stuck chain rather
-    than rejecting it. A rejection on forward-solve failure alone is not a
-    symmetric criterion, so the ladder makes that biased last resort rare.
-    ``z_init`` warm-starts the first solve. The fallback re-solves from
-    ``(q, p)``."""
+    Returns
+    -------
+    tuple
+        ``(q_out, p_out, iters, residual)``, the last two per chain.
+    """
     d = q.shape[-1]
-    base = solver if solver is not None else _PicardUpdate()
 
     def residual_fn(z):
         F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
         return z - torch.cat([F_q, F_p], dim=-1)
 
     trivial = torch.cat([q, p], dim=-1)
-    z, iters, residual = _fixed_point_solve(
-        residual_fn, trivial if z_init is None else z_init, base.new(d), max_iter, tol)
-    q_out, p_out = z[..., :d], z[..., d:]
-
-    for factor, fb_iter in fallback:
-        bad = residual > tol
-        if not bool(bad.any()):
-            break
-        zb, it_n, r_n = _fixed_point_solve(
-            residual_fn, trivial, base.damped(factor).new(d), fb_iter, tol)
-        commit   = bad.unsqueeze(-1)
-        q_out    = torch.where(commit, zb[..., :d], q_out)
-        p_out    = torch.where(commit, zb[..., d:], p_out)
-        iters    = torch.where(bad, iters + it_n, iters)   # honest cost, bad chains only
-        residual = torch.where(bad, r_n, residual)
-
-    return q_out, p_out, iters, residual
+    z, iters, residual = solver.solve(
+        residual_fn, trivial if z_init is None else z_init, cold_start=trivial)
+    return z[..., :d], z[..., d:], iters, residual
 
 
 # =========================================================================== #
@@ -442,11 +255,14 @@ class RMHMC(HamiltonianSampler):
     fp_tol : float
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
-        Fixed-point solver: ``"picard"`` (default) or ``"anderson"``.
+        Fixed-point solver: ``"picard"`` (default) or ``"anderson"``. Newton is
+        rejected here, since the midpoint residual's Jacobian carries second
+        derivatives of the metric.
     anderson_history : int or None
         History length ``m`` for the Anderson solver (ignored for Picard).
-        ``None`` (default) resolves per-solve to ``dim(q)``. Must be ≥ 1 if
-        given.
+        ``None`` (default) resolves per-solve to the dimension of the solve,
+        which here is ``2 dim(q)`` since the unknown is the endpoint ``(q, p)``.
+        Must be at least 1 if given.
     damping : float
         Under-relaxation factor β ∈ (0, 1] shared by both solvers.
         Default 1.0 (undamped).
@@ -499,26 +315,16 @@ class RMHMC(HamiltonianSampler):
         step_normalization: str = None,
         divergence_threshold: float = 100.0
     ):
-        # Resolve the string choice into a configured solver.
-        if not 0.0 < damping <= 1.0:
-            raise ValueError(f"damping must be in (0, 1], got {damping}")
-        if solver == "picard":
-            self._solver = _PicardUpdate(damping)
-        elif solver == "anderson":
-            if anderson_history is not None and anderson_history < 1:
-                raise ValueError(
-                    f"anderson_history must be >= 1, got {anderson_history}")
-            self._solver = _AndersonUpdate(anderson_history, damping)
-        else:
+        self._solver = FixedPointSolver(
+            solver, damping=damping, anderson_history=anderson_history,
+            max_iter=fp_max_iter, tol=fp_tol,
+            fallback_damping=fallback_damping,
+            fallback_iter_scale=fallback_iter_scale)
+        if self._solver.needs_jacobian:
             raise ValueError(
-                f"unknown solver {solver!r}; expected 'picard' or 'anderson'")
-
-        # Fallback ladder: re-solve non-converged chains with stronger damping.
-        if any(not 0.0 < f < 1.0 for f in fallback_damping):
-            raise ValueError(
-                f"fallback_damping factors must be in (0, 1), got {fallback_damping}")
-        self._fallback = [(f, fallback_iter_scale * fp_max_iter)
-                          for f in fallback_damping]
+                f"solver {solver!r} needs the Jacobian of the midpoint residual, "
+                f"which carries second derivatives of the metric and is not "
+                f"available cheaply here. Use 'picard' or 'anderson'.")
 
         # The adapters work on the log step size, so step_size is its exponential.
         log_eps = math.log(step_size)
@@ -531,8 +337,7 @@ class RMHMC(HamiltonianSampler):
                          trajectory_length=num_steps * step_size,
                          step_normalization=step_normalization)
 
-        self._fp_max_iter = fp_max_iter
-        self._fp_tol      = fp_tol
+        self._fp_tol = fp_tol
 
         # Solver diagnostics. Each transition contributes its worst substep;
         # the means are then over transitions.
@@ -584,8 +389,7 @@ class RMHMC(HamiltonianSampler):
         else:
             z_init = z_start + 2.0 * state.dz - state.dz_prev   # quadratic
         q, p, fp_it, residual = _implicit_midpoint_step(
-            state.q, state.p, step_size, self.evaluate_model,
-            self._fp_max_iter, self._fp_tol, self._solver, self._fallback,
+            state.q, state.p, step_size, self.evaluate_model, self._solver,
             z_init=z_init)
         it = fp_it.to(step_size.dtype)
         self._step_residual = torch.maximum(self._step_residual, residual)

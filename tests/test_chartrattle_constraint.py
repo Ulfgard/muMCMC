@@ -218,14 +218,20 @@ def _prior_eval(constraint, eta, priors, beta=1.0, grad=True):
     return s.evaluate_model(eta, grad=grad)
 
 
+def _base_of(constraint, eta, priors):
+    """U.base at ``eta`` for a space carrying ``priors`` (None for no prior)."""
+    space = UnconstrainedSpace(["v0"], priors=priors)
+    s = ChartRATTLE(constraint, space, step_size=0.1, adapt_step_size=False)
+    return s.evaluate_model(eta, grad=False)[0].base
+
+
 def test_absent_prior_is_flat():
     # The prior always comes off the space, as for every other sampler, so a
-    # space without one contributes nothing rather than a standard normal.
+    # space without one contributes nothing rather than a standard normal. U.base
+    # is then the volume term alone.
     c, _, _ = _funnel_pair()
     eta = torch.randn(7, 1)
-    s = ChartRATTLE(c, UnconstrainedSpace(["v0"]), step_size=0.1,
-                    adapt_step_size=False)
-    assert torch.allclose(s.prior_potential(eta), torch.zeros(7))
+    assert torch.allclose(_base_of(c, eta, None), c.log_abs_det_B(eta), atol=1e-12)
 
 
 def test_standard_normal_prior_is_the_non_centered_latent():
@@ -233,10 +239,9 @@ def test_standard_normal_prior_is_the_non_centered_latent():
     # normalizer.
     c, _, _ = _funnel_pair()
     eta = torch.randn(7, 1)
-    s = ChartRATTLE(c, UnconstrainedSpace(["v0"], priors={"v0": _N01()}),
-                    step_size=0.1, adapt_step_size=False)
-    assert torch.allclose(s.prior_potential(eta),
-                          0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi))
+    expected = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
+                + c.log_abs_det_B(eta))
+    assert torch.allclose(_base_of(c, eta, {"v0": _N01()}), expected, atol=1e-12)
 
 
 def test_space_prior_replaces_the_standard_normal_in_U():

@@ -248,6 +248,13 @@ def test_logging_empty_before_steps_then_populated():
 
 def test_invalid_solver_raises():
     with pytest.raises(ValueError, match="unknown solver"):
+        make_sampler(solver="secant")
+
+
+def test_newton_is_rejected():
+    # The midpoint residual's Jacobian carries second derivatives of the metric,
+    # so RMHMC has no cheap one to hand the newton rule.
+    with pytest.raises(ValueError, match="Jacobian of the midpoint residual"):
         make_sampler(solver="newton")
 
 

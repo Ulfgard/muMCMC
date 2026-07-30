@@ -25,6 +25,7 @@ from .spaces import (
     transforms,
 )
 from .adapters import DualAveraging, Reinforce, NoAdaptation
+from .solvers import FixedPointSolver
 from .validation import PosteriorEvaluation
 
 __all__ = [
@@ -53,6 +54,7 @@ __all__ = [
     "DualAveraging",
     "Reinforce",
     "NoAdaptation",
+    "FixedPointSolver",
     "PosteriorEvaluation",
     "__version__",
 ]

@@ -6,7 +6,8 @@ import torch
 from .HamiltonianSampler import HamiltonianSampler
 from .adapters import Reinforce, NoAdaptation
 from .spaces import TemperedAffine, TemperedMetric, broadcast_beta
-from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_solve
+from .RMHMC import _hamiltonian
+from .solvers import FixedPointSolver
 
 # =========================================================================== #
 #                                                                             #
@@ -45,30 +46,37 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  That involves the ε block alone, so any prior p(q) on the chart coordinate #
 #  carries straight through and the target is e^{−U} with                     #
 #                                                                             #
-#      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = I + β Wᵀ W.        #
+#      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = M + β Wᵀ W,        #
+#                                                                             #
+#  with M the space's prior metric, or I when it has none.                    #
 #                                                                             #
 #  p(q) is the space's prior, read the same way every other sampler in the    #
 #  library reads it. A space with no prior gives a flat one, so the N(0, I)   #
 #  latent that the plain non-centered parameterization implies is requested   #
 #  by name rather than assumed.                                               #
 #                                                                             #
-#  The prior enters U and nothing else. G_M keeps its I whatever the prior    #
-#  is, and a space's prior_metric_fn is deliberately unused, because that I   #
-#  is not a free choice. The same matrix appears in five coupled places:      #
-#  A_prior in G_M, the (q1 − q0) term of F, the (q1 − q0) of the momentum     #
-#  line, the kinetic term of S_h, and DF(q0) which the solve preconditions    #
-#  with. They are one object. Replacing it in G_M alone leaves H no longer    #
-#  the integrator's invariant, and energy error grows by an order of          #
-#  magnitude for a five percent mismatch.                                     #
+#  M matters, and it is not a free choice. The same matrix appears in five    #
+#  coupled places: the prior block of G_M, the (q1 − q0) term of F, the       #
+#  (q1 − q0) of the momentum line, the kinetic term of S_h, and DF(q0) that   #
+#  the solve preconditions with. They are one object, so they move together   #
+#  or not at all. Changing it in G_M alone leaves H no longer the             #
+#  integrator's invariant: on the funnel, scaling it by 1.05 raises the worst #
+#  |ΔH| over a 20 step trajectory from 8.3e-4 to 8.0e-3.                      #
 #                                                                             #
-#  A constant prior metric could be substituted consistently, moving all five #
-#  together and leaving S_h variational. A position-dependent one cannot: S_h #
-#  would need A_prior at the midpoint to stay symmetric, F would pick up      #
-#  ∂A/∂q1 terms, and DF(q0) would stop being G_M(q0). Neither is implemented, #
-#  so the prior is not currently reflected in the preconditioning. That costs #
-#  efficiency where a prior is sharply curved, such as at the walls of a soft #
-#  box, and costs nothing in correctness: exactness needs only that G_M is    #
-#  SPD and that V carries ½ log det G_M.                                      #
+#  Moved together they stay consistent, which is why a constant M is          #
+#  supported, and it is what lets the sampler match a prior of the wrong      #
+#  scale. A prior N(0, s²I) has precision s⁻²I, and with M = I instead the    #
+#  momentum is drawn at unit scale against a target of width s, so the        #
+#  trajectory needs about s/h steps to cross what one step should cover.      #
+#  M = s⁻²I fixes that.                                                       #
+#                                                                             #
+#  A position-dependent M cannot be supported by this scheme. S_h would need  #
+#  M at the midpoint to stay symmetric, F would pick up ∂M/∂q1 terms, and     #
+#  DF(q0) would stop being G_M(q0). One is refused at the first model         #
+#  evaluation rather than silently frozen. Correctness never rested on M      #
+#  either way: exactness                                                      #
+#  needs only that G_M is SPD and that V carries ½ log det G_M, so M is a     #
+#  preconditioning choice throughout.                                         #
 #                                                                             #
 #  Because the constraint and the prior are both evaluated at the sampled     #
 #  position, and U carries no change-of-variables Jacobian, the space has to  #
@@ -87,7 +95,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  user supplies log|det B|. The measure bookkeeping is ours.                 #
 #                                                                             #
 #  U is affine in β (lik = ½‖ψ‖², base = −log p(q) + log|det B|) and G_M is   #
-#  affine in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as #
+#  affine in β (A_lik = Wᵀ W, A_prior = M), so evaluate_model returns them as #
 #  a TemperedAffine and a TemperedMetric. The Hamiltonian                     #
 #                                                                             #
 #      H = U + ½ pᵀ G_M⁻¹ p + ½ log det G_M                                   #
@@ -102,10 +110,13 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                             #
 #  Step  (q0, p0) -> (q1, p1)                                                 #
 #                                                                             #
-#      F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0,      #
-#      DF(q0) = I + β W0ᵀ W0 = G_M(q0),                                       #
-#      q^{k+1} = q^k − G_M(q0)⁻¹ F(q^k),                                      #
-#      p1 = (1/h)[(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),                 #
+#      F(q1) = M(q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0,     #
+#      DF(q1) = M + β W0ᵀ W1,   so DF(q0) = G_M(q0),                          #
+#      p1 = (1/h)[M(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),                #
+#                                                                             #
+#  solved by any rule in solvers.py. Picard preconditioned by G_M(q0) is the  #
+#  frozen-Jacobian Newton step, and newton evaluates DF(q1) at each iterate   #
+#  instead, at the price of a tangent pass per iteration.                     #
 #                                                                             #
 #  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), q).   #
 #  Only ψ(q^k) is evaluated in the loop, preconditioned by one Cholesky of    #
@@ -114,7 +125,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  Why this is a valid proposal. The step is the variational integrator of    #
 #  the discrete Lagrangian                                                    #
 #                                                                             #
-#      S_h(q0, q1) = ‖q1 − q0‖²/(2h) + β‖ψ1 − ψ0‖²/(2h)                       #
+#      S_h(q0, q1) = (q1 − q0)ᵀM(q1 − q0)/(2h) + β‖ψ1 − ψ0‖²/(2h)             #
 #                    − (h/2)[V(q0) + V(q1)],                                  #
 #                                                                             #
 #  in the sense that p0 = −∂S_h/∂q0 is the position equation F = 0 and        #
@@ -125,10 +136,10 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #    * S_h(q0, q1) = S_h(q1, q0), so the map is self-adjoint: applied to      #
 #      (q1, −p1) it returns (q0, −p0).                                        #
 #                                                                             #
-#  S_h also explains the pieces. Its kinetic term is the squared ambient      #
-#  chord ‖(q1, ε1) − (q0, ε0)‖² with the ε block scaled by β, and its Hessian #
-#  as q1 -> q0 is G_M(q0)/h. So the metric is not a free choice but the       #
-#  discrete kinetic form, and the W0 / W1 asymmetry between the two equations #
+#  S_h also explains the pieces. Its kinetic term is the ambient chord with   #
+#  the q block measured by M and the ε block scaled by β, and its Hessian as  #
+#  q1 -> q0 is G_M(q0)/h. So the metric is the discrete kinetic form rather   #
+#  than a free choice, and the W0 / W1 asymmetry between the two equations    #
 #  is forced (differentiate at the left endpoint, then at the right).         #
 #                                                                             #
 #  Both properties hold up to the position solve. Where F has several roots   #
@@ -265,25 +276,65 @@ class LocationScaleChart(ChartConstraint):
 
 #  ---- Position solve ------------------------------------------------------ #
 
-def _solve_rattle_step(constraint, q, psi, W, beta_col, chol_G, rhs, q_init,
-                       solver, max_iter, tol):
-    """Solve the RATTLE position equation F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0)
-    − rhs = 0 for the endpoint q1, preconditioned by G_M(q0). The start position
-    ``q``, its inverse map ``psi`` and tangent data ``W``, and the Cholesky
-    factor ``chol_G`` of G_M(q) are the q0 quantities. Returns (q1, iters,
-    residual)."""
+def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
+                       chol_G, rhs, q_init, solver):
+    """Solve the RATTLE position equation for the step endpoint q1,
+
+        F(q1) = A_prior (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − rhs = 0,
+
+    preconditioned by G_M(q0) = A_prior + β W0ᵀW0.
+
+    Parameters
+    ----------
+    constraint : ChartConstraint
+        Supplies ψ, and W too when the solver wants a Jacobian.
+    q, psi, W : (N, n), (N, m), (N, m, n)
+        The q0 position and its inverse map and tangent data.
+    A_prior : (n, n)
+        Constant prior block of the metric.
+    beta_col, beta_mat : broadcastable β
+        Shaped for an ``(N, n)`` vector and an ``(N, n, n)`` matrix.
+    chol_G : (N, n, n)
+        Cholesky factor of G_M(q0), the frozen-Jacobian preconditioner.
+    rhs : (N, n)
+        ``h p0 − (h²/2) ∇V(q0)``.
+    q_init : (N, n)
+        Warm start.
+    solver : FixedPointSolver
+        Whose ``needs_jacobian`` picks the residual contract below.
+
+    Returns
+    -------
+    SolveResult
+    """
     Wt = W.transpose(-2, -1)                               # (N, n, m)
+
+    def drift(q_k):
+        return (A_prior @ (q_k - q).unsqueeze(-1)).squeeze(-1)
 
     def residual_fn(q_k):
         with torch.no_grad():                             # solve is derivative-free
             corr = (Wt @ (constraint.psi(q_k) - psi).unsqueeze(-1)).squeeze(-1)
-            return (q_k - q) - beta_col * corr - rhs
+            return drift(q_k) - beta_col * corr - rhs
 
-    def precond(F):                                       # G_M(q)⁻¹ F
+    def residual_and_jacobian(q_k):
+        # DF(q1) = A_prior + β W0ᵀ W(q1), the true Jacobian rather than its value
+        # frozen at q0. W(q1) needs a tangent pass, so this costs more per
+        # iteration than the residual alone.
+        with torch.enable_grad():
+            qk = q_k.detach().requires_grad_(True)
+            psi_k, W_k, _ = constraint.psi_with_jvp(qk)
+        psi_k, W_k = psi_k.detach(), W_k.detach()
+        corr = (Wt @ (psi_k - psi).unsqueeze(-1)).squeeze(-1)
+        r = drift(q_k) - beta_col * corr - rhs
+        return r, A_prior + beta_mat * (Wt @ W_k)
+
+    def precond(F):                                       # G_M(q0)⁻¹ F
         return torch.cholesky_solve(F.unsqueeze(-1), chol_G).squeeze(-1)
 
-    updater = solver.new(q.shape[-1], precond=precond)
-    return _fixed_point_solve(residual_fn, q_init, updater, max_iter, tol)
+    if solver.needs_jacobian:
+        return solver.solve(residual_and_jacobian, q_init)
+    return solver.solve(residual_fn, q_init, precond=precond)
 
 
 #  ---- Chain state --------------------------------------------------------- #
@@ -365,15 +416,9 @@ class ChartRATTLE(HamiltonianSampler):
     space
         Identity unconstrained space over the θ (= q) names. Its prior becomes
         the prior on q, entering U as −log p(q), and is flat when the space
-        carries none. Any ``prior_metric_fn`` is unused, since G_M is fixed by
-        the integrator rather than chosen (see the Energy section at the top of
-        this module).
-
-    Raises
-    ------
-    ValueError
-        If ``space`` does not map q to θ by the identity, if ``damping`` is
-        outside (0, 1], or if ``solver`` is not recognised.
+        carries none. Its ``prior_metric_fn`` becomes the prior block M of
+        G_M = M + β WᵀW, defaulting to the identity, and has to be independent of
+        position (see the Energy section at the top of this module).
     step_size : float
         Integration step size. When adapting, start it small: the step is grown
         from here, so a too-large start begins above the solver-convergence cliff
@@ -389,14 +434,26 @@ class ChartRATTLE(HamiltonianSampler):
     fp_tol : float
         Convergence tolerance for the position solve (max norm of F). Default 1e-8.
     solver : str
-        Position solver: ``"picard"`` (default) or ``"anderson"``.
+        Position solver: ``"picard"`` (default), ``"anderson"`` or ``"newton"``.
+        Newton re-evaluates DF at every iterate rather than freezing it at the
+        step start, which is worth its tangent pass when the Jacobian moves
+        quickly along the iteration.
     anderson_history : int or None
-        History length for the Anderson solver. None resolves per-solve to n.
+        History length for the Anderson solver, ignored by the others. None
+        resolves per-solve to n.
     damping : float
-        Under-relaxation factor in (0, 1] shared by both solvers. Default 1.0.
+        Under-relaxation factor in (0, 1] shared by every solver. Default 1.0.
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite for which) the step is a
         divergence. Default 100.
+
+    Raises
+    ------
+    ValueError
+        If ``space`` does not map q to θ by the identity, if ``damping`` is
+        outside (0, 1], or if ``solver`` is not recognised. A position-dependent
+        prior metric is caught later, at the first model evaluation, where the
+        dtype and device of the positions are known.
 
     Notes
     -----
@@ -422,18 +479,9 @@ class ChartRATTLE(HamiltonianSampler):
         divergence_threshold: float = 100.0,
     ):
         self._require_identity_space(space)
-        if not 0.0 < damping <= 1.0:
-            raise ValueError(f"damping must be in (0, 1], got {damping}")
-        if solver == "picard":
-            self._solver = _PicardUpdate(damping)
-        elif solver == "anderson":
-            if anderson_history is not None and anderson_history < 1:
-                raise ValueError(
-                    f"anderson_history must be >= 1, got {anderson_history}")
-            self._solver = _AndersonUpdate(anderson_history, damping)
-        else:
-            raise ValueError(
-                f"unknown solver {solver!r}, expected 'picard' or 'anderson'")
+        self._solver = FixedPointSolver(
+            solver, damping=damping, anderson_history=anderson_history,
+            max_iter=fp_max_iter, tol=fp_tol)
 
         log_eps = math.log(step_size)
         adapter = NoAdaptation(init=log_eps)
@@ -444,8 +492,8 @@ class ChartRATTLE(HamiltonianSampler):
                          trajectory_length=num_steps * step_size)
 
         self.constraint = constraint
-        self._fp_max_iter = fp_max_iter
         self._fp_tol = fp_tol
+        self._A_prior = None       # constant prior block of G_M, built on demand
 
         self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
         self.register_diagnostic("residual_max", lambda: self._residual_max)
@@ -473,26 +521,50 @@ class ChartRATTLE(HamiltonianSampler):
                 f"evaluated at the sampled position and U carries no transform "
                 f"Jacobian. Got {type(space).__name__}.")
 
-    # ---- model evaluation (the extension point) ---------------------------- #
+    def prior_metric(self, q):
+        """``A_prior``, the constant prior block of ``G_M``, shape ``(n, n)``.
 
-    def prior_potential(self, q):
-        """``-log p(q)``, the prior on the chart coordinate, shape ``(N,)``.
+        The space's ``prior_metric_fn`` pushed forward to the sampled
+        coordinates, or the identity when it has none. Cached after the first
+        call.
 
-        Always the space's prior, as for every other sampler in the library. A
-        space with no prior therefore gives a flat one, so a standard-normal
-        latent has to be asked for by name.
-
-        Parameters
-        ----------
-        q : (N, n)
-            Position, the chart coordinate.
-
-        Returns
-        -------
-        (N,) Tensor
-            Differentiable in ``q``, since the force ``∇V`` runs through it.
+        Raises
+        ------
+        ValueError
+            If the space's prior metric varies with position. G_M is also the
+            Hessian of the integrator's kinetic term, and a position-dependent
+            one would need the midpoint form of that term, a different scheme
+            from the one implemented here.
         """
-        return -self.space.prior_log_prob_vector(q)
+        if self._A_prior is not None:
+            return self._A_prior
+        n = q.shape[-1]
+        eye = torch.eye(n, dtype=q.dtype, device=q.device)
+        if getattr(self.space, "prior_metric_fn", None) is None:
+            self._A_prior = eye
+            return eye
+
+        probes = torch.tensor([0.0, 0.75, -1.5], dtype=q.dtype,
+                              device=q.device).view(3, 1).expand(3, n)
+        mats = [self._pushed_prior_metric(row.unsqueeze(0))[0] for row in probes]
+        if not all(torch.allclose(m, mats[0], rtol=1e-9, atol=1e-12)
+                   for m in mats[1:]):
+            raise ValueError(
+                "ChartRATTLE needs a position-independent prior metric, since "
+                "G_M doubles as the Hessian of the integrator's kinetic term. "
+                "The space's prior_metric_fn varies with position. Drop it to "
+                "fall back on the identity, or supply a constant one.")
+        self._A_prior = mats[0]
+        return self._A_prior
+
+    def _pushed_prior_metric(self, q):
+        """The space's prior metric at ``q``, pushed to the sampled coordinates."""
+        theta_map = self.space.map_to_constrained_vector(q)
+        theta_full = self._free_to_full(theta_map.mapped_point)
+        return self.space.push_forward_metric(
+            self.space.prior_metric(theta_full), theta_map)
+
+    # ---- model evaluation (the extension point) ---------------------------- #
 
     def evaluate_model(self, z_free, beta=None, grad=False):
         """The model at the position ``z_free`` (the chart coordinate ``q``), and
@@ -526,15 +598,15 @@ class ChartRATTLE(HamiltonianSampler):
         # through psi, so the input has to carry a graph either way.
         q = z_free.detach().requires_grad_(True)
         n = q.shape[-1]
-        eye = torch.eye(n, dtype=q.dtype, device=q.device)
+        A_prior = self.prior_metric(q)
 
         with torch.enable_grad():
             psi, W, log_abs_det_B = self.constraint.psi_with_jvp(q)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
             lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
-            base = self.prior_potential(q) + log_abs_det_B
+            base = -self.space.prior_log_prob_vector(q) + log_abs_det_B
             if grad:
-                G = eye + broadcast_beta(beta, 2) * gram
+                G = A_prior + broadcast_beta(beta, 2) * gram
                 # Cholesky, not torch.logdet: same factorization the metric uses
                 # for G_M⁻¹, and it rejects a non-SPD G instead of returning nan.
                 chol = torch.linalg.cholesky(G)
@@ -543,7 +615,8 @@ class ChartRATTLE(HamiltonianSampler):
                 (grad_V,) = torch.autograd.grad(V.sum(), q)
 
         U = TemperedAffine(lik.detach(), base.detach(), beta)
-        metric = TemperedMetric(gram.detach(), eye.expand(q.shape[0], n, n), beta)
+        metric = TemperedMetric(gram.detach(),
+                                A_prior.expand(q.shape[0], n, n), beta)
         out = (U, metric, psi.detach(), W.detach())
         if grad:
             out = out + (grad_V.detach(),)
@@ -579,20 +652,22 @@ class ChartRATTLE(HamiltonianSampler):
         displacement, which changes only the iteration count, not the fixed point."""
         h = step_size.unsqueeze(-1)                        # (N, 1)
         beta_col = broadcast_beta(self.beta, 1)
+        beta_mat = broadcast_beta(self.beta, 2)
+        A_prior = self.prior_metric(state.q)
 
         rhs = h * state.p - 0.5 * h * h * state.grad_V
         q_init = state.q
         if state.dq is not None:
             q_init = state.q + state.dq
         q, iters, residual = _solve_rattle_step(
-            self.constraint, state.q, state.psi, state.W, beta_col,
-            state.metric.L, rhs, q_init, self._solver,
-            self._fp_max_iter, self._fp_tol)
+            self.constraint, state.q, state.psi, state.W, A_prior, beta_col,
+            beta_mat, state.metric.L, rhs, q_init, self._solver)
 
         U, metric, psi, W, grad_V = self.evaluate_model(q, grad=True)
 
         corr = (W.transpose(-2, -1) @ (psi - state.psi).unsqueeze(-1)).squeeze(-1)
-        p = ((q - state.q) - beta_col * corr) / h - 0.5 * h * grad_V
+        drift = (A_prior @ (q - state.q).unsqueeze(-1)).squeeze(-1)
+        p = (drift - beta_col * corr) / h - 0.5 * h * grad_V
 
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters = torch.maximum(self._step_iters, iters.to(h.dtype))

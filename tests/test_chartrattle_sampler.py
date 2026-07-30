@@ -8,6 +8,8 @@ induced by an affine map and against a quadrature reference for the funnel;
 parallel tempering rides on the TemperedAffine / TemperedMetric that
 evaluate_model returns.
 """
+import math
+
 import torch
 import pytest
 
@@ -189,7 +191,7 @@ def test_step_keeps_only_the_fields_that_outlive_a_transition():
 
 def test_invalid_solver_raises():
     with pytest.raises(ValueError, match="unknown solver"):
-        _funnel_sampler(solver="newton")
+        _funnel_sampler(solver="secant")
 
 
 def test_invalid_anderson_history_raises():
@@ -267,6 +269,105 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors=priors),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="anderson", fp_tol=1e-10)
+    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
+                     num_chains=64, disable_progbar=True)
+    draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
+    assert torch.allclose(draws.mean(0), mu, atol=0.03)
+    assert torch.allclose(torch.cov(draws.T), Sigma, atol=0.05)
+    assert int(s.diagnostics()["num_divergences"].sum()) == 0
+
+
+def test_prior_metric_moves_the_metric_and_not_the_potential():
+    # M belongs to G_M alone. U is the target and must not notice it, or the
+    # sampler would be answering a different question per preconditioner.
+    torch.manual_seed(5)
+    A = torch.randn(4, 2)
+    B = torch.eye(4) + 0.2 * torch.randn(4, 4)
+    B = B @ B.transpose(-2, -1)
+    c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
+    names = ["a", "b"]
+    priors = {n: _N01() for n in names}
+    M = torch.diag(torch.tensor([3.0, 0.5]))
+
+    def build(metric_fn):
+        space = UnconstrainedSpace(names, priors=priors,
+                                   prior_metric_fn=metric_fn)
+        return ChartRATTLE(c, space, step_size=0.2, adapt_step_size=False)
+
+    eta = torch.randn(6, 2)
+    U_i, m_i, _, W = build(None).evaluate_model(eta, grad=False)
+    U_m, m_m, _, _ = build(
+        lambda th: M.expand(th.shape[0], 2, 2)).evaluate_model(eta, grad=False)
+
+    assert torch.allclose(U_m.value, U_i.value, atol=1e-12)      # target unmoved
+    gram = W.transpose(-2, -1) @ W
+    assert torch.allclose(m_i.value, torch.eye(2) + gram, atol=1e-10)
+    assert torch.allclose(m_m.value, M + gram, atol=1e-10)
+
+
+def test_position_dependent_prior_metric_is_refused():
+    # G_M is also the Hessian of the integrator's kinetic term, so a
+    # position-dependent M would need a different scheme. Freezing it silently
+    # would break energy conservation, so it is refused at the first evaluation.
+    c = FunnelChart(2.0, torch.randn(4))
+    space = UnconstrainedSpace(["v"], prior_metric_fn=lambda th: torch.diag_embed(
+        1.0 + th[..., :1] ** 2))
+    s = ChartRATTLE(c, space, step_size=0.1, adapt_step_size=False)
+    with pytest.raises(ValueError, match="position-independent"):
+        s.evaluate_model(torch.zeros(2, 1))
+
+
+def test_prior_metric_matched_to_a_wide_prior_mixes():
+    # A weak likelihood with a prior N(0, s^2) leaves a posterior about s wide.
+    # With M = I the momentum is drawn at unit scale against it, so one chain
+    # barely moves. M = s^-2 I is the scale the prior actually has.
+    torch.manual_seed(0)
+    n, m, S = 2, 4, 1.0e4
+    A = 1e-3 * torch.randn(m, n)                       # weak coupling q -> x
+    B = torch.eye(m) + 0.2 * torch.randn(m, m)
+    B = B @ B.transpose(-2, -1)
+    c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
+    names = ["a", "b"]
+    wide = torch.distributions.Normal(torch.tensor(0.0),
+                                      torch.tensor(math.sqrt(S)))
+    priors = {k: wide for k in names}
+
+    W = c.W_const
+    sd_exact = torch.linalg.inv(
+        torch.eye(n) / S + W.transpose(-2, -1) @ W).diagonal().sqrt()
+
+    def per_chain_spread(metric_fn):
+        space = UnconstrainedSpace(names, priors=priors,
+                                   prior_metric_fn=metric_fn)
+        s = ChartRATTLE(c, space, step_size=0.15, num_steps=10,
+                        adapt_step_size=False, solver="anderson", fp_tol=1e-10)
+        out = s.run_mcmc(torch.zeros(n), num_samples=400, num_warmup_steps=200,
+                         num_chains=16, disable_progbar=True)
+        # One chain, so this measures mixing rather than the spread of the
+        # independent starts.
+        sd = torch.stack([out[k][0] for k in names], dim=-1).std(0)
+        return float((sd / sd_exact).mean())
+
+    unmatched = per_chain_spread(None)
+    matched = per_chain_spread(
+        lambda th: torch.eye(n).expand(th.shape[0], n, n) / S)
+    assert unmatched < 0.5           # M = I explores a fraction of the width
+    assert matched > 0.8             # matched M gets most of the way across
+
+
+def test_newton_recovers_the_affine_gaussian_posterior():
+    # End to end on the newton rule, whose residual returns the Jacobian too.
+    torch.manual_seed(1)
+    A = torch.randn(5, 2)
+    B = torch.eye(5) + 0.2 * torch.randn(5, 5)
+    B = B @ B.transpose(-2, -1)
+    c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
+    mu, Sigma = c.posterior()
+
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"],
+                                          priors={"a": _N01(), "b": _N01()}),
+                    step_size=0.4, num_steps=12, adapt_step_size=False,
+                    solver="newton", fp_tol=1e-10)
     out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
