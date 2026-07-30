@@ -73,6 +73,21 @@ the documentation.
 
 No restating of the signature in prose.
 
+## Do not compare against other algorithms
+
+Say what this code does. Do not explain it by contrast with a sibling
+implementation, as in "unlike X, this one ...". The reader may not know X, X may
+be a niche method nobody would accept as the reference point, and the sentence
+goes stale the moment X changes.
+
+The one comparison worth making is against the base class, where a subclass
+departs from documented shared behaviour. That is a contract the reader is
+already holding.
+
+A general-purpose tool must not need a specific algorithm to explain itself. If a
+root finder can only be described through the equation one particular sampler
+hands it, either the description is wrong or the tool is not general.
+
 ## Notation
 
 The library has one vocabulary and every file uses it. Position is `q`, momentum
@@ -123,3 +138,17 @@ When an invariant changes, delete what documented the old one. That applies to
 tests as well. A test that pins an invariant the design has moved past is not
 protecting anything, and reading it as a constraint on new work is worse than
 having no test at all.
+
+## Size
+
+Documentation competes with the code for the reader's attention, so its size is
+part of the design. A useful check is the ratio of documentation lines to code
+lines, per file. Across this library the ordinary range is 0.9 to 1.5 to 1. A
+file well outside it is making a claim about being unusually subtle, and that
+claim is usually wrong.
+
+The same applies to a design note. Two hundred lines of note above two hundred
+lines of code means the note is arguing rather than stating. Keep the
+derivation, the identity, the caveat with teeth. Cut the paragraph that restates
+the equation above it in prose, and cut the measurement whose source no reader
+can find.

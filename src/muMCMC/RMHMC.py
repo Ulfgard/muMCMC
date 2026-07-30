@@ -282,7 +282,7 @@ class RMHMC(HamiltonianSampler):
 
     Notes
     -----
-    Unlike :class:`HMC` / :class:`LMC`, RMHMC exposes no ``target_accept_prob``.
+    RMHMC exposes no ``target_accept_prob``.
     The implicit-midpoint integrator can conserve energy over a wide range of
     step sizes, and exactly so on a Gaussian target up to the fixed-point
     tolerance. That makes acceptance a poor thing to adapt against, because

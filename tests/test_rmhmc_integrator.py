@@ -28,7 +28,7 @@ from muMCMC.RMHMC import (
     _midpoint_map,
     _implicit_midpoint_step,
 )
-from muMCMC._solvers import FixedPointSolver, _PicardUpdate, _AndersonUpdate
+from muMCMC._solvers import FixedPointSolver
 from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)
@@ -336,16 +336,21 @@ def test_anderson_solves_linear_map_faster_than_picard():
 
 
 def test_anderson_default_history_is_the_solve_dimension():
-    # A None history resolves to the row dimension of the solve. RMHMC solves
-    # for z = (q, p), so that is 2 dim(q) rather than dim(q).
-    assert _AndersonUpdate(history=None).new(2 * D).history == 2 * D
+    # A None history resolves to the row dimension, which here is 2 dim(q) since
+    # the unknown is the endpoint (q, p). Checked behaviourally: an explicit
+    # 2 dim(q) has to reproduce the default exactly.
     ev = make_eval(model_qdep)
     q, p, _, _ = _random_phase(2, seed=15)
     eps = torch.full((2,), 0.3)
-    _, _, _, residual = _implicit_midpoint_step(
+    auto = _implicit_midpoint_step(
         q, p, eps, ev, _fp("anderson", max_iter=200, tol=1e-12,
                            anderson_history=None))
-    assert torch.all(residual < 1e-10)
+    named = _implicit_midpoint_step(
+        q, p, eps, ev, _fp("anderson", max_iter=200, tol=1e-12,
+                           anderson_history=2 * D))
+    assert torch.equal(auto[2], named[2])              # same iteration counts
+    assert torch.allclose(auto[0], named[0], atol=1e-12)
+    assert torch.all(auto[3] < 1e-10)
 
 
 # ========================================================================== #
@@ -404,12 +409,6 @@ def test_damping_reaches_same_endpoint_as_undamped(solver):
 # ========================================================================== #
 #  7. Solver fallback ladder                                                 #
 # ========================================================================== #
-
-def test_damped_scales_beta_on_both_updaters():
-    assert _PicardUpdate(0.8).damped(0.5).beta == pytest.approx(0.4)
-    a = _AndersonUpdate(5, 0.8).damped(0.5)
-    assert a.beta == pytest.approx(0.4) and a.history == 5
-
 
 def test_fallback_ladder_rescues_a_step_where_the_base_solver_diverges():
     # Same setup as the damping-rescue test: at eps=1.8 the undamped Picard base

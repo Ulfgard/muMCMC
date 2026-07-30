@@ -4,249 +4,107 @@ import torch
 
 # =========================================================================== #
 #                                                                             #
-#  Batched solvers for r(z) = 0                                               #
+#  Batched root finding for r(z) = 0, one problem per row of z                 #
 #                                                                             #
-#  One problem per row of z, solved to a per-row tolerance. Every implicit    #
-#  integrator in the library reaches for this: RMHMC's midpoint equation and  #
-#  ChartRATTLE's position equation are both a root find in the step endpoint. #
+#  Internal. A caller picks the update rule by name and the solver builds it,  #
+#  so nothing here is part of the package surface.                            #
 #                                                                             #
-#  Internal. A sampler exposes the choice as a string and builds the solver   #
-#  itself, so nothing here is part of the package surface.                    #
-#                                                                             #
-#  An update rule turns the current iterate and its residual into the next    #
-#  iterate. Three are available, chosen by name.                              #
+#  A rule reporting needs_jacobian expects residual_fn(z) -> (r, J), with r    #
+#  shaped (N, d) and J shaped (N, d, d). The others expect residual_fn(z) -> r #
+#  so the contract follows from the rule rather than from a flag on the call.  #
+#  Either way only the root matters, and the result comes back detached.       #
 #                                                                             #
 #      picard     z_{k+1} = z_k − β P r_k                                     #
-#      anderson   Picard plus Walker and Ni's Type-II acceleration            #
+#      anderson   Picard plus Type-II Anderson acceleration                   #
 #      newton     z_{k+1} = z_k − β J(z_k)⁻¹ r_k                              #
 #                                                                             #
-#  β ∈ (0, 1] under-relaxes all three. It does not move the root, so it buys  #
-#  stability at the cost of iterations. P is an optional fixed                #
-#  preconditioner.                                                            #
-#                                                                             #
-#  Picard converges when the map is a contraction, which for an implicit      #
-#  integrator means a step size small enough. Relaxing it pulls the iteration #
-#  eigenvalues (β − 1) + β λ toward (1 − β) on the real axis, taming the      #
-#  near-imaginary spectrum of the midpoint map.                               #
-#                                                                             #
-#  Anderson(m) stacks the last m iterate and residual differences and solves  #
-#  a small per-row least squares. On a linear map Anderson(m ≥ 1) reaches the #
-#  root in one accelerated step. On a nonlinear one it usually beats Picard,  #
-#  trading extra residual evaluations for a cheap m by m solve. It is not     #
-#  monotone in the residual, so a transient rise is normal.                   #
-#                                                                             #
-#  Newton needs the Jacobian J = ∂r/∂z and converges quadratically near the   #
-#  root, which the other two do not. It is the rule to reach for when a fixed #
-#  preconditioner underperforms because J moves quickly along the iteration,  #
-#  since Picard with P ≈ J(z_0)⁻¹ is exactly Newton with a frozen Jacobian.   #
-#  Whether that trade pays depends on the cost of J against the cost of the   #
-#  extra iterations the frozen version needs.                                 #
-#                                                                             #
-#  J is not assumed symmetric, so the step goes through a general LU solve.   #
-#  A singular J gives non-finite entries rather than raising, which the       #
-#  divergence test below then catches for that row alone.                     #
-#                                                                             #
-# =========================================================================== #
-#                                                                             #
-#  The residual interface                                                     #
-#                                                                             #
-#  A solver that reports needs_jacobian expects                               #
-#                                                                             #
-#      residual_fn(z) -> (r, J)      r is (N, d), J is (N, d, d)              #
-#                                                                             #
-#  and one that does not expects                                              #
-#                                                                             #
-#      residual_fn(z) -> r                                                    #
-#                                                                             #
-#  so the contract follows from the chosen rule rather than from a flag on    #
-#  the call. Either way the result is detached from any autograd graph, since #
-#  the solve is derivative-free in the outer sense: only the root matters,    #
-#  not how the iteration reached it.                                          #
+#  β ∈ (0, 1] under-relaxes every rule without moving the root, so a fallback  #
+#  ladder can re-solve a stuck row rather than reject it. P preconditions the  #
+#  residual, and is meaningless for newton, whose solve is already exact. J is #
+#  not assumed symmetric, and a singular one gives non-finite entries rather   #
+#  than raising, which the divergence test catches for that row alone.         #
 #                                                                             #
 # =========================================================================== #
 
 SolveResult = namedtuple("SolveResult", ["z", "iters", "residual"])
 
-# Growth factor over the starting residual past which a row counts as diverged.
-# Loose enough to let Anderson overshoot on its way to the root.
+_RULES = ("picard", "anderson", "newton")
+
+# Growth over the starting residual past which a row counts as diverged. Loose,
+# since Anderson is not monotone on its way to the root.
 _DIVERGENCE_GROWTH = 1000.0
 
-
-class _PicardUpdate:
-    """Relaxed Picard iteration, ``z_{k+1} = z_k − β P r_k``.
-
-    Stateless.
-
-    Parameters
-    ----------
-    beta : float
-        Under-relaxation factor in (0, 1].
-    precond : callable or None
-        Preconditioner P applied to the residual before the step, or None for
-        the identity.
-    """
-
-    needs_jacobian = False
-
-    def __init__(self, beta=1.0, precond=None):
-        self.beta = float(beta)
-        self._precond = precond
-
-    def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dimensional rows. ``precond``
-        overrides the preconditioner. Omitted, this updater's own is kept."""
-        return _PicardUpdate(self.beta, self._precond if precond is None else precond)
-
-    def propose(self, z, r, jac=None):
-        if self._precond is not None:
-            r = self._precond(r)
-        return z - self.beta * r
-
-    def damped(self, factor):
-        """Copy with β scaled by ``factor``, same preconditioner."""
-        return _PicardUpdate(self.beta * factor, self._precond)
+# Relative and absolute Tikhonov floors for Anderson's least squares.
+_REG_REL, _REG_ABS = 1e-10, 1e-14
 
 
-class _AndersonUpdate:
-    """Anderson(m) acceleration, Type-II, of the fixed-point map.
+def _picard(beta, precond, _history):
+    def step(z, r, jac):
+        return z - beta * (r if precond is None else precond(r))
+    return step
 
-    With ``f_k = −r_k`` and the last ``m`` iterate and residual differences
-    stacked column-wise as ΔZ and ΔF, solve the per-row least squares
-    ``γ = argmin ‖f_k − ΔF γ‖`` and take
+
+def _newton(beta, precond, _history):
+    def step(z, r, jac):
+        dz, _ = torch.linalg.solve_ex(jac, r.unsqueeze(-1))
+        return z - beta * dz.squeeze(-1)
+    return step
+
+
+def _anderson(beta, precond, history):
+    """Anderson(m), Type II. With f_k = −r_k and the last m iterate and residual
+    differences stacked column-wise as ΔZ and ΔF, solve the per-row least squares
+    γ = argmin ‖f_k − ΔF γ‖ and take
 
         z_{k+1} = z_k + β f_k − (ΔZ + β ΔF) γ.
-
-    Parameters
-    ----------
-    history : int or None
-        History length ``m``, at least 1, or None to resolve to ``d`` when
-        :meth:`new` is called.
-    beta : float
-        Under-relaxation factor in (0, 1].
-    precond : callable or None
-        Preconditioner P applied to the residual before the step, or None for
-        the identity.
-
-    References
-    ----------
-    Walker and Ni, Anderson acceleration for fixed-point iterations, 2011.
     """
+    Z, F = [], []
 
-    needs_jacobian = False
+    def step(z, r, jac):
+        Z.append(z)
+        F.append(-(r if precond is None else precond(r)))
+        if len(Z) > history + 1:                  # keep at most `history` diffs
+            Z.pop(0)
+            F.pop(0)
+        f_k = F[-1]
+        if len(Z) == 1:
+            return z + beta * f_k
 
-    # Relative and absolute Tikhonov floors for the least-squares solve.
-    reg_rel = 1e-10
-    reg_abs = 1e-14
-
-    def __init__(self, history=None, beta=1.0, precond=None):
-        self.history = history
-        self.beta = float(beta)
-        self._precond = precond
-        self._Z = []
-        self._F = []
-
-    def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dimensional rows, resolving a None
-        ``history`` to ``d``. ``precond`` overrides the preconditioner. Omitted,
-        this updater's own is kept."""
-        return _AndersonUpdate(
-            d if self.history is None else self.history, self.beta,
-            self._precond if precond is None else precond)
-
-    def propose(self, z, r, jac=None):
-        if self._precond is not None:
-            r = self._precond(r)
-        self._Z.append(z)
-        self._F.append(-r)
-        if len(self._Z) > self.history + 1:     # keep at most `history` differences
-            self._Z.pop(0)
-            self._F.pop(0)
-
-        f_k = self._F[-1]
-        if len(self._Z) == 1:                   # no history yet, damped Picard step
-            return z + self.beta * f_k
-
-        dZ = torch.stack([self._Z[j] - self._Z[j - 1]
-                          for j in range(1, len(self._Z))], dim=-1)
-        dF = torch.stack([self._F[j] - self._F[j - 1]
-                          for j in range(1, len(self._F))], dim=-1)
-
-        N, _, mk = dF.shape
-        # Scale-aware Tikhonov floor for (near-)collinear or zero dF columns.
-        scale = (dF * dF).sum(-2).mean(-1)
-        reg = self.reg_rel * scale + self.reg_abs
-        # Solve the damped least squares by QR on the stacked [dF; sqrt(reg) I],
-        # not the normal equations dF^T dF whose squared condition number
-        # overflows float64 at a stiff metric's column spread.
+        dZ = torch.stack([Z[j] - Z[j - 1] for j in range(1, len(Z))], dim=-1)
+        dF = torch.stack([F[j] - F[j - 1] for j in range(1, len(F))], dim=-1)
+        n, _, mk = dF.shape
+        # QR on [ΔF; √reg I] rather than the normal equations, whose squared
+        # condition number overflows float64 at a stiff column spread. The floor
+        # covers near-collinear and zero columns.
+        reg = _REG_REL * (dF * dF).sum(-2).mean(-1) + _REG_ABS
         eye = torch.eye(mk, dtype=dF.dtype, device=dF.device)
-        A_aug = torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], dim=-2)
-        b_aug = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(N, mk, 1)], dim=-2)
-        Q, R = torch.linalg.qr(A_aug)
-        gamma = torch.linalg.solve_triangular(
-            R, Q.transpose(-2, -1) @ b_aug, upper=True)
-
-        return z + self.beta * f_k - ((dZ + self.beta * dF) @ gamma).squeeze(-1)
-
-    def damped(self, factor):
-        """Copy with β scaled by ``factor``, same history and preconditioner."""
-        return _AndersonUpdate(self.history, self.beta * factor, self._precond)
+        Q, R = torch.linalg.qr(torch.cat([dF, reg.sqrt().view(-1, 1, 1) * eye], -2))
+        rhs = torch.cat([f_k.unsqueeze(-1), f_k.new_zeros(n, mk, 1)], -2)
+        gamma = torch.linalg.solve_triangular(R, Q.transpose(-2, -1) @ rhs,
+                                              upper=True)
+        return z + beta * f_k - ((dZ + beta * dF) @ gamma).squeeze(-1)
+    return step
 
 
-class _NewtonUpdate:
-    """Damped Newton iteration, ``z_{k+1} = z_k − β J(z_k)⁻¹ r_k``.
-
-    Stateless. Requires the residual function to return the Jacobian alongside
-    the residual. Any preconditioner is ignored, since the Jacobian solve is
-    already the exact one.
-
-    Parameters
-    ----------
-    beta : float
-        Under-relaxation factor in (0, 1].
-    """
-
-    needs_jacobian = True
-
-    def __init__(self, beta=1.0, precond=None):
-        self.beta = float(beta)
-
-    def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dimensional rows."""
-        return _NewtonUpdate(self.beta)
-
-    def propose(self, z, r, jac=None):
-        step, _ = torch.linalg.solve_ex(jac, r.unsqueeze(-1))
-        return z - self.beta * step.squeeze(-1)
-
-    def damped(self, factor):
-        """Copy with β scaled by ``factor``."""
-        return _NewtonUpdate(self.beta * factor)
+_BUILD = {"picard": _picard, "anderson": _anderson, "newton": _newton}
 
 
-_RULES = {"picard": _PicardUpdate, "anderson": _AndersonUpdate,
-          "newton": _NewtonUpdate}
-
-
-def _iterate(residual_fn, z_init, updater, max_iter, tol):
-    """Iterate ``updater`` from ``z_init`` until every row's residual max-norm
-    is below ``tol`` or the row diverges. Returns a :class:`SolveResult`."""
-    wants_jac = updater.needs_jacobian
-
+def _iterate(residual_fn, z_init, step, wants_jac, max_iter, tol):
+    """Drive ``step`` from ``z_init`` until every row is below ``tol`` or has
+    diverged. Returns a :class:`SolveResult`."""
     def evaluate(z):
         out = residual_fn(z)
         return out if wants_jac else (out, None)
 
-    N = z_init.shape[0]
     z = z_init
     residual, jac = evaluate(z)
     r0 = residual.abs().amax(-1)
-
-    done = torch.zeros(N, dtype=torch.bool, device=z.device)
-    iters = torch.full((N,), max_iter, dtype=torch.long, device=z.device)
-    residual_norm = r0.clone()
+    done = torch.zeros_like(r0, dtype=torch.bool)
+    iters = torch.full(r0.shape, max_iter, dtype=torch.long, device=z.device)
+    norm = r0.clone()
 
     for i in range(1, max_iter + 1):
-        z_next = updater.propose(z, residual, jac)
+        z_next = step(z, residual, jac)
         residual_next, jac_next = evaluate(z_next)
         r = residual_next.abs().amax(-1)
 
@@ -255,22 +113,18 @@ def _iterate(residual_fn, z_init, updater, max_iter, tol):
         residual = torch.where(keep, residual, residual_next)
         if wants_jac:
             jac = torch.where(keep[..., None], jac, jac_next)
-        residual_norm = torch.where(done, residual_norm, r)
+        norm = torch.where(done, norm, r)
 
-        # Divergence: non-finite, or grown far beyond the start. The tol
-        # conjunct spares a warm start whose residual began sub-tol.
-        diverged = ~done & (~torch.isfinite(r)
-                            | ((r > _DIVERGENCE_GROWTH * r0) & (r > tol)))
-        done = done | diverged
-
-        converged = ~done & (residual_norm < tol)
+        # The tol conjunct spares a warm start whose residual began sub-tol.
+        done = done | (~done & (~torch.isfinite(r)
+                                | ((r > _DIVERGENCE_GROWTH * r0) & (r > tol))))
+        converged = ~done & (norm < tol)
         iters = torch.where(converged, torch.full_like(iters, i), iters)
         done = done | converged
-
         if bool(done.all()):
             break
 
-    return SolveResult(z.detach(), iters, residual_norm.detach())
+    return SolveResult(z.detach(), iters, norm.detach())
 
 
 class FixedPointSolver:
@@ -279,9 +133,9 @@ class FixedPointSolver:
     Parameters
     ----------
     kind : {"picard", "anderson", "newton"}
-        Update rule. See the design note at the top of this module.
+        Update rule. ``"newton"`` sets :attr:`needs_jacobian`.
     damping : float
-        Under-relaxation factor β in (0, 1]. Default 1.0, undamped.
+        Under-relaxation β in (0, 1]. Default 1.0.
     anderson_history : int or None
         History length for ``"anderson"``, at least 1, ignored by the others.
         None resolves per solve to the row dimension.
@@ -290,9 +144,8 @@ class FixedPointSolver:
     tol : float
         Convergence tolerance on the residual max-norm, per row.
     fallback_damping : tuple of float
-        On non-convergence, re-solve the failed rows with β scaled by each
-        factor in turn, each in (0, 1). Empty disables the ladder. Damping does
-        not move the root, so this rescues a stuck row rather than rejecting it.
+        On non-convergence, re-solve the failed rows with β scaled by each factor
+        in turn, each in (0, 1). Empty disables the ladder.
     fallback_iter_scale : int
         Iteration cap of each fallback level, as a multiple of ``max_iter``.
 
@@ -313,8 +166,7 @@ class FixedPointSolver:
                  max_iter=100, tol=1e-8, fallback_damping=(),
                  fallback_iter_scale=4):
         if kind not in _RULES:
-            raise ValueError(
-                f"unknown solver {kind!r}, expected one of {sorted(_RULES)}")
+            raise ValueError(f"unknown solver {kind!r}, expected one of {_RULES}")
         if not 0.0 < damping <= 1.0:
             raise ValueError(f"damping must be in (0, 1], got {damping}")
         if anderson_history is not None and anderson_history < 1:
@@ -325,18 +177,16 @@ class FixedPointSolver:
                 f"fallback_damping factors must be in (0, 1), got {fallback_damping}")
 
         self.kind = kind
+        self.damping = damping
+        self.history = anderson_history
         self.max_iter = max_iter
         self.tol = tol
-        if kind == "anderson":
-            self._rule = _AndersonUpdate(anderson_history, damping)
-        else:
-            self._rule = _RULES[kind](damping)
-        self._fallback = [(f, fallback_iter_scale * max_iter)
-                          for f in fallback_damping]
+        self.fallback = [(f, fallback_iter_scale * max_iter)
+                         for f in fallback_damping]
 
     @property
     def needs_jacobian(self):
-        return self._rule.needs_jacobian
+        return self.kind == "newton"
 
     def solve(self, residual_fn, z_init, *, precond=None, cold_start=None):
         """Drive ``residual_fn`` to zero from ``z_init``.
@@ -344,41 +194,38 @@ class FixedPointSolver:
         Parameters
         ----------
         residual_fn : callable
-            ``z -> r``, or ``z -> (r, J)`` when :attr:`needs_jacobian`. ``z``
-            and ``r`` are ``(N, d)`` and ``J`` is ``(N, d, d)``.
+            ``z -> r``, or ``z -> (r, J)`` when :attr:`needs_jacobian`.
         z_init : (N, d)
             Starting iterate. A warm start changes the iteration count and not
             the root, provided the root is unique.
         precond : callable or None
-            Fixed preconditioner applied to the residual, ``(N, d) -> (N, d)``.
-            Ignored by ``"newton"``.
+            Preconditioner applied to the residual, ``(N, d) -> (N, d)``.
         cold_start : (N, d) or None
             Iterate the fallback ladder restarts from. Defaults to ``z_init``.
 
         Returns
         -------
         SolveResult
-            ``z`` the root, ``iters`` the per-row iteration count, and
-            ``residual`` the per-row final max-norm. A row whose ``residual``
-            exceeds :attr:`tol` did not converge, and its ``z`` is not a root.
+            ``z`` the root, with the per-row iteration count and final residual
+            max-norm. A row whose ``residual`` exceeds :attr:`tol` did not
+            converge and its ``z`` is not a root.
         """
         d = z_init.shape[-1]
-        result = _iterate(residual_fn, z_init, self._rule.new(d, precond),
-                          self.max_iter, self.tol)
-        if not self._fallback:
-            return result
+        history = d if self.history is None else self.history
+        build = _BUILD[self.kind]
 
-        z, iters, residual = result
+        def run(beta, start, cap):
+            return _iterate(residual_fn, start, build(beta, precond, history),
+                            self.needs_jacobian, cap, self.tol)
+
+        z, iters, residual = run(self.damping, z_init, self.max_iter)
         restart = z_init if cold_start is None else cold_start
-        for factor, fb_iter in self._fallback:
+        for factor, cap in self.fallback:
             bad = residual > self.tol
             if not bool(bad.any()):
                 break
-            retry = _iterate(residual_fn, restart,
-                             self._rule.damped(factor).new(d, precond),
-                             fb_iter, self.tol)
-            commit = bad.unsqueeze(-1)
-            z = torch.where(commit, retry.z, z)
+            retry = run(self.damping * factor, restart, cap)
+            z = torch.where(bad.unsqueeze(-1), retry.z, z)
             # Honest cost: the failed rows paid for both passes.
             iters = torch.where(bad, iters + retry.iters, iters)
             residual = torch.where(bad, retry.residual, residual)
