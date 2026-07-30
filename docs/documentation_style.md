@@ -99,16 +99,29 @@ not been introduced to is not documentation.
 
 ## Design notes and derivations
 
-Anything that explains why the code is shaped the way it is goes in a comment
-block delimited by full width `#` rules, near the top of the file or above the
-section it explains. This is the home for derivations, for the reasoning behind a
-design decision, for a discussion of what a chosen scheme does and does not
-guarantee, and for the trade offs that were taken deliberately.
+A comment block delimited by full width `#` rules is for what no docstring should
+carry: things that are about more than one API surface, or about why the code took
+the shape it did.
 
-A derivation may be as long as it needs to be. If a function reparameterises the
-problem it solves, the full derivation of that reparameterisation belongs in a
-design note block or in a comment at the code that performs it. Showing the work
-is the point, so length is not a fault here.
+It belongs there when it is
+
+* how two things relate, such as a sampler and the state object it threads,
+* a derivation of an equation the code encodes,
+* a reparameterisation that makes a solve tractable or cheap,
+* a trade off taken deliberately, together with what it costs.
+
+It does not belong there when it is
+
+* the defining property of a class or function, including its equation. A solver
+  implementing Newton says so in its docstring and states the Newton step there.
+  In a design note it is hidden from the reader who found the class.
+* the contract of an argument or a return value. Shapes, admissible values,
+  what raises, which rule needs what from its caller.
+
+A derivation may be as long as it needs to be, in the block or in a comment at
+the code that performs it. Showing the work is the point, so length is not a
+fault there. The test is whether a reader who has the docstring in front of them
+still needs it.
 
 ## Comments
 

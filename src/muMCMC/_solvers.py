@@ -4,26 +4,14 @@ import torch
 
 # =========================================================================== #
 #                                                                             #
-#  Batched root finding for r(z) = 0, one problem per row of z                #
-#                                                                             #
 #  Internal. A caller picks the update rule by name and the solver builds it, #
 #  so nothing here is part of the package surface.                            #
 #                                                                             #
-#  A rule reporting needs_jacobian expects residual_fn(z) -> (r, J), with r   #
-#  shaped (N, d) and J shaped (N, d, d). The others expect residual_fn(z) ->  #
-#  r so the contract follows from the rule rather than from a flag on the     #
-#  call. Either way only the root matters, and the result comes back          #
-#  detached.                                                                  #
-#                                                                             #
-#      picard     z_{k+1} = z_k − β P r_k                                     #
-#      anderson   Picard plus Type-II Anderson acceleration                   #
-#      newton     z_{k+1} = z_k − β J(z_k)⁻¹ r_k                              #
-#                                                                             #
-#  β ∈ (0, 1] under-relaxes every rule without moving the root, so a fallback #
-#  ladder can re-solve a stuck row rather than reject it. P preconditions the #
-#  residual, and is meaningless for newton, whose solve is already exact. J   #
-#  is not assumed symmetric, and a singular one gives non-finite entries      #
-#  rather than raising, which the divergence test catches for that row alone. #
+#  Damping does not move the root, which is what the fallback ladder trades   #
+#  on: a row that will not converge can be re-solved more slowly instead of   #
+#  being handed back as a failure the caller has to deal with. That is worth  #
+#  the extra iterations because the alternative costs the caller a rejection  #
+#  it cannot attribute to the problem rather than to the solver.              #
 #                                                                             #
 # =========================================================================== #
 
@@ -131,12 +119,20 @@ def _iterate(residual_fn, z_init, step, wants_jac, max_iter, tol):
 class FixedPointSolver:
     """Batched root finder for ``r(z) = 0``, one problem per row of ``z``.
 
+    The three update rules, with P the preconditioner and β the damping:
+
+        picard     z_{k+1} = z_k − β P r_k
+        anderson   Picard plus Type-II Anderson acceleration over m past steps
+        newton     z_{k+1} = z_k − β J(z_k)⁻¹ r_k
+
     Parameters
     ----------
     kind : {"picard", "anderson", "newton"}
-        Update rule. ``"newton"`` sets :attr:`needs_jacobian`.
+        Update rule. ``"newton"`` sets :attr:`needs_jacobian`, and takes J as it
+        comes without assuming symmetry.
     damping : float
-        Under-relaxation β in (0, 1]. Default 1.0.
+        Under-relaxation β in (0, 1]. It slows the iteration without moving the
+        root. Default 1.0.
     anderson_history : int or None
         History length for ``"anderson"``, at least 1, ignored by the others.
         None resolves per solve to the row dimension.
@@ -195,21 +191,26 @@ class FixedPointSolver:
         Parameters
         ----------
         residual_fn : callable
-            ``z -> r``, or ``z -> (r, J)`` when :attr:`needs_jacobian`.
+            ``z -> r`` with ``r`` shaped ``(N, d)``, or ``z -> (r, J)`` with J
+            shaped ``(N, d, d)`` when :attr:`needs_jacobian`. Only the root
+            matters, so the returned values may be detached.
         z_init : (N, d)
             Starting iterate. A warm start changes the iteration count and not
             the root, provided the root is unique.
         precond : callable or None
-            Preconditioner applied to the residual, ``(N, d) -> (N, d)``.
+            Preconditioner applied to the residual, ``(N, d) -> (N, d)``. Ignored
+            by ``"newton"``, whose Jacobian solve is already exact.
         cold_start : (N, d) or None
             Iterate the fallback ladder restarts from. Defaults to ``z_init``.
 
         Returns
         -------
         SolveResult
-            ``z`` the root, with the per-row iteration count and final residual
-            max-norm. A row whose ``residual`` exceeds :attr:`tol` did not
-            converge and its ``z`` is not a root.
+            ``z`` the root, detached, with the per-row iteration count and final
+            residual max-norm. A row whose ``residual`` exceeds :attr:`tol` did
+            not converge and its ``z`` is not a root. A row is abandoned when its
+            residual goes non-finite, which is also what a singular J produces,
+            so one bad row does not raise for the others.
         """
         d = z_init.shape[-1]
         history = d if self.history is None else self.history
