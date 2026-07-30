@@ -370,7 +370,7 @@ class ChartRATTLE(HamiltonianSampler):
     ------
     ValueError
         If ``damping`` is outside (0, 1], if ``solver`` is not recognised, or if
-        the space carries no prior or has a transform that is not analytic.
+        the space carries no prior.
 
     Notes
     -----
@@ -408,13 +408,6 @@ class ChartRATTLE(HamiltonianSampler):
                 "ChartRATTLE needs a space with a prior, whose normal chart "
                 "supplies the constant prior block M of G_M = M + beta W^T W. "
                 "UnnormalizedSpace has no chart and so no M.")
-        if not space.as_transform.is_analytic:
-            raise ValueError(
-                "ChartRATTLE needs a space whose transform is analytic. The "
-                "force it integrates differentiates the chart Jacobian, and a "
-                "transform served by a numerical fallback is correct to first "
-                "order only.")
-
         super().__init__(None, space, requires_metric=True, num_steps=num_steps,
                          adapter=adapter, divergence_threshold=divergence_threshold,
                          trajectory_length=num_steps * step_size)

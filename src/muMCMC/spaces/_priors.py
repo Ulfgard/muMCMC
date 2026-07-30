@@ -2,8 +2,7 @@ import torch
 
 from ._space import Space
 from ._transform import (
-    NormalTransform, _invert_increasing, _std_normal_cdf, _std_normal_icdf,
-    _std_normal_log_pdf,
+    NormalTransform, _std_normal_cdf, _std_normal_icdf, _std_normal_log_pdf,
 )
 
 
@@ -42,7 +41,7 @@ class NormalSpace(Space):
         log_sigma = torch.log(sigma)
         self._transform = NormalTransform(
             lambda z: (mu + sigma * z, log_sigma.expand_as(z)),
-            inverse=lambda th: ((th - mu) / sigma, (-log_sigma).expand_as(th)),
+            lambda th: ((th - mu) / sigma, (-log_sigma).expand_as(th)),
             log_prob=lambda th: _std_normal_log_pdf((th - mu) / sigma) - log_sigma,
             reference=mu)
 
@@ -77,7 +76,7 @@ class LogNormalSpace(Space):
             return (log_theta - mu) / sigma, -log_sigma - log_theta
 
         self._transform = NormalTransform(
-            forward, inverse=inverse,
+            forward, inverse,
             log_prob=lambda th: (_std_normal_log_pdf((torch.log(th) - mu) / sigma)
                                  - log_sigma - torch.log(th)),
             reference=mu)
@@ -99,41 +98,28 @@ def _implements(dist, method: str) -> bool:
     return True
 
 
-def _support_chart(support):
-    """An increasing bijection from the line onto ``support``, so that a search
-    over the support runs as an unbounded one. The identity when the support is
-    the whole line."""
-    support = getattr(support, "base_constraint", support)
-    lo = getattr(support, "lower_bound", None)
-    hi = getattr(support, "upper_bound", None)
-    if lo is None and hi is None:
-        return lambda t: t
-    if hi is None:
-        return lambda t: lo + torch.exp(t)
-    if lo is None:
-        return lambda t: hi - torch.exp(-t)
-    return lambda t: lo + (hi - lo) * torch.sigmoid(t)
-
-
 def _distribution_transform(dist) -> NormalTransform:
     """The normal chart ``theta = F⁻¹(Phi(z))`` of a batched distribution.
 
     The Jacobian is analytic from the density, ``dtheta/dz = phi(z)/f(theta)``,
-    so a distribution offering ``icdf``, ``cdf`` and ``log_prob`` needs no
-    replacement. A missing ``icdf`` is replaced by bisection on ``cdf`` over the
-    support, and a missing ``cdf`` by bisection on the forward map.
+    so ``icdf``, ``cdf`` and ``log_prob`` are all it takes.
+
+    Raises
+    ------
+    ValueError
+        If ``dist`` implements neither ``icdf`` nor ``cdf``, since the chart
+        would then have no closed form in that direction.
     """
-    # Argument validation runs on a copy, so a bisection iterate sitting on the
-    # boundary of the support does not raise on the way to the root.
+    missing = [name for name in ("icdf", "cdf") if not _implements(dist, name)]
+    if missing:
+        raise ValueError(
+            f"{type(dist).__name__} does not implement {' and '.join(missing)}, "
+            f"so its normal chart has no closed form. Build the chart directly "
+            f"as a NormalTransform, or pick a distribution that does.")
     dist = dist.expand(dist.batch_shape)
-    dist._validate_args = False
-    chart = _support_chart(dist.support)
-    has_icdf, has_cdf = _implements(dist, "icdf"), _implements(dist, "cdf")
 
     def forward(z):
-        u = _std_normal_cdf(z)
-        theta = (dist.icdf(u) if has_icdf
-                 else chart(_invert_increasing(lambda t: dist.cdf(chart(t)), u)))
+        theta = dist.icdf(_std_normal_cdf(z))
         return theta, _std_normal_log_pdf(z) - dist.log_prob(theta)
 
     def inverse(theta):
@@ -144,8 +130,8 @@ def _distribution_transform(dist) -> NormalTransform:
               if torch.is_tensor(getattr(dist, name, None))]
     reference = (params[0].expand(dist.batch_shape) if params
                  else torch.zeros(dist.batch_shape))
-    return NormalTransform(forward, inverse=inverse if has_cdf else None,
-                           log_prob=dist.log_prob, reference=reference)
+    return NormalTransform(forward, inverse, log_prob=dist.log_prob,
+                           reference=reference)
 
 
 class DistributionSpace(Space):
@@ -199,7 +185,7 @@ class UnnormalizedSpace(Space):
         zero = torch.zeros(self.d, dtype=dtype, device=device)
         self._transform = NormalTransform(
             lambda z: (z, torch.zeros_like(z)),
-            inverse=lambda th: (th, torch.zeros_like(th)),
+            lambda th: (th, torch.zeros_like(th)),
             log_prob=torch.zeros_like,
             reference=zero)
 

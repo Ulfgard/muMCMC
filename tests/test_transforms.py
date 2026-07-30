@@ -3,8 +3,7 @@
 The transform is the chart every space leans on: it exposes both directions,
 each with its own diagonal Jacobian and log-determinant, and the samplers and
 ``push_forward_metric`` trust those to match the analytic Jacobian. These tests
-pin that contract down, together with the routes that replace a callable the
-caller left out.
+pin that contract down.
 
 The transform is built from callables rather than by subclassing, so these
 construct one directly instead of going through a space.
@@ -24,17 +23,17 @@ MU = torch.tensor([0.5, -1.0, 2.0])
 SIGMA = torch.tensor([1.0, 2.0, 0.3])
 
 
-def _affine(*, inverse=True, log_prob=False):
-    """``theta = mu + sigma z``, with the optional callables switchable so the
-    replacement routes can be checked against a known answer."""
+def _affine(*, log_prob=False):
+    """``theta = mu + sigma z``, with ``log_prob`` switchable so the derivation
+    from the inverse map can be checked against the closed form."""
     log_sigma = torch.log(SIGMA)
     kw = {}
-    if inverse:
-        kw["inverse"] = lambda th: ((th - MU) / SIGMA, (-log_sigma).expand_as(th))
     if log_prob:
         kw["log_prob"] = lambda th: _std_normal_log_pdf((th - MU) / SIGMA) - log_sigma
     return NormalTransform(
-        lambda z: (MU + SIGMA * z, log_sigma.expand_as(z)), reference=MU, **kw)
+        lambda z: (MU + SIGMA * z, log_sigma.expand_as(z)),
+        lambda th: ((th - MU) / SIGMA, (-log_sigma).expand_as(th)),
+        reference=MU, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +121,8 @@ def test_reports_its_coordinate_count_dtype_and_device():
 # --------------------------------------------------------------------------- #
 
 def test_derived_log_prob_matches_the_given_one():
+    # Derived from the inverse map, which is an identity rather than an
+    # approximation, so it must agree exactly with the closed form.
     theta = MU + SIGMA * torch.randn(9, 3)
     assert torch.allclose(_affine(log_prob=False).log_prob(theta),
                           _affine(log_prob=True).log_prob(theta), atol=ATOL)
@@ -134,73 +135,47 @@ def test_log_prob_is_the_density_of_the_pushed_forward_normal():
 
 
 # --------------------------------------------------------------------------- #
-#  Replacement routes                                                         #
+#  Everything is supplied                                                     #
 # --------------------------------------------------------------------------- #
 
-def test_missing_log_jacobian_is_recovered_by_autograd():
-    T = NormalTransform(lambda z: (MU + SIGMA * z, None), reference=MU)
-    z = torch.randn(5, 3)
-    assert torch.allclose(T.forward(z).jacobian_diag, SIGMA.expand_as(z), atol=ATOL)
+def test_a_missing_log_jacobian_is_rejected():
+    # Nothing is differentiated numerically, so a caller who leaves a Jacobian
+    # out is told at construction rather than served an approximation.
+    with pytest.raises(ValueError, match="both log"):
+        NormalTransform(lambda z: (MU + SIGMA * z, None),
+                        lambda th: ((th - MU) / SIGMA, torch.zeros_like(th)),
+                        reference=MU)
 
 
-def test_missing_log_jacobian_falls_back_to_finite_differences():
-    def no_graph(z):
-        with torch.no_grad():
-            return MU + SIGMA * z.detach().clone(), None
-
-    z = torch.randn(5, 3)
-    assert torch.allclose(NormalTransform(no_graph, reference=MU).forward(z).jacobian_diag,
-                          SIGMA.expand_as(z), rtol=1e-6)
+def test_a_missing_inverse_log_jacobian_is_rejected():
+    with pytest.raises(ValueError, match="both log"):
+        NormalTransform(lambda z: (MU + SIGMA * z, torch.zeros_like(z)),
+                        lambda th: ((th - MU) / SIGMA, None),
+                        reference=MU)
 
 
-def test_missing_inverse_is_found_by_bisection():
-    T = _affine(inverse=False)
-    z = torch.randn(5, 3)
-    back = T.inverse(T.forward(z).mapped_point)
-    assert torch.allclose(back.mapped_point, z, atol=1e-7)
-    assert torch.allclose(back.jacobian_diag, 1.0 / SIGMA.expand_as(z), rtol=1e-5)
-
-
-def test_a_replaced_route_still_carries_the_first_derivative():
-    # A replacement breaks the graph, so the value reattaches the derivative it
-    # computed. A sampler differentiating the target through the chart needs it.
-    T = NormalTransform(lambda z: (MU + SIGMA * z, None), reference=MU)
-    z = torch.randn(5, 3, requires_grad=True)
-    (g,) = torch.autograd.grad(T.forward(z).mapped_point.sum(), z)
-    assert torch.allclose(g, SIGMA.expand_as(z), atol=ATOL)
-
-
-def test_is_analytic_is_true_only_when_both_directions_are_given():
-    assert _affine().is_analytic
-    assert not _affine(inverse=False).is_analytic
-    assert not NormalTransform(lambda z: (MU + SIGMA * z, None),
-                               reference=MU).is_analytic
-
-
-def test_bisection_raises_when_the_value_is_outside_the_image():
-    # exp maps onto the positive half line, so a non-positive target cannot be
-    # bracketed and the failure is reported rather than returned.
-    T = NormalTransform(lambda z: (torch.exp(z), None), reference=torch.zeros(2))
-    with pytest.raises(RuntimeError, match="bracket"):
-        T.inverse(torch.tensor([[-1.0, -1.0]]))
-
-
-@pytest.mark.parametrize("order", [2, 4])
-def test_finite_difference_order_is_configurable(order):
-    def no_graph(z):
-        with torch.no_grad():
-            return torch.exp(z.detach().clone()), None
-
-    z = torch.randn(4, 3)
-    T = NormalTransform(no_graph, reference=torch.zeros(3), fd_order=order)
-    assert torch.allclose(T.forward(z).jacobian_diag, torch.exp(z), rtol=1e-5)
+def test_the_forward_map_is_differentiable_to_second_order():
+    # Both directions are closed forms, so the graph reaches the input. The
+    # force ChartRATTLE integrates differentiates the chart Jacobian, so it is
+    # the second derivative that has to survive, on a chart that has one.
+    T = NormalTransform(lambda z: (torch.exp(z), z),
+                        lambda th: (torch.log(th), -torch.log(th)),
+                        reference=torch.zeros(3))
+    z = torch.randn(4, 3, requires_grad=True)
+    (g,) = torch.autograd.grad(T.forward(z).mapped_point.sum(), z,
+                               create_graph=True)
+    (gg,) = torch.autograd.grad(g.sum(), z)
+    assert torch.allclose(g, torch.exp(z).detach(), atol=ATOL)
+    assert torch.allclose(gg, torch.exp(z).detach(), atol=ATOL)
 
 
 def test_saturating_chart_keeps_the_log_jacobian_finite():
     # The log is the stored form precisely so that a saturating value, whose
     # Jacobian underflows, still reports a usable derivative.
-    T = NormalTransform(lambda z: (_std_normal_cdf(z), _std_normal_log_pdf(z)),
-                        reference=torch.zeros(2))
+    T = NormalTransform(
+        lambda z: (_std_normal_cdf(z), _std_normal_log_pdf(z)),
+        lambda th: (torch.zeros_like(th), torch.zeros_like(th)),
+        reference=torch.zeros(2))
     m = T.forward(torch.full((1, 2), 40.0))
     assert torch.all(m.mapped_point == 1.0)
     assert torch.all(torch.isfinite(m.jacobian_log_diag))
