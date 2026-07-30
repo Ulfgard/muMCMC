@@ -211,6 +211,12 @@ class ChartConstraint:
         Conditioning value the manifold is defined by, shared across chains.
     """
 
+    # Whether psi_with_jvp needs grad mode enabled around it. True for the
+    # default, which differentiates psi. A subclass returning W from explicit or
+    # forward-mode Jacobians should set it False, which spares the graph build
+    # on every call, and that is once per iteration under the newton solver.
+    jvp_needs_grad = True
+
     def __init__(self, x: torch.Tensor):
         self.x = x
 
@@ -228,7 +234,8 @@ class ChartConstraint:
 
     def psi_with_jvp(self, q: torch.Tensor):
         """(ψ, W, log|det B|) at ``q``, with W = −∂ψ/∂q by one reverse pass per
-        latent. ``q`` must require grad. Override with explicit Jacobians."""
+        latent. ``q`` must require grad. Override with explicit Jacobians, and
+        set :attr:`jvp_needs_grad` False when the override needs no grad mode."""
         eps = self.psi(q)
         m = eps.shape[-1]
         cols = [torch.autograd.grad(eps[:, i].sum(), q, retain_graph=True,
@@ -321,9 +328,13 @@ def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
         # DF(q1) = A_prior + β W0ᵀ W(q1), the true Jacobian rather than its value
         # frozen at q0. W(q1) needs a tangent pass, so this costs more per
         # iteration than the residual alone.
-        with torch.enable_grad():
-            qk = q_k.detach().requires_grad_(True)
-            psi_k, W_k, _ = constraint.psi_with_jvp(qk)
+        if constraint.jvp_needs_grad:
+            with torch.enable_grad():
+                qk = q_k.detach().requires_grad_(True)
+                psi_k, W_k, _ = constraint.psi_with_jvp(qk)
+        else:
+            with torch.no_grad():
+                psi_k, W_k, _ = constraint.psi_with_jvp(q_k)
         psi_k, W_k = psi_k.detach(), W_k.detach()
         corr = (Wt @ (psi_k - psi).unsqueeze(-1)).squeeze(-1)
         r = drift(q_k) - beta_col * corr - rhs
