@@ -9,9 +9,13 @@ TemperedMetric). Here we check, against closed forms, that:
    matches a finite difference.
 3. The potential U.value is exactly −log p(q | x): the funnel posterior, the
    affine Gaussian, and the β-tempered funnel.
+3b. The prior comes off the space: absent means flat, a supplied one enters U
+   and ∇V, and neither touches the metric.
 4. U.lik = ½‖ψ‖² is the temperature-free swap statistic.
 5. The returned pieces are detached (no autograd graph pinned).
 """
+import math
+
 import torch
 import pytest
 
@@ -19,6 +23,13 @@ from muMCMC.ChartRATTLE import ChartRATTLE, ChartConstraint, LocationScaleChart
 from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)
+
+
+def _N01():
+    """Explicit standard-normal prior, the latent of the plain non-centered
+    parameterization. ChartRATTLE reads the prior off the space, so it is named
+    rather than assumed."""
+    return torch.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0))
 
 
 class FunnelChart(ChartConstraint):
@@ -72,7 +83,9 @@ class AffineChart(ChartConstraint):
 def _eval(constraint, eta, beta=1.0, grad=True):
     """evaluate_model through a minimal sampler at the given temperature."""
     n = eta.shape[-1]
-    s = ChartRATTLE(constraint, UnconstrainedSpace([f"v{i}" for i in range(n)]),
+    names = [f"v{i}" for i in range(n)]
+    s = ChartRATTLE(constraint,
+                    UnconstrainedSpace(names, priors={k: _N01() for k in names}),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -185,9 +198,111 @@ def test_beta_tempers_the_data_fit_only():
     eta = torch.randn(30, 1)
     U, _, _, _ = _eval(fun, eta, beta=0.4, grad=False)
     e = eta[:, 0]
-    neg_log_post = 0.5 * e * e + 0.5 * x.shape[-1] * fun.s * e \
+    # The space's Normal(0, 1) is normalized, so -log p(q) carries ½ log 2π.
+    neg_log_post = 0.5 * e * e + 0.5 * math.log(2 * math.pi) \
+        + 0.5 * x.shape[-1] * fun.s * e \
         + 0.4 * 0.5 * torch.exp(-fun.s * e) * (x * x).sum()
     assert torch.allclose(U.value, neg_log_post, atol=1e-9)
+
+
+# ========================================================================== #
+#  3b. The space's prior replaces the standard-normal latent                #
+# ========================================================================== #
+
+def _prior_eval(constraint, eta, priors, beta=1.0, grad=True):
+    """evaluate_model through a sampler whose space carries ``priors``."""
+    names = [f"v{i}" for i in range(eta.shape[-1])]
+    s = ChartRATTLE(constraint, UnconstrainedSpace(names, priors=priors),
+                    step_size=0.1, adapt_step_size=False)
+    s.beta = beta
+    return s.evaluate_model(eta, grad=grad)
+
+
+def test_absent_prior_is_flat():
+    # The prior always comes off the space, as for every other sampler, so a
+    # space without one contributes nothing rather than a standard normal.
+    c, _, _ = _funnel_pair()
+    eta = torch.randn(7, 1)
+    s = ChartRATTLE(c, UnconstrainedSpace(["v0"]), step_size=0.1,
+                    adapt_step_size=False)
+    assert torch.allclose(s.prior_potential(eta), torch.zeros(7))
+
+
+def test_standard_normal_prior_is_the_non_centered_latent():
+    # Asked for by name, the standard normal reproduces 1/2||q||^2 up to its
+    # normalizer.
+    c, _, _ = _funnel_pair()
+    eta = torch.randn(7, 1)
+    s = ChartRATTLE(c, UnconstrainedSpace(["v0"], priors={"v0": _N01()}),
+                    step_size=0.1, adapt_step_size=False)
+    assert torch.allclose(s.prior_potential(eta),
+                          0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi))
+
+
+def test_space_prior_replaces_the_standard_normal_in_U():
+    # A Normal(mu0, s0) prior on the space shows up in U as -log p(q), so U
+    # differs from the default by exactly that swap and the likelihood part is
+    # untouched.
+    c, _, _ = _funnel_pair(sigma=2.0, m=4, seed=3)
+    eta = torch.randn(9, 1)
+    prior = torch.distributions.Normal(torch.tensor(0.7), torch.tensor(1.6))
+
+    U_def = _eval(c, eta)[0]                       # standard-normal latent
+    U_pri = _prior_eval(c, eta, {"v0": prior})[0]
+
+    swap = _N01().log_prob(eta[:, 0]) - prior.log_prob(eta[:, 0])
+    assert torch.allclose(U_pri.value, U_def.value + swap, atol=1e-10)
+    assert torch.allclose(U_pri.lik, U_def.lik, atol=1e-12)
+
+
+def test_space_prior_enters_the_force():
+    # grad V has to pick the prior up, or the integrator targets a different
+    # density than U describes.
+    torch.manual_seed(4)
+    A = torch.randn(4, 2)
+    B = torch.eye(4) + 0.1 * torch.randn(4, 4)
+    B = B @ B.transpose(-2, -1)
+    c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
+    eta = torch.randn(3, 2)
+    priors = {"v0": torch.distributions.Normal(torch.tensor(0.4), torch.tensor(2.0)),
+              "v1": torch.distributions.Normal(torch.tensor(-0.3), torch.tensor(0.7))}
+    gV = _prior_eval(c, eta, priors)[4]
+
+    def V(e):
+        U, metric, _, _ = _prior_eval(c, e, priors, grad=False)
+        return U.value + 0.5 * metric.log_det_metric()
+    h = 1e-6
+    gfd = torch.zeros_like(eta)
+    for j in range(eta.shape[-1]):
+        ep = eta.clone(); ep[:, j] += h
+        em = eta.clone(); em[:, j] -= h
+        gfd[:, j] = (V(ep) - V(em)) / (2 * h)
+    assert torch.allclose(gV, gfd, atol=1e-6)
+
+
+def test_space_prior_leaves_the_metric_alone():
+    # G_M is chart geometry, not a prior term, so swapping the prior must not
+    # move it. The preconditioner of the position solve rests on this.
+    c, _, _ = _funnel_pair()
+    eta = torch.randn(5, 1)
+    m_def = _eval(c, eta)[1]
+    m_pri = _prior_eval(c, eta, {"v0": torch.distributions.Normal(
+        torch.tensor(2.0), torch.tensor(0.3))})[1]
+    assert torch.allclose(m_pri.value, m_def.value, atol=1e-12)
+
+
+def test_space_prior_is_untempered():
+    # beta multiplies the likelihood only, so the prior sits in base and the
+    # swap statistic stays temperature-free.
+    c, _, _ = _funnel_pair()
+    eta = torch.randn(6, 1)
+    priors = {"v0": torch.distributions.Normal(torch.tensor(0.2),
+                                               torch.tensor(1.3))}
+    U1 = _prior_eval(c, eta, priors, beta=1.0)[0]
+    Ub = _prior_eval(c, eta, priors, beta=0.25)[0]
+    assert torch.allclose(U1.base, Ub.base, atol=1e-12)
+    assert torch.allclose(U1.lik, Ub.lik, atol=1e-12)
+    assert torch.allclose(Ub.value, Ub.base + 0.25 * Ub.lik, atol=1e-12)
 
 
 # ========================================================================== #

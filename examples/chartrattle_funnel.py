@@ -45,7 +45,12 @@ def main():
     # Fixed step (adaptation is out of scope here). Anderson solves the n = 1
     # position equation in a few iterations per substep.
     sampler = ChartRATTLE(
-        constraint, UnconstrainedSpace(["log_scale"]),
+        constraint,
+        # eta ~ N(0, 1) is the model's own prior, so the space carries it. A
+        # space with no prior would give ChartRATTLE a flat one.
+        UnconstrainedSpace(["log_scale"], priors={
+            "log_scale": torch.distributions.Normal(torch.tensor(0.0),
+                                                    torch.tensor(1.0))}),
         step_size=0.08, num_steps=12, adapt_step_size=False,
         solver="anderson", fp_tol=1e-9,
     )

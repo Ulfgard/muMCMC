@@ -16,7 +16,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  hyperparameter (q = θ), which doubles as the chart coordinate of the       #
 #  manifold below. ε is the inner latent and x the observation.               #
 #                                                                             #
-#  Latent (q, ε) ~ N(0, I_{n+m}) and a diffeomorphism φ_q with                #
+#  Latent q ~ p(q) and ε ~ N(0, I_m), and a diffeomorphism φ_q with           #
 #                                                                             #
 #      φ_q(ε) = x,      θ = q,                                                #
 #                                                                             #
@@ -41,15 +41,44 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                             #
 #  Energy                                                                     #
 #                                                                             #
-#  Change of variables gives x | q the density N(ψ(q); 0, I) / |det B(q)|, so #
-#  against the N(0, I) prior on q the target is e^{−U} with                   #
+#  Change of variables gives x | q the density N(ψ(q); 0, I) / |det B(q)|.    #
+#  That involves the ε block alone, so any prior p(q) on the chart coordinate #
+#  carries straight through and the target is e^{−U} with                     #
 #                                                                             #
-#      U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖²,      G_M(q) = I + β Wᵀ W.         #
+#      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = I + β Wᵀ W.        #
+#                                                                             #
+#  p(q) is the space's prior, read the same way every other sampler in the    #
+#  library reads it. A space with no prior gives a flat one, so the N(0, I)   #
+#  latent that the plain non-centered parameterization implies is requested   #
+#  by name rather than assumed.                                               #
+#                                                                             #
+#  The prior enters U and nothing else. G_M keeps its I whatever the prior    #
+#  is, and a space's prior_metric_fn is deliberately unused, because that I   #
+#  is not a free choice. The same matrix appears in five coupled places:      #
+#  A_prior in G_M, the (q1 − q0) term of F, the (q1 − q0) of the momentum     #
+#  line, the kinetic term of S_h, and DF(q0) which the solve preconditions    #
+#  with. They are one object. Replacing it in G_M alone leaves H no longer    #
+#  the integrator's invariant, and energy error grows by an order of          #
+#  magnitude for a five percent mismatch.                                     #
+#                                                                             #
+#  A constant prior metric could be substituted consistently, moving all five #
+#  together and leaving S_h variational. A position-dependent one cannot: S_h #
+#  would need A_prior at the midpoint to stay symmetric, F would pick up      #
+#  ∂A/∂q1 terms, and DF(q0) would stop being G_M(q0). Neither is implemented, #
+#  so the prior is not currently reflected in the preconditioning. That costs #
+#  efficiency where a prior is sharply curved, such as at the walls of a soft #
+#  box, and costs nothing in correctness: exactness needs only that G_M is    #
+#  SPD and that V carries ½ log det G_M.                                      #
+#                                                                             #
+#  Because the constraint and the prior are both evaluated at the sampled     #
+#  position, and U carries no change-of-variables Jacobian, the space has to  #
+#  map q to θ by the identity. The constructor checks this.                   #
 #                                                                             #
 #  No co-area factor survives into U, and that is not an omission. In the     #
-#  Hausdorff-measure form the density on M is e^{−½‖(q,ε)‖²}/√(det Λ) with    #
-#  Λ = Dg Dgᵀ, and reading it in the q chart multiplies by the chart Jacobian #
-#  √(det G_M). The two collapse exactly: with Dg = [A, B] and A = B W,        #
+#  Hausdorff-measure form the ambient density restricted to M carries a       #
+#  factor 1/√(det Λ) with Λ = Dg Dgᵀ, and reading it in the q chart           #
+#  multiplies by the chart Jacobian √(det G_M). The two collapse exactly:     #
+#  with Dg = [A, B] and A = B W,                                              #
 #                                                                             #
 #      Λ = A Aᵀ + B Bᵀ = B (I + W Wᵀ) Bᵀ,                                     #
 #      det Λ = (det B)² det(I + Wᵀ W) = (det B)² det G_M       (Sylvester)    #
@@ -57,7 +86,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  so √(det G_M / det Λ) = 1/|det B|, which is the log|det B| term above. The #
 #  user supplies log|det B|. The measure bookkeeping is ours.                 #
 #                                                                             #
-#  U is affine in β (lik = ½‖ψ‖², base = ½‖q‖² + log|det B|) and G_M is       #
+#  U is affine in β (lik = ½‖ψ‖², base = −log p(q) + log|det B|) and G_M is   #
 #  affine in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as #
 #  a TemperedAffine and a TemperedMetric. The Hamiltonian                     #
 #                                                                             #
@@ -138,14 +167,15 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  β softens the observation in the scale family, Σ -> Σ/β, which scales the  #
 #  data-fit ½‖ψ‖² by β. So β multiplies the likelihood wherever it appears:   #
 #  in the potential U (β·½‖ψ‖²), in the metric G_M = I + β WᵀW, and hence in  #
-#  the position equation F and its Jacobian above. The prior ½‖q‖² and the    #
-#  volume log|det B| stay untempered. That drops the β^{m/2} normalizer the   #
+#  the position equation F and its Jacobian above. The prior −log p(q) and    #
+#  the volume log|det B| stay untempered. That drops the β^{m/2} normalizer   #
+#  the                                                                        #
 #  exact scale family carries, deliberately: it keeps U finite as β -> 0,     #
 #  where the scale family itself degenerates. A parallel-tempering swap reads #
 #  the β-free ½‖ψ‖² off U.lik.                                                #
 #                                                                             #
-#  What the drop costs. The β = 0 rung is e^{−½‖q‖²}/|det B(q)|, not the      #
-#  prior, and its normalizer Z_0 is not 1. Thermodynamic integration along    #
+#  What the drop costs. The β = 0 rung is p(q)/|det B(q)|, not the prior      #
+#  itself, and its normalizer Z_0 is not 1. Thermodynamic integration along   #
 #  the ladder therefore yields log p(x) − log Z_0, so PT's ``log_evidence``   #
 #  is an evidence against an unnormalized reference here rather than an       #
 #  absolute one.                                                              #
@@ -317,9 +347,9 @@ class ChartRATTLEState:
 #                                                                             #
 #  ChartRATTLE sampler                                                        #
 #                                                                             #
-#  Runs in the q chart. The N(0, I) top-level prior is baked into U, so the   #
-#  space is the identity UnconstrainedSpace over the θ names and the driver   #
-#  reads the position q off as θ. evaluate_model builds U (TemperedAffine)    #
+#  Runs in the q chart. The space is the identity UnconstrainedSpace over the #
+#  θ names and the driver reads the position q off as θ. The space's prior    #
+#  goes into U, flat if it has none. evaluate_model builds U (TemperedAffine) #
 #  and G_M (TemperedMetric) from the constraint. integrate performs the step. #
 #                                                                             #
 # =========================================================================== #
@@ -333,8 +363,17 @@ class ChartRATTLE(HamiltonianSampler):
     constraint : ChartConstraint
         The reparameterization inverse ψ(q) = φ_q⁻¹(x) and its geometry.
     space
-        Identity unconstrained space over the θ (= q) names, no prior (the
-        N(0, I) prior is in U).
+        Identity unconstrained space over the θ (= q) names. Its prior becomes
+        the prior on q, entering U as −log p(q), and is flat when the space
+        carries none. Any ``prior_metric_fn`` is unused, since G_M is fixed by
+        the integrator rather than chosen (see the Energy section at the top of
+        this module).
+
+    Raises
+    ------
+    ValueError
+        If ``space`` does not map q to θ by the identity, if ``damping`` is
+        outside (0, 1], or if ``solver`` is not recognised.
     step_size : float
         Integration step size. When adapting, start it small: the step is grown
         from here, so a too-large start begins above the solver-convergence cliff
@@ -382,6 +421,7 @@ class ChartRATTLE(HamiltonianSampler):
         damping: float = 1.0,
         divergence_threshold: float = 100.0,
     ):
+        self._require_identity_space(space)
         if not 0.0 < damping <= 1.0:
             raise ValueError(f"damping must be in (0, 1], got {damping}")
         if solver == "picard":
@@ -413,7 +453,46 @@ class ChartRATTLE(HamiltonianSampler):
         self.register_diagnostic("fp_iters_max", lambda: self._fp_iters_max)
         self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
+    @staticmethod
+    def _require_identity_space(space):
+        """Reject a space whose z -> theta map is not the identity.
+
+        The constraint reads the sampled position as theta and U carries no
+        change-of-variables Jacobian, so a transforming space would silently
+        sample the wrong density rather than fail.
+        """
+        probe = torch.zeros(2, space.d)
+        probe[1] = 0.5
+        mapped = space.map_to_constrained_vector(probe)
+        identity = (torch.equal(mapped.mapped_point, probe)
+                    and bool((mapped.jacobian_log_det.abs() < 1e-12).all()))
+        if not identity:
+            raise ValueError(
+                f"ChartRATTLE needs a space that maps q to theta by the "
+                f"identity, because the constraint and the prior are both "
+                f"evaluated at the sampled position and U carries no transform "
+                f"Jacobian. Got {type(space).__name__}.")
+
     # ---- model evaluation (the extension point) ---------------------------- #
+
+    def prior_potential(self, q):
+        """``-log p(q)``, the prior on the chart coordinate, shape ``(N,)``.
+
+        Always the space's prior, as for every other sampler in the library. A
+        space with no prior therefore gives a flat one, so a standard-normal
+        latent has to be asked for by name.
+
+        Parameters
+        ----------
+        q : (N, n)
+            Position, the chart coordinate.
+
+        Returns
+        -------
+        (N,) Tensor
+            Differentiable in ``q``, since the force ``∇V`` runs through it.
+        """
+        return -self.space.prior_log_prob_vector(q)
 
     def evaluate_model(self, z_free, beta=None, grad=False):
         """The model at the position ``z_free`` (the chart coordinate ``q``), and
@@ -421,10 +500,11 @@ class ChartRATTLE(HamiltonianSampler):
         psi, W)``, or ``(U, metric, psi, W, grad_V)`` when ``grad`` is set.
 
         U : TemperedAffine
-            Potential U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖². The target is e^{−U}.
+            Potential U(q) = −log p(q) + log|det B| + β·½‖ψ‖², with p(q) the
+            space's prior. The target is e^{−U}.
 
         metric : TemperedMetric
-            Metric G_M(q) = I + β WᵀW on the q-chart: the ambient N(0, I) metric
+            Metric G_M(q) = I + β WᵀW on the q-chart: the ambient metric
             pulled back to the chart along q ↦ (q, ψ(q)), whose tangents are
             (v, −W v).
 
@@ -452,7 +532,7 @@ class ChartRATTLE(HamiltonianSampler):
             psi, W, log_abs_det_B = self.constraint.psi_with_jvp(q)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
             lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
-            base = 0.5 * (q * q).sum(-1) + log_abs_det_B
+            base = self.prior_potential(q) + log_abs_det_B
             if grad:
                 G = eye + broadcast_beta(beta, 2) * gram
                 # Cholesky, not torch.logdet: same factorization the metric uses

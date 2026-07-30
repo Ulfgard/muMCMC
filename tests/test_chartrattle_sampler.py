@@ -18,6 +18,13 @@ from muMCMC.PT import PT
 torch.set_default_dtype(torch.float64)
 
 
+def _N01():
+    """Explicit standard-normal prior, the latent of the plain non-centered
+    parameterization. ChartRATTLE reads the prior off the space, so it is named
+    rather than assumed."""
+    return torch.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0))
+
+
 class FunnelChart(ChartConstraint):
     def __init__(self, sigma, x):
         super().__init__(x)
@@ -65,7 +72,7 @@ def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
     c = FunnelChart(sigma, torch.randn(m))
     kw.setdefault("adapt_step_size", False)
     kw.setdefault("step_size", 0.1)
-    return ChartRATTLE(c, UnconstrainedSpace(["v"]), **kw)
+    return ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()}), **kw)
 
 
 def _endpoint_state(sampler, eta):
@@ -104,7 +111,8 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"]), step_size=0.1, adapt_step_size=False)
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors={"a": _N01(), "b": _N01()}),
+                    step_size=0.1, adapt_step_size=False)
     N = 40000
     state = s.sample_momentum(s.init(torch.zeros(N, 2)))
     G = state.metric.value[0]
@@ -189,6 +197,17 @@ def test_invalid_anderson_history_raises():
         _funnel_sampler(solver="anderson", anderson_history=0)
 
 
+def test_transforming_space_raises():
+    # The constraint reads the sampled position as theta and U carries no
+    # change-of-variables Jacobian, so a space with a real transform would
+    # sample the wrong density. It has to be refused, not tolerated.
+    from muMCMC.spaces import UniformBoxSpace
+    c = FunnelChart(2.0, torch.randn(4))
+    box = UniformBoxSpace({"v": (-2.0, 3.0)}, ["v"], "cpu")
+    with pytest.raises(ValueError, match="identity"):
+        ChartRATTLE(c, box, step_size=0.1, adapt_step_size=False)
+
+
 @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
 def test_invalid_damping_raises(bad):
     with pytest.raises(ValueError, match="damping"):
@@ -209,8 +228,45 @@ def test_recovers_affine_gaussian_posterior():
     c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
     mu, Sigma = c.posterior()
 
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"]), step_size=0.4, num_steps=12,
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors={"a": _N01(), "b": _N01()}),
+                    step_size=0.4, num_steps=12,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-10)
+    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
+                     num_chains=64, disable_progbar=True)
+    draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
+    assert torch.allclose(draws.mean(0), mu, atol=0.03)
+    assert torch.allclose(torch.cov(draws.T), Sigma, atol=0.05)
+    assert int(s.diagnostics()["num_divergences"].sum()) == 0
+
+
+def test_recovers_affine_gaussian_posterior_under_a_space_prior():
+    # Same affine chart, but the space carries a Normal(m0, s0) prior instead of
+    # the standard-normal latent. The exact posterior precision becomes
+    # S0^-1 + W^T W, so a chain that ignored the prior would miss both moments.
+    torch.manual_seed(1)
+    A = torch.randn(5, 2)
+    B = torch.eye(5) + 0.2 * torch.randn(5, 5)
+    B = B @ B.transpose(-2, -1)
+    c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
+
+    m0 = torch.tensor([0.8, -0.5])
+    s0 = torch.tensor([1.5, 0.6])
+    priors = {n: torch.distributions.Normal(m0[i], s0[i])
+              for i, n in enumerate(["a", "b"])}
+
+    W = c.W_const
+    S0_inv = torch.diag(1.0 / s0 ** 2)
+    Lam = S0_inv + W.transpose(-2, -1) @ W
+    Sigma = torch.linalg.inv(Lam)
+    mu = Sigma @ (S0_inv @ m0 + W.transpose(-2, -1) @ c.d)
+
+    # The prior really does move the target, so the test has teeth.
+    mu_flat, _ = c.posterior()
+    assert float((mu - mu_flat).abs().max()) > 0.1
+
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors=priors),
+                    step_size=0.4, num_steps=12, adapt_step_size=False,
+                    solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
@@ -234,7 +290,8 @@ def test_recovers_funnel_posterior_against_quadrature():
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
-    s = ChartRATTLE(c, UnconstrainedSpace(["v"]), step_size=0.08, num_steps=16,
+    s = ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()}),
+                    step_size=0.08, num_steps=16,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-9)
     out = s.run_mcmc(torch.zeros(1), num_samples=400, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
@@ -262,7 +319,8 @@ def test_pt_runs_swaps_and_recovers_target_mean():
                  + 0.5 * m * sigma * grid)
     mean_q = float((torch.softmax(log_post, 0) * grid).sum())
 
-    kernel = ChartRATTLE(FunnelChart(sigma, xobs), UnconstrainedSpace(["v"]),
+    kernel = ChartRATTLE(FunnelChart(sigma, xobs),
+                         UnconstrainedSpace(["v"], priors={"v": _N01()}),
                          step_size=0.06, num_steps=12, adapt_step_size=False,
                          solver="anderson", fp_tol=1e-9)
     # β > 0 throughout: β = 0 sends Σ/β -> ∞, outside the scale family.
