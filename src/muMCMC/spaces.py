@@ -1,151 +1,372 @@
-import contextlib
+import math
 from functools import cached_property
 
 import torch
 
 # =========================================================================== #
 #                                                                             #
-#  Prior contract                                                             #
+#  The normal chart                                                           #
 #                                                                             #
-#  Every space assumes its prior p(y) factorizes over the parameter names and #
-#  is a normalized density over the free coordinates. Both assumptions are    #
-#  preconditions the interface does not check.                                #
+#  A space is a group of named variables carrying a prior. The prior is held  #
+#  as a diffeomorphism of the standard normal,                                #
 #                                                                             #
-#  Anything reading log p(x) = log INT p(x|y) p(y) dy as an evidence relies   #
-#  on both. Factorization lets a marginal drop the integrated-out names       #
-#  cleanly. A missing normalizer shifts the evidence by exactly that          #
-#  constant.                                                                  #
+#      theta = T(z),   z ~ N(0, I),                                           #
 #                                                                             #
-#  Factorization is also what makes the marginal interface work.              #
+#  elementwise and strictly increasing in each coordinate, and every sampler  #
+#  runs in z. Bounds are not constraints here. A variable on (l, u) is a      #
+#  Uniform prior whose T is the probit map, so the box lives in the prior     #
+#  rather than in a separate transform.                                       #
+#                                                                             #
+#  Two identities follow, and they are why the chart is worth the indirection.#
+#                                                                             #
+#  The prior and the change of variables collapse. The temperature-free part  #
+#  of the potential is U_base = -log p(theta) - log|det dtheta/dz|, and with  #
+#  log p(theta) = log phi(z) - log|det dtheta/dz| that is                      #
+#                                                                             #
+#      U_base = -log phi(z) = ½‖z‖² + (d/2) log 2π,                           #
+#                                                                             #
+#  a closed form in z alone. The prior leaves the inner loop entirely.        #
+#                                                                             #
+#  The prior's metric is the identity. Its natural metric in theta is         #
+#  M_theta = J^-T J^-1 with J = dtheta/dz, so its pushforward to z is         #
+#  Jᵀ M_theta J = I. The same I is the exact Hessian of U_base, because the   #
+#  prior read in its own chart is exactly N(0, I) rather than something       #
+#  approximated by it. A scheme needing a constant prior metric therefore     #
+#  needs no condition on the prior, which is what lets ChartRATTLE take one.  #
+#                                                                             #
+#  A prior is normalized by construction, being the pushforward of a          #
+#  normalized density, so anything reading log p(x) as an evidence gets an    #
+#  absolute value rather than one off by an unstated constant.                #
+#                                                                             #
 #  prior_log_prob is keyed on which free names appear in its argument. Every  #
 #  free name gives the full log-prior, a subset gives the marginal over that  #
-#  subset, which is the sum of just those factors. A name left out by         #
-#  accident therefore returns a marginal instead of raising. That is the      #
-#  price of keeping the interface a single method taking one dict.            #
+#  subset, which is the sum of just those factors because the prior           #
+#  factorizes over the coordinate axis. A name left out by accident therefore #
+#  returns a marginal instead of raising. That is the price of keeping the    #
+#  interface a single method taking one dict.                                 #
 #                                                                             #
-#  A space normalizes any prior it defines itself. The implicit uniform of a  #
-#  bounded box, for instance, contributes -log(u_i - l_i) per coordinate.     #
-#  A prior supplied by the caller is taken as given, so the caller owns its   #
-#  normalization, and an explicit prior is not renormalized for truncation to #
-#  a box.                                                                     #
+#  UnnormalizedSpace is the one member with no chart. Its T is the identity   #
+#  and its prior is absent, so z is theta, U_base is 0, and the prior metric  #
+#  is None. An evidence or an entropy computed against it is not defined,     #
+#  which is what its name records.                                            #
 #                                                                             #
 # =========================================================================== #
 
-
-@contextlib.contextmanager
-def _rng_context(generator):
-    """Make the enclosed sampling reproducible from ``generator``.
-
-    torch and pyro distributions take no generator argument, so a seed drawn
-    from ``generator`` seeds a forked copy of the global RNG, which is restored
-    on exit. With ``generator`` None the global RNG is used directly.
-    """
-    if generator is None:
-        yield
-        return
-    seed = int(torch.randint(0, 2 ** 62, (1,), generator=generator).item())
-    with torch.random.fork_rng():
-        torch.manual_seed(seed)
-        yield
+_LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
 
 
-class ElementwiseTransform:
-    """
-    Elementwise transform p' = T(p) with diagonal Jacobian.
+def _std_normal_log_pdf(z: torch.Tensor) -> torch.Tensor:
+    return -0.5 * z * z - _LOG_SQRT_2PI
 
-    Exposes the mapped point, the (diagonal) Jacobian and its log-determinant,
-    and the inverse transform.
+
+def _std_normal_cdf(z: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (1.0 + torch.erf(z * (0.5 ** 0.5)))
+
+
+def _std_normal_icdf(u: torch.Tensor) -> torch.Tensor:
+    return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+
+
+class ElementwiseMap:
+    """An elementwise map evaluated at a point, with its diagonal Jacobian.
+
+    Carries the point, its image, and the log of the Jacobian diagonal. The log
+    is the stored form because a saturating map has a diagonal that underflows
+    while its logarithm stays finite.
+
+    Parameters
+    ----------
+    point : Tensor, shape (..., d)
+        Where the map was evaluated.
+    mapped_point : Tensor, shape (..., d)
+        The image of ``point``.
+    log_jacobian_diag : Tensor, shape (..., d)
+        Log of the Jacobian diagonal at ``point``, which is positive because the
+        map is strictly increasing in each coordinate.
     """
 
     def __init__(
         self,
-        p:              torch.Tensor,
-        p_prime:        torch.Tensor,
-        diag_J:         torch.Tensor,
-        log_abs_det_J:  torch.Tensor,
+        point:              torch.Tensor,
+        mapped_point:       torch.Tensor,
+        log_jacobian_diag:  torch.Tensor,
     ):
-        self._p             = p
-        self._p_prime       = p_prime
-        self._diag_J        = diag_J
-        self._log_abs_det_J = log_abs_det_J
+        self._point             = point
+        self._mapped_point      = mapped_point
+        self._log_jacobian_diag = log_jacobian_diag
+
+    @property
+    def point(self) -> torch.Tensor:
+        return self._point
 
     @property
     def mapped_point(self) -> torch.Tensor:
-        return self._p_prime
+        return self._mapped_point
 
     @property
-    def p(self) -> torch.Tensor:
-        return self._p
+    def jacobian_log_diag(self) -> torch.Tensor:
+        """Log of the diagonal of the Jacobian, shape ``(..., d)``."""
+        return self._log_jacobian_diag
 
     @cached_property
-    def inv(self) -> "ElementwiseTransform":
-        return ElementwiseTransform(
-            p             = self._p_prime,
-            p_prime       = self._p,
-            diag_J        = 1.0 / self._diag_J,
-            log_abs_det_J = -self._log_abs_det_J,
-        )
-
-    @property
-    def jacobian_log_det(self) -> torch.Tensor:
-        return self._log_abs_det_J
-
-    @property
     def jacobian_diag(self) -> torch.Tensor:
-        """Diagonal of the Jacobian dp'/dp."""
-        return self._diag_J
+        """Diagonal of the Jacobian, shape ``(..., d)``."""
+        return torch.exp(self._log_jacobian_diag)
+
+    @cached_property
+    def jacobian_log_det(self) -> torch.Tensor:
+        """``log|det J|``, shape ``(...)``, summed over the coordinate axis."""
+        return self._log_jacobian_diag.sum(dim=-1)
+
+    @cached_property
+    def inv(self) -> "ElementwiseMap":
+        """The same map read backwards, so its Jacobian is the reciprocal."""
+        return ElementwiseMap(self._mapped_point, self._point,
+                              -self._log_jacobian_diag)
 
     def jvp(self, v: torch.Tensor) -> torch.Tensor:
-        return self._diag_J * v
+        """``J v`` for a tangent ``v`` of shape ``(..., d)``."""
+        return self.jacobian_diag * v
 
 
-class transforms:
+def _autograd_derivative(fn, x):
+    """Elementwise ``d fn(x)_i / d x_i``, or None when the graph does not reach
+    ``x``. Valid only because ``fn`` is elementwise, which makes one backward
+    pass over the sum yield the whole diagonal."""
+    try:
+        with torch.enable_grad():
+            x_leaf = x.detach().requires_grad_(True)
+            (g,) = torch.autograd.grad(fn(x_leaf).sum(), x_leaf,
+                                       allow_unused=True)
+    except RuntimeError:
+        return None
+    if g is None or not bool(torch.isfinite(g).all()):
+        return None
+    return g.detach()
 
-    @staticmethod
-    def identity(p: torch.Tensor) -> ElementwiseTransform:
-        shape = (p.shape[0],) if p.dim() == 2 else ()
-        return ElementwiseTransform(
-            p             = p,
-            p_prime       = p,
-            diag_J        = torch.ones_like(p),
-            log_abs_det_J = torch.zeros(shape, device=p.device, dtype=p.dtype),
-        )
 
-    @staticmethod
-    def _box(p, p_prime, l, u):
-        """Box <-> unconstrained tanh transform.
+def _fd_derivative(fn, x, order: int):
+    """Elementwise ``d fn(x)_i / d x_i`` by a central difference of the given
+    order, with the step scaled to the working precision."""
+    h = torch.finfo(x.dtype).eps ** (1.0 / (order + 1))
+    h = h * torch.clamp(x.abs(), min=1.0)
+    with torch.no_grad():
+        if order == 2:
+            return (fn(x + h) - fn(x - h)) / (2.0 * h)
+        return (-fn(x + 2.0 * h) + 8.0 * fn(x + h)
+                - 8.0 * fn(x - h) + fn(x - 2.0 * h)) / (12.0 * h)
 
-            p'            = (u+l)/2 + (u-l)/2 * tanh(p)
-            p             = atanh( 2 (p' - (u+l)/2) / (u-l) )
-            d p'/d p      = (u-l)/2 * sech^2(p)
-            log|d p'/d p| = log((u-l)/2) - 2 log|cosh(p)|
-        """
-        scale = (u - l) / 2.0
-        log_diag_J = torch.log(scale) - 2.0 * torch.log(torch.cosh(p))
-        return ElementwiseTransform(
-            p             = p,
-            p_prime       = p_prime,
-            diag_J        = torch.exp(log_diag_J),
-            log_abs_det_J = log_diag_J.sum(dim=-1),
-        )
 
-    @staticmethod
-    def box(p: torch.Tensor, l: torch.Tensor, u: torch.Tensor) -> ElementwiseTransform:
-        """Unconstrained p -> constrained p' = (u+l)/2 + (u-l)/2 * tanh(p)."""
-        l, u = torch.atleast_1d(l), torch.atleast_1d(u)
-        center = (u + l) / 2.0
-        half_range = (u - l) / 2.0
-        p_prime = center + half_range * torch.tanh(p)
-        return transforms._box(p, p_prime, l, u)
+def _invert_increasing(fn, y, *, max_expand: int = 64, max_iter: int = 100):
+    """Solve ``fn(x) = y`` elementwise for a strictly increasing ``fn``, by
+    doubling a bracket around zero and then bisecting it."""
+    lo = -torch.ones_like(y)
+    hi = torch.ones_like(y)
+    for _ in range(max_expand):
+        low_hits = fn(lo) > y
+        high_hits = fn(hi) < y
+        if not bool((low_hits | high_hits).any()):
+            break
+        lo = torch.where(low_hits, 2.0 * lo, lo)
+        hi = torch.where(high_hits, 2.0 * hi, hi)
+    else:
+        raise RuntimeError(
+            "could not bracket the inverse of a transform. The value lies "
+            "outside the image of the map, or the map is not increasing.")
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        below = fn(mid) < y
+        lo = torch.where(below, mid, lo)
+        hi = torch.where(below, hi, mid)
+    return 0.5 * (lo + hi)
 
-    @staticmethod
-    def box_inv(p_prime: torch.Tensor, l: torch.Tensor, u: torch.Tensor) -> ElementwiseTransform:
-        """Constrained p' in (l, u) -> unconstrained p = atanh(2(p'-c)/(u-l))."""
-        l, u = torch.atleast_1d(l), torch.atleast_1d(u)
-        center = (u + l) / 2.0
-        half_range = (u - l) / 2.0
-        p = torch.atanh((p_prime - center) / half_range)
-        return transforms._box(p, p_prime, l, u).inv
+
+def _reattach(value, x, log_jac):
+    """``value`` carrying the first derivative ``exp(log_jac)`` with respect to
+    ``x``, for a value computed by a route autograd cannot follow. Returns it
+    unchanged when the graph is already there or when none is wanted."""
+    if not x.requires_grad or value.requires_grad:
+        return value
+    return value.detach() + (x - x.detach()) * torch.exp(log_jac).detach()
+
+
+def _implements(dist, method: str) -> bool:
+    """Whether ``dist`` gives ``method`` a body rather than inheriting the one
+    that raises."""
+    try:
+        getattr(dist, method)(torch.zeros((), dtype=torch.get_default_dtype()))
+    except NotImplementedError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _support_chart(support):
+    """An increasing bijection from the line onto ``support``, so that a search
+    over the support runs as an unbounded one. The identity when the support is
+    the whole line."""
+    support = getattr(support, "base_constraint", support)
+    lo = getattr(support, "lower_bound", None)
+    hi = getattr(support, "upper_bound", None)
+    if lo is None and hi is None:
+        return lambda t: t
+    if hi is None:
+        return lambda t: lo + torch.exp(t)
+    if lo is None:
+        return lambda t: hi - torch.exp(-t)
+    return lambda t: lo + (hi - lo) * torch.sigmoid(t)
+
+
+class NormalTransform:
+    """``theta = T(z)``, elementwise and strictly increasing per coordinate,
+    pushing ``z ~ N(0, I)`` forward to the prior on ``theta``.
+
+    The map is given as callables rather than by subclassing, so a space builds
+    one by handing over the mathematics of its own prior. Each direction returns
+    its value together with the log of its Jacobian diagonal, which is how a
+    caller supplies both from one pass over the shared intermediates.
+
+    Anything left out is replaced: a missing log Jacobian is differentiated by
+    autograd, or by a central difference when the graph does not reach the
+    input, a missing ``inverse`` is found by bisection, and a missing
+    ``log_prob`` is assembled from the inverse map. A replaced route breaks the
+    autograd graph, so the value carries the computed first derivative back to
+    its input. First derivatives of the target are then right and higher ones
+    are not, which is what :attr:`is_analytic` records.
+
+    Parameters
+    ----------
+    forward : callable
+        ``z -> (theta, log dtheta/dz)`` for ``z`` of shape ``(..., d)``, both
+        entries of shape ``(..., d)``. The second may be None.
+    inverse : callable, optional
+        ``theta -> (z, log dz/dtheta)``, in the same shapes. The second entry may
+        be None.
+    log_prob : callable, optional
+        ``theta -> (..., d)``, the per-coordinate log-density of the prior. Give
+        it when a closed form beats going through ``inverse``.
+    reference : Tensor, shape (d,)
+        Parameter tensor fixing the coordinate count, the dtype and the device.
+    fd_order : int
+        Order of the central difference used when a derivative is neither given
+        nor reachable by autograd.
+
+    Attributes
+    ----------
+    is_analytic : bool
+        Whether both directions and both Jacobians were given, so the map is
+        differentiable to any order. Determined by evaluating the callables once
+        at ``z = 0``.
+    interior_point : Tensor, shape (d,)
+        ``T(0)``, a point in the support of every coordinate.
+    """
+
+    def __init__(self, forward, *, inverse=None, log_prob=None, reference,
+                 fd_order: int = 4):
+        self._forward_fn = forward
+        self._inverse_fn = inverse
+        self._log_prob_fn = log_prob
+        self._reference = reference
+        self.fd_order = fd_order
+
+        theta, forward_jac = forward(torch.zeros_like(reference))
+        self.interior_point = theta.detach()
+        inverse_jac = None if inverse is None else inverse(theta)[1]
+        self.is_analytic = forward_jac is not None and inverse_jac is not None
+
+    @property
+    def d(self) -> int:
+        """Number of coordinates the transform spans."""
+        return self._reference.shape[-1]
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._reference.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._reference.device
+
+    def _log_derivative(self, fn, x):
+        derivative = _autograd_derivative(fn, x)
+        if derivative is None:
+            derivative = _fd_derivative(fn, x, self.fd_order)
+        return torch.log(derivative)
+
+    def _invert(self, theta):
+        if self._inverse_fn is not None:
+            return self._inverse_fn(theta)
+        return _invert_increasing(lambda z: self._forward_fn(z)[0], theta), None
+
+    def forward(self, z: torch.Tensor) -> ElementwiseMap:
+        """``theta = T(z)`` with ``dtheta/dz``, for ``z`` of shape ``(..., d)``."""
+        theta, log_jac = self._forward_fn(z)
+        if log_jac is None:
+            log_jac = self._log_derivative(lambda t: self._forward_fn(t)[0], z)
+        return ElementwiseMap(z, _reattach(theta, z, log_jac), log_jac)
+
+    def inverse(self, theta: torch.Tensor) -> ElementwiseMap:
+        """``z = T⁻¹(theta)`` with ``dz/dtheta``, for ``theta`` of shape
+        ``(..., d)``."""
+        z, log_jac = self._invert(theta)
+        if log_jac is None:
+            log_jac = self._log_derivative(lambda t: self._invert(t)[0], theta)
+        return ElementwiseMap(theta, _reattach(z, theta, log_jac), log_jac)
+
+    def metric(self, theta: torch.Tensor) -> torch.Tensor:
+        """Diagonal of the prior's natural metric ``M = J⁻ᵀ J⁻¹`` at ``theta``,
+
+            M_ii = (dz_i/dtheta_i)²,
+
+        shape ``(..., d)``. It is the Jacobian of the inverse map that squares,
+        so this is the reciprocal of ``(dtheta/dz)²``. Its pushforward to ``z``
+        is the identity."""
+        return self.inverse(theta).jacobian_diag ** 2
+
+    def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
+        """Per-coordinate log-density of the prior at ``theta``,
+
+            log p_i(theta_i) = log phi(z_i) + log(dz_i/dtheta_i),
+
+        shape ``(..., d)``."""
+        if self._log_prob_fn is not None:
+            return self._log_prob_fn(theta)
+        m = self.inverse(theta)
+        return _std_normal_log_pdf(m.mapped_point) + m.jacobian_log_diag
+
+
+def _distribution_transform(dist) -> NormalTransform:
+    """The normal chart ``theta = F⁻¹(Phi(z))`` of a batched distribution.
+
+    The Jacobian is analytic from the density, ``dtheta/dz = phi(z)/f(theta)``,
+    so a distribution offering ``icdf``, ``cdf`` and ``log_prob`` needs no
+    replacement. A missing ``icdf`` is replaced by bisection on ``cdf`` over the
+    support, and a missing ``cdf`` by bisection on the forward map.
+    """
+    # Argument validation runs on a copy, so a bisection iterate sitting on the
+    # boundary of the support does not raise on the way to the root.
+    dist = dist.expand(dist.batch_shape)
+    dist._validate_args = False
+    chart = _support_chart(dist.support)
+    has_icdf, has_cdf = _implements(dist, "icdf"), _implements(dist, "cdf")
+
+    def forward(z):
+        u = _std_normal_cdf(z)
+        theta = (dist.icdf(u) if has_icdf
+                 else chart(_invert_increasing(lambda t: dist.cdf(chart(t)), u)))
+        return theta, _std_normal_log_pdf(z) - dist.log_prob(theta)
+
+    def inverse(theta):
+        z = _std_normal_icdf(dist.cdf(theta))
+        return z, dist.log_prob(theta) - _std_normal_log_pdf(z)
+
+    params = [getattr(dist, name) for name in dist.arg_constraints
+              if torch.is_tensor(getattr(dist, name, None))]
+    reference = (params[0].expand(dist.batch_shape) if params
+                 else torch.zeros(dist.batch_shape))
+    return NormalTransform(forward, inverse=inverse if has_cdf else None,
+                           log_prob=dist.log_prob, reference=reference)
 
 
 # =========================================================================== #
@@ -245,13 +466,14 @@ class TemperedAffine:
 
 class TemperedMetric(TemperedAffine):
     """
-    Free-space metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD
-    :attr:`value` whose operations are built from its Cholesky factor ``G = L Lᵀ``.
+    Metric ``G = beta * A_lik + A_prior`` in the normal chart, an ``(N, d, d)``
+    SPD :attr:`value` whose operations are built from its Cholesky factor
+    ``G = L Lᵀ``.
 
-    ``A_lik`` and ``A_prior`` (``lik`` and ``base``) are the likelihood and prior
-    metrics pushed forward to free unconstrained coordinates (see
-    ``space.push_forward_metric``). ``A_prior`` is ``None`` when the prior
-    contributes no metric.
+    ``A_lik`` (``lik``) is the likelihood metric pushed forward to the chart (see
+    ``Space.push_forward_metric``). ``A_prior`` (``base``) is the prior's metric
+    there, which is the identity for a space carrying a prior and ``None`` for
+    one that does not.
     """
 
     @cached_property
@@ -280,360 +502,529 @@ class TemperedMetric(TemperedAffine):
 # =========================================================================== #
 #  Spaces                                                                     #
 # =========================================================================== #
- 
 
+class Space:
+    """Named variables with a prior, read in the prior's normal chart.
 
-class UnconstrainedSpace:
-    def __init__(self, names, priors=None, *, prior_metric_fn=None, fixed=None):
-        """
-        Parameters
-        ----------
-        names : sequence of str
-            Parameter names (full / ambient ordering).
-        priors : dict[str, distribution] or None
-            Per-name priors.  When None, prior_log_prob is unavailable and
-            prior_log_prob_vector returns zeros.
-        prior_metric_fn : callable or None
-            Optional function returning the prior's metric contribution in
-            constrained coords as a (d_full, d_full) SPD tensor, accessed via
-            ``prior_metric``.  Defaults to None (no contribution).
-        fixed : dict[str, float] or None
-            Names to hold fixed at the given value.  Removed from the free
-            space.  None or empty means nothing fixed.
-        """
+    A subclass supplies :attr:`as_transform`, the map ``theta = T(z)`` over the
+    free variables. Everything else here is the naming and the free/fixed
+    bookkeeping, which is independent of which prior the group carries.
+
+    Vectors come in two layouts. A full vector is ``(..., d_full)`` over
+    :attr:`names` in order, which is what a model potential is handed. A free
+    vector is ``(..., d)`` over :attr:`free_names` in the same relative order,
+    which is what the transform and the prior act on. :meth:`to_full` and
+    :meth:`to_free` move between them.
+
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    fixed : dict[str, float] or None
+        Names held at the given value. They keep their place in the full layout
+        and are absent from the free one, so a fixed name may sit between two
+        free ones. None or empty means nothing is fixed.
+
+    Raises
+    ------
+    ValueError
+        If a fixed name does not appear in ``names``.
+    """
+
+    def __init__(self, names, *, fixed=None):
         self.names = list(names)
-        self.priors = priors
-        self.prior_metric_fn = prior_metric_fn
         self.fixed = dict(fixed) if fixed else {}
 
-        if self.priors is not None:
-            if not all(name in priors for name in names):
-                raise ValueError("priors must either be None or have one element for each name in names")
-        if not all(name in self.names for name in self.fixed):
-            raise ValueError("every fixed name must appear in names")
+        unknown = [name for name in self.fixed if name not in self.names]
+        if unknown:
+            raise ValueError(
+                f"every fixed name must appear in names, got {unknown}")
 
-        self._free_names = [yi for yi in self.names if yi not in self.fixed]
-        name_to_idx = {yi: i for i, yi in enumerate(self.names)}
-        self.free_indices = [name_to_idx[yi] for yi in self._free_names]
-        self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
+        self._free_names = [name for name in self.names if name not in self.fixed]
+        index = {name: i for i, name in enumerate(self.names)}
+        self.free_indices = [index[name] for name in self._free_names]
+        self.fixed_indices = [index[name] for name in self.fixed]
+        self._template_cache = {}
+
+    # ---- naming ------------------------------------------------------------ #
 
     @property
     def d(self) -> int:
+        """Number of free variables."""
         return len(self._free_names)
 
     @property
     def d_full(self) -> int:
+        """Number of variables, free and fixed."""
         return len(self.names)
 
     @property
     def free_names(self):
         return self._free_names
 
-    def to_free_vector(self, samples):
-        return torch.stack([samples[yi] for yi in self._free_names], dim=-1)
+    @property
+    def as_transform(self) -> NormalTransform:
+        """The map ``theta = T(z)`` over the free variables."""
+        raise NotImplementedError
 
-    def from_vector(self, vec):
-        n = vec.shape[-1]
-        if n == self.d:
-            return {yi: vec[..., i] for i, yi in enumerate(self._free_names)}
-        elif n == self.d_full:
-            return {yi: vec[..., idx] for yi, idx in zip(self._free_names, self.free_indices)}
-        else:
-            raise ValueError(
-                f"Expected vector of size {self.d} (free) or "
-                f"{self.d_full} (full), got {n}."
-            )
+    @property
+    def is_proper(self) -> bool:
+        """Whether the prior is a normalized density, and so has a normal chart.
+        False for a space carrying no prior, whose evidence and entropy are then
+        not defined."""
+        return True
 
-    def map_to_unconstrained_vector(self, theta_vec):
-        if theta_vec.shape[-1] > self.d:
-            theta_vec = theta_vec[..., self.free_indices]
-        return transforms.identity(theta_vec)
+    # ---- vector layouts ---------------------------------------------------- #
 
-    def map_to_constrained_vector(self, z_vec):
-        return transforms.identity(z_vec)
+    def _free_index(self, ref: torch.Tensor) -> torch.Tensor:
+        return torch.as_tensor(self.free_indices, device=ref.device)
 
-    def prior_log_prob(self, y):
-        """Factorized log-prior over the free names present in ``y``.
+    def _template(self, ref: torch.Tensor) -> torch.Tensor:
+        """``(d_full,)`` holding each fixed value at its place and zero
+        elsewhere, cached per dtype and device."""
+        key = (ref.dtype, ref.device)
+        if key not in self._template_cache:
+            t = torch.zeros(self.d_full, dtype=ref.dtype, device=ref.device)
+            for name, value in self.fixed.items():
+                t[self.names.index(name)] = value
+            self._template_cache[key] = t
+        return self._template_cache[key]
 
-        Passing every free name gives the full log-prior. Passing a subset gives
-        the marginal log-prior over that subset, which is valid because the prior
-        factorizes over names. A name left out of ``y`` therefore returns a
-        marginal rather than raising.
-
-        Raises
-        ------
-        ValueError
-            If the space has no priors, or if ``y`` holds none of the free names.
-        """
-        if self.priors is None:
-            raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
-        names = [yi for yi in self._free_names if yi in y]
-        if not names:
-            raise ValueError("y contains none of the free parameter names")
-        result = 0
-        for yi in names:
-            result = result + self.priors[yi].log_prob(y[yi]).squeeze(-1)
-        return result
-
-    def prior_log_prob_vector(self, theta_free):
-        """Prior log-density on a free vector, zero if no prior is configured."""
-        if self.priors is None:
-            return torch.zeros(theta_free.shape[:-1], device=theta_free.device, dtype=theta_free.dtype)
-        return self.prior_log_prob(self.from_vector(theta_free))
-
-    def prior_metric(self, theta_full):
-        """Constrained-space prior metric, or None when not configured."""
-        if self.prior_metric_fn is None:
-            return None
-        return self.prior_metric_fn(theta_full)
-        
-    def push_forward_metric(self, G, theta_map):
-        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
-        block ``G_ff``.
-
-        Parameters
-        ----------
-        G : Tensor, shape (N, d_full, d_full)
-            Constrained-space metric.
-        theta_map : the z->θ map (``map_to_constrained_vector``).
-
-        Returns
-        -------
-        Tensor, shape (N, d, d)
-        """
-        dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
-        fi = torch.as_tensor(self.free_indices, device=G.device)
-        G_ff = G.index_select(-2, fi).index_select(-1, fi)  # (N, d, d)
-        return dJ[..., :, None] * G_ff * dJ[..., None, :]
-
-    def sample(self, n_samples, *, generator=None):
-        if self.priors is None:
-            raise ValueError("Unconstrained space without priors cannot be sampled from")
-        samples = {}
-        with _rng_context(generator):
-            for yi in self._free_names:
-                # Per-name prior is univariate. reshape normalises a trailing
-                # singleton and rejects a multivariate prior.
-                samples[yi] = self.priors[yi].sample([n_samples]).reshape(n_samples)
-        return self.add_fixed(samples)
-
-    def remove_fixed(self, samples):
+    def to_free(self, theta_full: torch.Tensor) -> torch.Tensor:
+        """Full vector ``(..., d_full)`` to free vector ``(..., d)``."""
         if not self.fixed:
-            return samples
-        samples = samples.copy()
-        for yi in self.fixed.keys():
-            samples.pop(yi, None)
-        return samples
+            return theta_full
+        return theta_full.index_select(-1, self._free_index(theta_full))
 
-    def add_fixed(self, samples):
+    def to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """Free vector ``(..., d)`` to full vector ``(..., d_full)``, with each
+        fixed variable at its value."""
+        if not self.fixed:
+            return theta_free
+        shape = theta_free.shape[:-1] + (self.d_full,)
+        out = self._template(theta_free).expand(shape).clone()
+        out[..., self._free_index(theta_free)] = theta_free
+        return out
+
+    def to_vector(self, samples: dict) -> torch.Tensor:
+        """Dict keyed by name to a full vector ``(..., d_full)``. Fixed names
+        absent from ``samples`` are filled in."""
+        samples = self.add_fixed(samples)
+        return torch.stack([samples[name] for name in self.names], dim=-1)
+
+    def to_free_vector(self, samples: dict) -> torch.Tensor:
+        """Dict keyed by name to a free vector ``(..., d)``."""
+        return torch.stack([samples[name] for name in self._free_names], dim=-1)
+
+    def from_full_vector(self, theta_full: torch.Tensor) -> dict:
+        """Full vector ``(..., d_full)`` to a dict over every name."""
+        self._check_width(theta_full, self.d_full, "full")
+        return {name: theta_full[..., i] for i, name in enumerate(self.names)}
+
+    def from_free_vector(self, theta_free: torch.Tensor) -> dict:
+        """Free vector ``(..., d)`` to a dict over the free names."""
+        self._check_width(theta_free, self.d, "free")
+        return {name: theta_free[..., i]
+                for i, name in enumerate(self._free_names)}
+
+    def _check_width(self, vec, width, layout):
+        if vec.shape[-1] != width:
+            raise ValueError(
+                f"expected a {layout} vector of size {width}, got "
+                f"{vec.shape[-1]}.")
+
+    # ---- fixed variables --------------------------------------------------- #
+
+    def add_fixed(self, samples: dict) -> dict:
+        """``samples`` with each fixed name added at its value, broadcast to the
+        shape the other entries carry."""
         if not self.fixed:
             return samples
         samples = samples.copy()
         ref = next(iter(samples.values()))
-        for yi, val in self.fixed.items():
-            samples[yi] = val * torch.ones(ref.shape, device=ref.device, dtype=ref.dtype)
+        for name, value in self.fixed.items():
+            samples[name] = torch.full(ref.shape, value,
+                                       device=ref.device, dtype=ref.dtype)
         return samples
 
-    def point_inside(self, y):
-        return True
+    def remove_fixed(self, samples: dict) -> dict:
+        """``samples`` with every fixed name dropped."""
+        if not self.fixed:
+            return samples
+        samples = samples.copy()
+        for name in self.fixed:
+            samples.pop(name, None)
+        return samples
 
-    def to_vector(self, samples):
-        samples = self.add_fixed(samples)
-        point = []
-        for yi in self.names:
-            point.append(samples[yi])
-        return torch.stack(point, axis=-1)
+    # ---- prior ------------------------------------------------------------- #
 
+    def prior_log_prob(self, y: dict) -> torch.Tensor:
+        """Factorized log-prior over the free names present in ``y``.
 
-class UniformBoxSpace:
-    # Maximum resampling rounds for the rejection sampler in ``sample`` when
-    # per-name priors are supplied.
-    _MAX_REJECTION_ROUNDS = 100
+        Passing every free name gives the full log-prior. Passing a subset gives
+        the marginal log-prior over that subset, which is valid because the prior
+        factorizes over the coordinate axis. A name left out of ``y`` therefore
+        returns a marginal rather than raising. Fixed names in ``y`` are ignored.
 
-    def __init__(self, limits, names, device, priors=None, *, prior_metric_fn=None):
-        self.names = names
-        self.priors = priors if priors is not None else {}
-        self.prior_metric_fn = prior_metric_fn
-        self.fixed = {}
+        Parameters
+        ----------
+        y : dict[str, Tensor]
+            Constrained points keyed by name, each of shape ``(...)``.
 
-        self.l = []
-        self.u = []
-        for yi in self.names:
-            min_val = limits[yi][0]
-            max_val = limits[yi][1]
-
-            if abs(min_val - max_val) < 1.e-15:
-                self.fixed[yi] = min_val
-                continue
-            self.l.append(min_val)
-            self.u.append(max_val)
-
-        self.l = torch.tensor(self.l, device=device)
-        self.u = torch.tensor(self.u, device=device)
-        self.free_names = [yi for yi in self.names if yi not in self.fixed]
-        self.d = len(self.free_names)
-        self.d_full = len(self.names)
-
-        name_to_idx = {yi: i for i, yi in enumerate(self.names)}
-        self.free_indices = [name_to_idx[yi] for yi in self.free_names]
-        self.fixed_indices = [name_to_idx[yi] for yi in self.fixed]
-
-        # Per-coordinate normalizer of the box prior. A free coordinate with no
-        # explicit prior is uniform on [l_i, u_i] and contributes -log(u_i - l_i)
-        # to its normalized log-density. Kept per name so a marginal prior over a
-        # subset of names sums only the provided coordinates' constants, and so
-        # the full prior integrates to 1 over the box (a well-defined evidence
-        # needs this). A constant offset in the potential does not affect
-        # sampling. Explicit priors are taken as given and carry no entry.
-        self._uniform_log_norm = {
-            yi: float(-torch.log(self.u[i] - self.l[i]))
-            for i, yi in enumerate(self.free_names)
-            if yi not in self.priors
-        }
-
-    def to_free_vector(self, samples):
-        return torch.stack([samples[yi] for yi in self.free_names], dim=-1)
-
-    def from_vector(self, vec):
-        n = vec.shape[-1]
-        if n == self.d:
-            return {yi: vec[..., i] for i, yi in enumerate(self.free_names)}
-        elif n == self.d_full:
-            return {yi: vec[..., idx] for yi, idx in zip(self.free_names, self.free_indices)}
-        else:
-            raise ValueError(
-                f"Expected vector of size {self.d} (free) or "
-                f"{self.d_full} (full), got {n}."
-            )
-
-    def map_to_unconstrained_vector(self, theta_vec):
-        if theta_vec.shape[-1] > self.d:
-            theta_vec = theta_vec[...,self.free_indices]
-        return transforms.box_inv(theta_vec, self.l, self.u)
-
-    def map_to_constrained_vector(self, z_vec):
-        return transforms.box(z_vec, self.l, self.u)
-
-    def prior_log_prob(self, y):
-        """Factorized, box-normalized log-prior over the free names present in
-        ``y``.
-
-        Coordinates without an explicit prior are uniform on ``[l_i, u_i]`` and
-        contribute ``-log(u_i - l_i)``. Explicit per-coordinate priors are added
-        as given (not renormalized for truncation to the box). Passing every free
-        name gives the full log-prior. Passing a subset gives the marginal
-        log-prior over that subset, since the prior factorizes over names. A name
-        left out of ``y`` therefore returns a marginal rather than raising.
+        Returns
+        -------
+        Tensor, shape (...)
 
         Raises
         ------
         ValueError
             If ``y`` holds none of the free names.
         """
-        first = next(iter(y.values()))
-        names = [yi for yi in self.free_names if yi in y]
-        if not names:
+        present = [i for i, name in enumerate(self._free_names) if name in y]
+        if not present:
             raise ValueError("y contains none of the free parameter names")
-        log_norm = sum(self._uniform_log_norm[yi]
-                       for yi in names if yi not in self.priors)
-        result = torch.full(first.shape, float(log_norm),
-                            device=first.device, dtype=first.dtype)
-        for yi in names:
-            if yi in self.priors:
-                result = result + self.priors[yi].log_prob(y[yi]).squeeze(-1)
-        return result
 
-    def prior_log_prob_vector(self, theta_free):
-        return self.prior_log_prob(self.from_vector(theta_free))
+        # A variable the marginal does not range over is held at T(0), which is
+        # in the support and so keeps its factor finite before it is dropped.
+        ref = y[self._free_names[present[0]]]
+        interior = self.as_transform.interior_point.to(ref.dtype)
+        theta = interior.expand(ref.shape + (self.d,)).clone()
+        for i in present:
+            theta[..., i] = y[self._free_names[i]]
+        idx = torch.as_tensor(present, device=theta.device)
+        return self.as_transform.log_prob(theta).index_select(-1, idx).sum(-1)
 
-    def prior_metric(self, theta_full):
-        """Constrained-space prior metric, or None when not configured."""
-        if self.prior_metric_fn is None:
-            return None
-        return self.prior_metric_fn(theta_full)
-        
-    def push_forward_metric(self, G, theta_map):
-        """G_free = dJ · G_ff · dJ, diagonal Jacobian ``dJ = dθ/dz`` on the free
-        block ``G_ff``.
+    def prior_log_prob_vector(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """Log-prior on a free vector ``(..., d)``, shape ``(...)``."""
+        return self.as_transform.log_prob(theta_free).sum(-1)
+
+    def prior_log_prob_normal(self, z_free: torch.Tensor) -> torch.Tensor:
+        """Log-prior read in the normal chart, ``log N(z; 0, I)``, for ``z`` of
+        shape ``(..., d)``. It equals ``prior_log_prob_vector(T(z))`` plus
+        ``log|det dtheta/dz|``, so a caller needing both the prior and the change
+        of variables takes this one instead."""
+        return _std_normal_log_pdf(z_free).sum(-1)
+
+    def prior_metric(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """Diagonal of the prior's natural metric at ``theta_free``, shape
+        ``(..., d)``. Its pushforward to the normal chart is the identity, which
+        is what :meth:`prior_metric_normal` returns."""
+        return self.as_transform.metric(theta_free)
+
+    def prior_metric_normal(self, z_free: torch.Tensor):
+        """The prior's metric in the normal chart, the identity of shape
+        ``(..., d, d)``, or None when the space carries no prior."""
+        eye = torch.eye(self.d, dtype=z_free.dtype, device=z_free.device)
+        return eye.expand(z_free.shape[:-1] + (self.d, self.d))
+
+    def push_forward_metric(self, G: torch.Tensor,
+                            jacobian_diag: torch.Tensor) -> torch.Tensor:
+        """The constrained-space metric ``G`` read in the normal chart,
+
+            G_z = diag(J) G_ff diag(J),   J = dtheta/dz,
+
+        where ``G_ff`` is the free block of ``G``.
 
         Parameters
         ----------
-        G : Tensor, shape (N, d_full, d_full)
-            Constrained-space metric.
-        theta_map : the z->θ map (``map_to_constrained_vector``).
+        G : Tensor, shape (..., d_full, d_full)
+            Metric in constrained coordinates over every variable.
+        jacobian_diag : Tensor, shape (..., d)
+            Jacobian diagonal of the ``z`` to ``theta`` map on the free block,
+            from ``as_transform.forward(z).jacobian_diag``.
 
         Returns
         -------
-        Tensor, shape (N, d, d)
+        Tensor, shape (..., d, d)
         """
-        dJ = theta_map.jacobian_diag                        # (N, d) = dθ/dz, free coords
-        fi = torch.as_tensor(self.free_indices, device=G.device)
-        G_ff = G.index_select(-2, fi).index_select(-1, fi)  # (N, d, d)
-        return dJ[..., :, None] * G_ff * dJ[..., None, :]
+        idx = self._free_index(G)
+        G_ff = G.index_select(-2, idx).index_select(-1, idx)
+        return jacobian_diag[..., :, None] * G_ff * jacobian_diag[..., None, :]
 
-    def sample(self, n_samples, *, generator=None):
-        with _rng_context(generator):
-            samples = self._sample_body(n_samples)
-        return self.add_fixed(samples)
+    def sample(self, n_samples: int, *, generator=None) -> dict:
+        """``n_samples`` draws from the prior, keyed by name and including the
+        fixed variables, each of shape ``(n_samples,)``.
 
-    def _sample_body(self, n_samples):
-        if not self.priors:
-            # Uniform sample within the box.
-            u = torch.rand(n_samples, self.d, device=self.l.device, dtype=self.l.dtype)
-            theta = self.l + u * (self.u - self.l)
-            return {yi: theta[..., i] for i, yi in enumerate(self.free_names)}
+        Parameters
+        ----------
+        n_samples : int
+            Number of draws.
+        generator : torch.Generator, optional
+            RNG driving the draw. The global RNG when omitted.
+        """
+        T = self.as_transform
+        z = torch.randn(n_samples, self.d, dtype=T.dtype, device=T.device,
+                        generator=generator)
+        return self.add_fixed(self.from_free_vector(T.forward(z).mapped_point))
 
-        # Per-coord rejection sampling: draw from the prior, resample draws
-        # outside [l, u]. Coords are independent.
-        dev, dt = self.l.device, self.l.dtype
-        samples = {}
-        for i, yi in enumerate(self.free_names):
-            l_i, u_i = self.l[i], self.u[i]
-            prior = self.priors.get(yi)
-            if prior is None:                       # no prior -> uniform on its interval
-                samples[yi] = l_i + torch.rand(n_samples, device=dev, dtype=dt) * (u_i - l_i)
-                continue
-            out    = torch.empty(n_samples, device=dev, dtype=dt)
-            filled = torch.zeros(n_samples, dtype=torch.bool, device=dev)
-            for _ in range(self._MAX_REJECTION_ROUNDS):
-                idx = torch.nonzero(~filled, as_tuple=False).squeeze(-1)
-                if idx.numel() == 0:
-                    break
-                cand = prior.sample([idx.numel()]).reshape(-1).to(device=dev, dtype=dt)
-                ok = (cand > l_i) & (cand < u_i)
-                out[idx[ok]] = cand[ok]
-                filled[idx[ok]] = True
-            if not bool(filled.all()):
-                raise RuntimeError(
-                    f"rejection sampling for '{yi}' did not fill all draws. The "
-                    f"prior places too little mass inside [{float(l_i)}, {float(u_i)}]."
-                )
-            samples[yi] = out
-        return samples
 
-    def remove_fixed(self, samples):
-        samples = samples.copy()
-        for yi in self.fixed.keys():
-            del samples[yi]
-        return samples
+def _as_parameter(value, free_names, name, dtype, device):
+    """A per-variable parameter as a ``(d,)`` tensor. A scalar is shared across
+    the free variables and a dict is read in free-name order."""
+    if isinstance(value, dict):
+        missing = [n for n in free_names if n not in value]
+        if missing:
+            raise ValueError(f"{name} is missing an entry for {missing}")
+        value = [value[n] for n in free_names]
+    out = torch.as_tensor(value, dtype=dtype, device=device)
+    if out.dim() == 0:
+        out = out.expand(len(free_names))
+    if out.shape != (len(free_names),):
+        raise ValueError(
+            f"{name} must be a scalar, a dict over the free names, or a tensor "
+            f"of shape ({len(free_names)},), got shape {tuple(out.shape)}")
+    return out.contiguous()
 
-    def add_fixed(self, samples):
-        samples = samples.copy()
-        ref = next(iter(samples.values()))
-        for yi in self.fixed.keys():
-            samples[yi] = self.fixed[yi] * torch.ones(
-                ref.shape, device=ref.device, dtype=ref.dtype)
-        return samples
 
-    def point_inside(self, y):
-        for i, yi in enumerate(self.free_names):
-            if torch.any(y[yi] <= self.l[i]) or torch.any(y[yi] >= self.u[i]):
-                return False
-        return True
+class NormalSpace(Space):
+    """Variables with independent normal priors, ``theta_i ~ Normal(mu_i,
+    sigma_i)``, whose normal chart is ``theta = mu + sigma z``.
 
-    def to_vector(self, samples):
-        samples = self.add_fixed(samples)
-        point = []
-        for yi in self.names:
-            point.append(samples[yi])
-        return torch.stack(point, axis=-1)
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    mu, sigma : float, dict[str, float] or Tensor
+        Location and scale per free variable. A scalar is shared across them, a
+        dict is keyed by name, and a tensor is read in free-name order.
+        ``sigma`` is positive.
+    fixed : dict[str, float] or None
+        Names held at the given value.
+    dtype, device : optional
+        Working dtype and device of the prior parameters.
+
+    Raises
+    ------
+    ValueError
+        If a parameter is missing a free name or has the wrong shape.
+    """
+
+    def __init__(self, names, mu=0.0, sigma=1.0, *, fixed=None,
+                 dtype=None, device=None):
+        super().__init__(names, fixed=fixed)
+        mu = _as_parameter(mu, self._free_names, "mu", dtype, device)
+        sigma = _as_parameter(sigma, self._free_names, "sigma", dtype, device)
+        log_sigma = torch.log(sigma)
+        self._transform = NormalTransform(
+            lambda z: (mu + sigma * z, log_sigma.expand_as(z)),
+            inverse=lambda th: ((th - mu) / sigma, (-log_sigma).expand_as(th)),
+            log_prob=lambda th: _std_normal_log_pdf((th - mu) / sigma) - log_sigma,
+            reference=mu)
+
+    @property
+    def as_transform(self):
+        return self._transform
+
+
+class LogNormalSpace(Space):
+    """Variables with independent log-normal priors, whose normal chart is
+    ``theta = exp(mu + sigma z)``, so every variable is positive.
+
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    mu, sigma : float, dict[str, float] or Tensor
+        Location and scale of the underlying normal per free variable, in the
+        forms ``NormalSpace`` takes. ``sigma`` is positive.
+    fixed : dict[str, float] or None
+        Names held at the given value.
+    dtype, device : optional
+        Working dtype and device of the prior parameters.
+    """
+
+    def __init__(self, names, mu=0.0, sigma=1.0, *, fixed=None,
+                 dtype=None, device=None):
+        super().__init__(names, fixed=fixed)
+        mu = _as_parameter(mu, self._free_names, "mu", dtype, device)
+        sigma = _as_parameter(sigma, self._free_names, "sigma", dtype, device)
+        log_sigma = torch.log(sigma)
+
+        def forward(z):
+            w = mu + sigma * z
+            return torch.exp(w), log_sigma + w
+
+        def inverse(theta):
+            log_theta = torch.log(theta)
+            return (log_theta - mu) / sigma, -log_sigma - log_theta
+
+        self._transform = NormalTransform(
+            forward, inverse=inverse,
+            log_prob=lambda th: (_std_normal_log_pdf((torch.log(th) - mu) / sigma)
+                                 - log_sigma - torch.log(th)),
+            reference=mu)
+
+    @property
+    def as_transform(self):
+        return self._transform
+
+
+class UniformSpace(Space):
+    """Variables with independent uniform priors on ``(low, high)``, whose normal
+    chart is the probit map ``theta = low + (high - low) Phi(z)``.
+
+    A variable whose interval is degenerate, meaning its endpoints are equal, is
+    fixed at that value instead of being given a prior.
+
+    ``Phi`` saturates in floating point, so a ``z`` far from the origin maps to
+    an endpoint exactly rather than to a point strictly inside. The log Jacobian
+    stays exact there and goes to minus infinity, and the potential in ``z``
+    grows as ``½‖z‖²``, so the region is unreachable rather than mishandled.
+
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    low, high : float, dict[str, float] or Tensor
+        Interval endpoints per free variable, in the forms ``NormalSpace`` takes.
+    limits : dict[str, tuple[float, float]] or None
+        Endpoints given as one dict of pairs, an alternative to ``low`` and
+        ``high``. A name whose pair has equal entries becomes fixed.
+    fixed : dict[str, float] or None
+        Names held at the given value.
+    dtype, device : optional
+        Working dtype and device of the prior parameters.
+
+    Raises
+    ------
+    ValueError
+        If both ``limits`` and either endpoint argument are given, or if
+        ``limits`` misses a name.
+    """
+
+    def __init__(self, names, low=None, high=None, *, limits=None, fixed=None,
+                 dtype=None, device=None):
+        names = list(names)
+        if limits is not None:
+            if low is not None or high is not None:
+                raise ValueError("give either limits or low and high, not both")
+            missing = [n for n in names if n not in limits]
+            if missing:
+                raise ValueError(f"limits is missing an entry for {missing}")
+            fixed = dict(fixed) if fixed else {}
+            for name in names:
+                lo, hi = limits[name]
+                if lo == hi:
+                    fixed.setdefault(name, lo)
+            low = {n: limits[n][0] for n in names if n not in fixed}
+            high = {n: limits[n][1] for n in names if n not in fixed}
+
+        super().__init__(names, fixed=fixed)
+        low = _as_parameter(low, self._free_names, "low", dtype, device)
+        high = _as_parameter(high, self._free_names, "high", dtype, device)
+        log_width = torch.log(high - low)
+
+        def inverse(theta):
+            z = _std_normal_icdf((theta - low) / (high - low))
+            return z, -log_width - _std_normal_log_pdf(z)
+
+        self._transform = NormalTransform(
+            lambda z: (low + (high - low) * _std_normal_cdf(z),
+                       log_width + _std_normal_log_pdf(z)),
+            inverse=inverse,
+            log_prob=lambda th: (-log_width).expand_as(th),
+            reference=low)
+
+    @property
+    def as_transform(self):
+        return self._transform
+
+
+class DistributionSpace(Space):
+    """Variables with independent priors from one batched distribution, whose
+    normal chart is ``theta = F⁻¹(Phi(z))``.
+
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    dist : torch.distributions.Distribution
+        Univariate distribution whose batch shape is ``(d,)``, one entry per free
+        variable in free-name order. A batch shape of ``()`` is expanded to all
+        of them.
+    fixed : dict[str, float] or None
+        Names held at the given value.
+
+    Raises
+    ------
+    ValueError
+        If the batch shape matches neither the free variables nor a single
+        variable.
+    """
+
+    def __init__(self, names, dist, *, fixed=None):
+        super().__init__(names, fixed=fixed)
+        shape = tuple(dist.batch_shape)
+        if shape == ():
+            dist = dist.expand((self.d,))
+        elif shape != (self.d,):
+            raise ValueError(
+                f"dist must have batch shape ({self.d},) or (), got {shape}")
+        self._transform = _distribution_transform(dist)
+
+    @property
+    def as_transform(self):
+        return self._transform
+
+
+class UnnormalizedSpace(Space):
+    """Variables with no prior, whose chart is the identity so that ``z`` is
+    ``theta``.
+
+    The target is whatever the model potential defines, with nothing added. An
+    evidence, an entropy or a prior draw is not defined against it, and the
+    methods computing those raise. A scheme requiring the prior's metric is not
+    available either, since :meth:`prior_metric_normal` is None.
+
+    Parameters
+    ----------
+    names : sequence of str
+        Variable names, defining the full vector layout.
+    fixed : dict[str, float] or None
+        Names held at the given value.
+    dtype, device : optional
+        Working dtype and device.
+
+    Raises
+    ------
+    ValueError
+        From :meth:`prior_log_prob` and :meth:`sample`, which have no meaning
+        without a prior.
+    """
+
+    def __init__(self, names, *, fixed=None, dtype=None, device=None):
+        super().__init__(names, fixed=fixed)
+        zero = torch.zeros(self.d, dtype=dtype, device=device)
+        self._transform = NormalTransform(
+            lambda z: (z, torch.zeros_like(z)),
+            inverse=lambda th: (th, torch.zeros_like(th)),
+            log_prob=torch.zeros_like,
+            reference=zero)
+
+    @property
+    def as_transform(self):
+        return self._transform
+
+    @property
+    def is_proper(self) -> bool:
+        return False
+
+    def prior_log_prob(self, y: dict) -> torch.Tensor:
+        raise ValueError(
+            "UnnormalizedSpace carries no prior, so prior_log_prob is not "
+            "defined. Use a space with a prior if you need one.")
+
+    def prior_log_prob_vector(self, theta_free: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(theta_free.shape[:-1], dtype=theta_free.dtype,
+                           device=theta_free.device)
+
+    def prior_log_prob_normal(self, z_free: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(z_free.shape[:-1], dtype=z_free.dtype,
+                           device=z_free.device)
+
+    def prior_metric_normal(self, z_free: torch.Tensor):
+        return None
+
+    def sample(self, n_samples: int, *, generator=None) -> dict:
+        raise ValueError(
+            "UnnormalizedSpace carries no prior, so it cannot be sampled from.")

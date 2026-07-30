@@ -12,12 +12,16 @@ from .NUTS import NUTS
 from .SMC import SMC
 from .PT import PT
 from .spaces import (
-    ElementwiseTransform,
+    DistributionSpace,
+    ElementwiseMap,
+    LogNormalSpace,
+    NormalSpace,
+    NormalTransform,
+    Space,
     TemperedAffine,
     TemperedMetric,
-    UnconstrainedSpace,
-    UniformBoxSpace,
-    transforms,
+    UniformSpace,
+    UnnormalizedSpace,
 )
 from .validation import PosteriorEvaluation
 
@@ -34,12 +38,16 @@ __all__ = [
     "NUTS",
     "SMC",
     "PT",
-    "ElementwiseTransform",
+    "DistributionSpace",
+    "ElementwiseMap",
+    "LogNormalSpace",
+    "NormalSpace",
+    "NormalTransform",
+    "Space",
     "TemperedAffine",
     "TemperedMetric",
-    "UnconstrainedSpace",
-    "UniformBoxSpace",
-    "transforms",
+    "UniformSpace",
+    "UnnormalizedSpace",
     "PosteriorEvaluation",
     "__version__",
 ]
