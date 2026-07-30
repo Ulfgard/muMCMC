@@ -20,6 +20,12 @@ from muMCMC.PT import PT
 torch.set_default_dtype(torch.float64)
 
 
+def _eye(n):
+    """Identity prior metric. ChartRATTLE requires the space to supply M, and
+    these targets all want the plain identity."""
+    return lambda th: torch.eye(n).expand(th.shape[0], n, n)
+
+
 def _N01():
     """Explicit standard-normal prior, the latent of the plain non-centered
     parameterization. ChartRATTLE reads the prior off the space, so it is named
@@ -74,7 +80,8 @@ def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
     c = FunnelChart(sigma, torch.randn(m))
     kw.setdefault("adapt_step_size", False)
     kw.setdefault("step_size", 0.1)
-    return ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()}), **kw)
+    return ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()},
+                                          prior_metric_fn=_eye(1)), **kw)
 
 
 def _endpoint_state(sampler, eta):
@@ -113,7 +120,9 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors={"a": _N01(), "b": _N01()}),
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"],
+                                          priors={"a": _N01(), "b": _N01()},
+                                          prior_metric_fn=_eye(2)),
                     step_size=0.1, adapt_step_size=False)
     N = 40000
     state = s.sample_momentum(s.init(torch.zeros(N, 2)))
@@ -219,7 +228,9 @@ def test_recovers_affine_gaussian_posterior():
     c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
     mu, Sigma = c.posterior()
 
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors={"a": _N01(), "b": _N01()}),
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"],
+                                          priors={"a": _N01(), "b": _N01()},
+                                          prior_metric_fn=_eye(2)),
                     step_size=0.4, num_steps=12,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
@@ -255,7 +266,8 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     mu_flat, _ = c.posterior()
     assert float((mu - mu_flat).abs().max()) > 0.1
 
-    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors=priors),
+    s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"], priors=priors,
+                                          prior_metric_fn=_eye(2)),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
@@ -284,7 +296,7 @@ def test_prior_metric_moves_the_metric_and_not_the_potential():
         return ChartRATTLE(c, space, step_size=0.2, adapt_step_size=False)
 
     eta = torch.randn(6, 2)
-    U_i, m_i, _, W = build(None).evaluate_model(eta, grad=False)
+    U_i, m_i, _, W = build(_eye(2)).evaluate_model(eta, grad=False)
     U_m, m_m, _, _ = build(
         lambda th: M.expand(th.shape[0], 2, 2)).evaluate_model(eta, grad=False)
 
@@ -325,7 +337,7 @@ def test_prior_metric_matched_to_a_wide_prior_mixes():
         sd = torch.stack([out[k][0] for k in names], dim=-1).std(0)
         return float((sd / sd_exact).mean())
 
-    unmatched = per_chain_spread(None)
+    unmatched = per_chain_spread(_eye(n))
     matched = per_chain_spread(
         lambda th: torch.eye(n).expand(th.shape[0], n, n) / S)
     assert unmatched < 0.5           # M = I explores a fraction of the width
@@ -342,7 +354,8 @@ def test_newton_recovers_the_affine_gaussian_posterior():
     mu, Sigma = c.posterior()
 
     s = ChartRATTLE(c, UnconstrainedSpace(["a", "b"],
-                                          priors={"a": _N01(), "b": _N01()}),
+                                          priors={"a": _N01(), "b": _N01()},
+                                          prior_metric_fn=_eye(2)),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="newton", fp_tol=1e-10)
     out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
@@ -368,7 +381,8 @@ def test_recovers_funnel_posterior_against_quadrature():
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
-    s = ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()}),
+    s = ChartRATTLE(c, UnconstrainedSpace(["v"], priors={"v": _N01()},
+                                          prior_metric_fn=_eye(1)),
                     step_size=0.08, num_steps=16,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-9)
     out = s.run_mcmc(torch.zeros(1), num_samples=400, num_warmup_steps=200,
@@ -398,7 +412,8 @@ def test_pt_runs_swaps_and_recovers_target_mean():
     mean_q = float((torch.softmax(log_post, 0) * grid).sum())
 
     kernel = ChartRATTLE(FunnelChart(sigma, xobs),
-                         UnconstrainedSpace(["v"], priors={"v": _N01()}),
+                         UnconstrainedSpace(["v"], priors={"v": _N01()},
+                                            prior_metric_fn=_eye(1)),
                          step_size=0.06, num_steps=12, adapt_step_size=False,
                          solver="anderson", fp_tol=1e-9)
     # β > 0 throughout: β = 0 sends Σ/β -> ∞, outside the scale family.

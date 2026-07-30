@@ -62,13 +62,15 @@ class AffineChart(ChartConstraint):
 def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_metric_fn=None, **kw):
     torch.manual_seed(seed)
     c = FunnelChart(sigma, torch.randn(m))
-    space = UnconstrainedSpace(["v"], prior_metric_fn=prior_metric_fn)
+    space = UnconstrainedSpace(
+        ["v"], prior_metric_fn=prior_metric_fn or _scaled_metric(1.0, 1))
     return ChartRATTLE(c, space, adapt_step_size=False, **kw)
 
 
 def _scaled_metric(scale, n):
-    """A constant prior metric ``scale * I``, the shape a Gaussian prior has."""
-    return lambda th: scale * torch.eye(n).expand(th.shape[0], n, n)
+    """A constant prior metric ``scale * I``, the shape a Gaussian prior has.
+    ChartRATTLE requires the space to supply M."""
+    return lambda th: (scale * torch.eye(n)).expand(th.shape[0], n, n)
 
 
 def _affine_sampler(n=2, m=5, seed=0, **kw):
@@ -77,7 +79,8 @@ def _affine_sampler(n=2, m=5, seed=0, **kw):
     B = torch.eye(m) + 0.15 * torch.randn(m, m)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
-    space = UnconstrainedSpace([f"v{i}" for i in range(n)])
+    space = UnconstrainedSpace([f"v{i}" for i in range(n)],
+                               prior_metric_fn=_scaled_metric(1.0, n))
     return ChartRATTLE(c, space, adapt_step_size=False, **kw), n
 
 
@@ -174,8 +177,9 @@ def test_step_preserves_volume_and_symplectic_form(prior_metric_fn):
     chart = LocationScaleChart(lambda q: torch.tanh(q @ A.transpose(-2, -1)),
                                lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
                                torch.randn(m))
-    space = UnconstrainedSpace([f"v{i}" for i in range(n)],
-                               prior_metric_fn=prior_metric_fn)
+    space = UnconstrainedSpace(
+        [f"v{i}" for i in range(n)],
+        prior_metric_fn=prior_metric_fn or _scaled_metric(1.0, n))
     s = ChartRATTLE(chart, space, step_size=h, num_steps=1,
                     adapt_step_size=False, solver="anderson",
                     fp_tol=1e-14, fp_max_iter=500)

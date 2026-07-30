@@ -256,8 +256,7 @@ class RMHMC(HamiltonianSampler):
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
         Fixed-point solver: ``"picard"`` (default) or ``"anderson"``. Newton is
-        rejected here, since the midpoint residual's Jacobian carries second
-        derivatives of the metric.
+        rejected, since the midpoint residual's Jacobian is not available here.
     anderson_history : int or None
         History length ``m`` for the Anderson solver (ignored for Picard).
         ``None`` (default) resolves per-solve to the dimension of the solve,

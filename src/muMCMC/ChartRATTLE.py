@@ -35,8 +35,8 @@ from ._solvers import FixedPointSolver
 #                                                                             #
 #      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = M + β Wᵀ W,        #
 #                                                                             #
-#  with p(q) and M the space's prior and prior metric, flat and I when        #
-#  absent.                                                                    #
+#  with p(q) and M the space's prior and its prior metric. An absent prior    #
+#  is flat, an absent prior metric is an error.                               #
 #                                                                             #
 #  No co-area factor survives into U, and that is not an omission. The        #
 #  Hausdorff-measure form carries 1/√(det Λ) with Λ = Dg Dgᵀ, and reading it  #
@@ -354,8 +354,8 @@ class ChartRATTLE(HamiltonianSampler):
         the identity, since the constraint reads the sampled position as θ and U
         carries no transform Jacobian. Its prior becomes the prior on q, entering
         U as −log p(q), and is flat when the space carries none. Its
-        ``prior_metric_fn`` becomes the prior block M of G_M = M + β WᵀW,
-        defaulting to the identity, and has to be independent of position.
+        ``prior_metric_fn`` becomes the prior block M of G_M = M + β WᵀW. It is
+        required, and has to be independent of position.
     step_size : float
         Integration step size. When adapting, start it small: the step is grown
         from here, so a too-large start begins above the solver-convergence cliff
@@ -372,9 +372,6 @@ class ChartRATTLE(HamiltonianSampler):
         Convergence tolerance for the position solve (max norm of F). Default 1e-8.
     solver : str
         Position solver: ``"picard"`` (default), ``"anderson"`` or ``"newton"``.
-        Newton re-evaluates DF at every iterate rather than freezing it at the
-        step start, which is worth its tangent pass when the Jacobian moves
-        quickly along the iteration.
     anderson_history : int or None
         History length for the Anderson solver, ignored by the others. None
         resolves per-solve to n.
@@ -387,7 +384,8 @@ class ChartRATTLE(HamiltonianSampler):
     Raises
     ------
     ValueError
-        If ``damping`` is outside (0, 1] or ``solver`` is not recognised.
+        If ``damping`` is outside (0, 1] or ``solver`` is not recognised. A
+        space with no prior metric raises at the first model evaluation.
 
     Notes
     -----
@@ -433,17 +431,6 @@ class ChartRATTLE(HamiltonianSampler):
         self.register_diagnostic("fp_iters_max", lambda: self._fp_iters_max)
         self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
-    def _prior_metric(self, q):
-        """M, the prior block of G_M, shape ``(N, n, n)``. The space's prior
-        metric pushed to the sampled coordinates, identity when it has none."""
-        theta_map = self.space.map_to_constrained_vector(q)
-        G = self.space.prior_metric(self._free_to_full(theta_map.mapped_point))
-        if G is None:
-            n = q.shape[-1]
-            eye = torch.eye(n, dtype=q.dtype, device=q.device)
-            return eye.expand(q.shape[0], n, n)
-        return self.space.push_forward_metric(G, theta_map)
-
     # ---- model evaluation (the extension point) ---------------------------- #
 
     def evaluate_model(self, z_free, beta=None, grad=False):
@@ -477,7 +464,14 @@ class ChartRATTLE(HamiltonianSampler):
         # Detached leaf regardless of ``grad``: W comes from a reverse pass
         # through psi, so the input has to carry a graph either way.
         q = z_free.detach().requires_grad_(True)
-        A_prior = self._prior_metric(q)
+        theta_map = self.space.map_to_constrained_vector(q)
+        G_prior = self.space.prior_metric(self._free_to_full(theta_map.mapped_point))
+        if G_prior is None:
+            raise ValueError(
+                "ChartRATTLE needs the space's prior metric, which is the prior "
+                "block M of G_M = M + beta W^T W. Give the space a "
+                "prior_metric_fn.")
+        A_prior = self.space.push_forward_metric(G_prior, theta_map)
 
         with torch.enable_grad():
             psi, W, log_abs_det_B = self.constraint.psi_with_jvp(q)
@@ -531,7 +525,7 @@ class ChartRATTLE(HamiltonianSampler):
         h = step_size.unsqueeze(-1)                        # (N, 1)
         beta_col = broadcast_beta(self.beta, 1)
         beta_mat = broadcast_beta(self.beta, 2)
-        A_prior = self._prior_metric(state.q)
+        A_prior = state.metric.base                        # M, off the metric
 
         rhs = h * state.p - 0.5 * h * h * state.grad_V
         q_init = state.q

@@ -25,6 +25,12 @@ from muMCMC.spaces import UnconstrainedSpace
 torch.set_default_dtype(torch.float64)
 
 
+def _eye(n):
+    """Identity prior metric. ChartRATTLE requires the space to supply M, and
+    these targets all want the plain identity."""
+    return lambda th: torch.eye(n).expand(th.shape[0], n, n)
+
+
 def _N01():
     """Explicit standard-normal prior, the latent of the plain non-centered
     parameterization. ChartRATTLE reads the prior off the space, so it is named
@@ -85,7 +91,8 @@ def _eval(constraint, eta, beta=1.0, grad=True):
     n = eta.shape[-1]
     names = [f"v{i}" for i in range(n)]
     s = ChartRATTLE(constraint,
-                    UnconstrainedSpace(names, priors={k: _N01() for k in names}),
+                    UnconstrainedSpace(names, priors={k: _N01() for k in names},
+                                       prior_metric_fn=_eye(n)),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -212,7 +219,9 @@ def test_beta_tempers_the_data_fit_only():
 def _prior_eval(constraint, eta, priors, beta=1.0, grad=True):
     """evaluate_model through a sampler whose space carries ``priors``."""
     names = [f"v{i}" for i in range(eta.shape[-1])]
-    s = ChartRATTLE(constraint, UnconstrainedSpace(names, priors=priors),
+    s = ChartRATTLE(constraint,
+                    UnconstrainedSpace(names, priors=priors,
+                                       prior_metric_fn=_eye(len(names))),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -220,7 +229,7 @@ def _prior_eval(constraint, eta, priors, beta=1.0, grad=True):
 
 def _base_of(constraint, eta, priors):
     """U.base at ``eta`` for a space carrying ``priors`` (None for no prior)."""
-    space = UnconstrainedSpace(["v0"], priors=priors)
+    space = UnconstrainedSpace(["v0"], priors=priors, prior_metric_fn=_eye(1))
     s = ChartRATTLE(constraint, space, step_size=0.1, adapt_step_size=False)
     return s.evaluate_model(eta, grad=False)[0].base
 
