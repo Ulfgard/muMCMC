@@ -1,36 +1,49 @@
-"""Posterior evaluation from MCMC draws: evidence and posterior density.
+# =========================================================================== #
+#                                                                             #
+#  Evidence and posterior density from MCMC draws                             #
+#                                                                             #
+#  Given posterior draws y ~ p(y|x), the likelihood p(x|y) bound in the       #
+#  sampler, and the space's prior p(y), this module estimates                 #
+#                                                                             #
+#      log p(x)   = log INT p(x|y) p(y) dy               the evidence         #
+#      log p(y|x) = loglik(y) + log p(y) - log p(x)   the posterior density   #
+#                                                                             #
+#  Derivation of the evidence estimator (BAR, the Bennett acceptance ratio in #
+#  its reverse-logistic-regression form).                                     #
+#                                                                             #
+#  Work happens in the sampler's unconstrained coordinates z, where           #
+#  sampler.evaluate_model(z).value is exactly -log f(z) for the unnormalized  #
+#  posterior density                                                          #
+#                                                                             #
+#      f(z) = p(x|y(z)) p(y(z)) |dy/dz|,                                      #
+#                                                                             #
+#  whose integral over z is the evidence. Fit a reference q-hat, a Gaussian   #
+#  mixture, to the z-draws and form the log-ratio                             #
+#                                                                             #
+#      W(z) = log f(z) - log q-hat(z)                                         #
+#           = -evaluate_model(z).value - log q-hat(z)                         #
+#                                                                             #
+#  on the n1 posterior draws and on n0 draws from q-hat. The scalar b solving #
+#                                                                             #
+#      SUM_pooled sigmoid(W + b) = n1                                         #
+#                                                                             #
+#  then gives                                                                 #
+#                                                                             #
+#      log p(x) = log(n1 / n0) - b.                                           #
+#                                                                             #
+#  The root is unique and always bracketed, because                           #
+#  g(b) = n1 - SUM sigmoid(W + b) decreases strictly from +n1 to -n0.         #
+#                                                                             #
+#  The evidence is reparameterization-invariant, so the z-space value equals  #
+#  the y-space integral. Everything uses the sampler's current beta, so a     #
+#  tempered sampler yields the correspondingly tempered evidence.             #
+#                                                                             #
+#  The prior is assumed proper and normalized, as set out in the prior        #
+#  contract in spaces. An unnormalized prior shifts log p(x) by its missing   #
+#  constant.                                                                  #
+#                                                                             #
+# =========================================================================== #
 
-Given posterior draws ``y ~ p(y|x)``, the likelihood ``p(x|y)`` bound in the
-sampler, and the space's prior ``p(y)``, this module estimates
-
-    log p(x) = log ∫ p(x|y) p(y) dy          (the evidence, ``log_evidence``)
-    log p(y|x) = loglik(y) + log p(y) − log p(x)   (``log_posterior``)
-
-The evidence uses BAR (Bennett acceptance ratio, as reverse logistic
-regression). Work happens in the sampler's unconstrained coordinates ``z``,
-where ``sampler.evaluate_model(z).value`` is exactly ``−log f(z)`` for the
-unnormalized posterior density ``f(z) = p(x|y(z)) p(y(z)) |dy/dz|`` whose
-integral over ``z`` is the evidence. A reference ``q̂`` (a Gaussian mixture) is
-fitted to the ``z``-draws. With the log-ratio
-
-    W(z) = log f(z) − log q̂(z) = −evaluate_model(z).value − log q̂(z)
-
-evaluated on the posterior draws (``n1`` of them) and on ``n0`` draws from
-``q̂``, the scalar ``b`` solving ``Σ_pooled σ(W + b) = n1`` (σ = expit) gives
-
-    log p(x) = log(n1 / n0) − b .
-
-``g(b) = n1 − Σ σ(W + b)`` is strictly decreasing from ``+n1`` to ``−n0``, so
-the root is unique and always brackets.
-
-The evidence is reparameterization-invariant, so the ``z``-space value equals
-the ``y``-space integral. Everything uses the sampler's current ``beta``. A
-tempered sampler yields the corresponding tempered evidence, which is the
-caller's choice.
-
-The prior is assumed proper and normalized (see the prior contract in
-``spaces``). An unnormalized prior shifts ``log p(x)`` by its missing constant.
-"""
 from __future__ import annotations
 
 import math

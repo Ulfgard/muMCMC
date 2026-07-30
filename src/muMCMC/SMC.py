@@ -45,7 +45,7 @@ def _rhat(x: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(var_plus / W)
 
 
-# ===================================================================== #
+# =========================================================================== #
 # num_chains independent populations run in parallel over the kernel's
 # batch axis, each with its own particles, resampling, and schedule.
 # Independent populations give a between-run estimate of Monte Carlo error:
@@ -54,7 +54,7 @@ def _rhat(x: torch.Tensor) -> torch.Tensor:
 # tempered potential (state.U.lik), grad-free, rather than recomputed. The
 # mutation kernel runs at a fixed step size, its adaptation frozen via
 # end_warmup.
-# ===================================================================== #
+# =========================================================================== #
 
 
 class SMC:

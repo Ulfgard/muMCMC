@@ -8,23 +8,23 @@ from .spaces import TemperedMetric
 from .adapters import Reinforce, NoAdaptation
 
 # =========================================================================== #
-#                                                                              #
-#  RMHMC helpers  (implicit midpoint integrator)                               #
-#                                                                              #
-#  The implicit-midpoint step solves a per-chain fixed-point equation          #
-#  z = F(z).  Algorithm I.M.(a) of Brofos & Lederman (2021): the unknown       #
-#  is the endpoint (q_k, p_k), with the midpoint derived from it.  The         #
-#  update rule that drives the solve is pluggable: Picard iteration            #
-#  (z_{k+1} = F(z_k)) and Anderson acceleration both solve the same F, so      #
-#  the endpoint is solver- and damping-independent. Only the proposal,         #
-#  the iteration count, and stability differ.                                  #
-#                                                                              #
-#  Only the values F_q, F_p are needed (no Jacobian), so the sole              #
-#  gradient is the first-order dH/dq at the midpoint.                          #
-#                                                                              #
+#                                                                             #
+#  RMHMC helpers  (implicit midpoint integrator)                              #
+#                                                                             #
+#  The implicit-midpoint step solves a per-chain fixed-point equation         #
+#  z = F(z).  Algorithm I.M.(a) of Brofos & Lederman (2021): the unknown      #
+#  is the endpoint (q_k, p_k), with the midpoint derived from it.  The        #
+#  update rule that drives the solve is pluggable: Picard iteration           #
+#  (z_{k+1} = F(z_k)) and Anderson acceleration both solve the same F, so     #
+#  the endpoint is solver- and damping-independent. Only the proposal,        #
+#  the iteration count, and stability differ.                                 #
+#                                                                             #
+#  Only the values F_q, F_p are needed (no Jacobian), so the sole             #
+#  gradient is the first-order dH/dq at the midpoint.                         #
+#                                                                             #
 # =========================================================================== #
 
-# ---- Hamiltonian --------------------------------------------------------- #
+#  ---- Hamiltonian --------------------------------------------------------- #
 
 def _hamiltonian(
     q: torch.Tensor,
@@ -51,7 +51,7 @@ def _hamiltonian(
     return U + kinetic + 0.5 * metric.log_det_metric()
 
 
-# ---- Midpoint map -------------------------------------------------------- #
+#  ---- Midpoint map -------------------------------------------------------- #
 
 def _midpoint_map(
     q: torch.Tensor,
@@ -99,14 +99,14 @@ def _midpoint_map(
     return F_q, F_p
 
 
-# ---- Fixed-point update rules ------------------------------------------- #
+#  ---- Fixed-point update rules -------------------------------------------  #
 #
 # An updater turns the current iterate/residual pair (z_k, r_k) into the next
 # proposal z_{k+1}.  ``r_k`` is the fixed-point residual z_k − F(z_k), so
 # ``F(z_k) = z_k − r_k`` and the Anderson residual (Walker & Ni's notation) is
 # ``f_k = F(z_k) − z_k = −r_k``.  A fresh updater is built per solve, so any
 # internal history it keeps is scoped to a single solve. An updater may carry a
-# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(η0)⁻¹ for
+# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(q0)⁻¹ for
 # the ChartRATTLE position solve, absent for the RMHMC midpoint solve).
 #
 # Relaxed Picard (β < 1) pulls the iteration eigenvalues (β − 1) + β λ toward
@@ -141,9 +141,9 @@ class _PicardUpdate:
         self._precond = precond
 
     def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions with preconditioner
-        ``precond``."""
-        return _PicardUpdate(self.beta, precond)
+        """Fresh per-solve updater for ``d``-dim positions. ``precond`` overrides
+        the preconditioner. Omitted, this updater's own is carried over."""
+        return _PicardUpdate(self.beta, self._precond if precond is None else precond)
 
     def propose(self, z, r):
         if self._precond is not None:
@@ -151,8 +151,9 @@ class _PicardUpdate:
         return z - self.beta * r
 
     def damped(self, factor):
-        """Copy with β scaled by ``factor`` (fallback ladder)."""
-        return _PicardUpdate(self.beta * factor)
+        """Copy with β scaled by ``factor``, same preconditioner (fallback
+        ladder)."""
+        return _PicardUpdate(self.beta * factor, self._precond)
 
 
 class _AndersonUpdate:
@@ -188,10 +189,12 @@ class _AndersonUpdate:
         self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
 
     def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions with preconditioner
-        ``precond``, resolving a None ``history`` to ``d``."""
+        """Fresh per-solve updater for ``d``-dim positions, resolving a None
+        ``history`` to ``d``. ``precond`` overrides the preconditioner. Omitted,
+        this updater's own is carried over."""
         return _AndersonUpdate(
-            d if self.history is None else self.history, self.beta, precond)
+            d if self.history is None else self.history, self.beta,
+            self._precond if precond is None else precond)
 
     def propose(self, z, r):
         if self._precond is not None:
@@ -229,11 +232,12 @@ class _AndersonUpdate:
         return z_next
 
     def damped(self, factor):
-        """Copy with β scaled by ``factor``, same history (fallback ladder)."""
-        return _AndersonUpdate(self.history, self.beta * factor)
+        """Copy with β scaled by ``factor``, same history and preconditioner
+        (fallback ladder)."""
+        return _AndersonUpdate(self.history, self.beta * factor, self._precond)
 
 
-# ---- Implicit midpoint step --------------------------------------------- #
+#  ---- Implicit midpoint step ---------------------------------------------  #
 
 def _fixed_point_solve(residual_fn, z_init, updater, max_iter, tol):
     """Find ``z`` with ``residual_fn(z) = 0``, batched over chains, by
@@ -289,8 +293,10 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
     ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
     not converge are re-solved with progressively stronger under-relaxation.
     Damping does not move the fixed point, so this resolves a stuck chain rather
-    than rejecting it (a solver-driven rejection would break detailed balance).
-    ``z_init`` warm-starts the first solve; the fallback re-solves from ``(q, p)``."""
+    than rejecting it. A rejection on forward-solve failure alone is not a
+    symmetric criterion, so the ladder makes that biased last resort rare.
+    ``z_init`` warm-starts the first solve. The fallback re-solves from
+    ``(q, p)``."""
     d = q.shape[-1]
     base = solver if solver is not None else _PicardUpdate()
 
@@ -319,16 +325,16 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
 
 
 # =========================================================================== #
-#                                                                              #
-#  Chain state                                                                 #
-#                                                                              #
-#  ``U`` and ``metric`` are configuration-bound objects that carry their       #
-#  own temperature and retemper themselves under ``reorder``, so the           #
-#  state stays agnostic to tempering.  ``max_residual`` and ``fp_iters``       #
-#  are integrator diagnostics bound to the slot. The trajectory                #
-#  accumulators are reset by ``init`` and ``accept`` and carried forward       #
-#  by ``step``.                                                                #
-#                                                                              #
+#                                                                             #
+#  Chain state                                                                #
+#                                                                             #
+#  ``U`` and ``metric`` are configuration-bound objects that carry their      #
+#  own temperature and retemper themselves under ``reorder``, so the          #
+#  state stays agnostic to tempering.  ``max_residual`` and ``fp_iters``      #
+#  are integrator diagnostics bound to the slot. The trajectory               #
+#  accumulators are reset by ``init`` and ``accept`` and carried forward      #
+#  by ``step``.                                                               #
+#                                                                             #
 # =========================================================================== #
 
 class RMHMCState:
@@ -355,7 +361,7 @@ class RMHMCState:
         self.U = U
         self.metric = metric
         # Last two converged endpoint displacements (N, 2d), used to warm-start
-        # the next substep's solve by quadratic extrapolation; None at a
+        # the next substep's solve by quadratic extrapolation. None at a
         # trajectory start (dropped by accept).
         self.dz = dz
         self.dz_prev = dz_prev
@@ -386,23 +392,23 @@ class RMHMCState:
 
 
 # =========================================================================== #
-#                                                                              #
-#  RMHMC sampler                                                               #
-#                                                                              #
-#  The transition machinery (init / step / accept / end_warmup / diagnostics)  #
-#  is inherited from HamiltonianSampler; RMHMC supplies the integrator and      #
-#  energy through the build_initial_state / sample_momentum / integrate /       #
-#  acceptance_delta / adapt hooks. All chains run in one batched state.         #
-#                                                                              #
+#                                                                             #
+#  RMHMC sampler                                                              #
+#                                                                             #
+#  The transition machinery (init / step / accept / end_warmup / diagnostics) #
+#  is inherited from HamiltonianSampler. RMHMC supplies the integrator and    #
+#  energy through the build_initial_state / sample_momentum / integrate /     #
+#  acceptance_delta / adapt hooks. All chains run in one batched state.       #
+#                                                                             #
 #  model_fn is specified in constrained space. MCMCSampler adds the           #
-#  prior log-prob and prior metric and pushes the metric forward to free       #
-#  unconstrained coordinates (spaces.push_forward_metric).                     #
-#                                                                              #
-#  Both solvers return the same endpoint up to fp_tol. Anderson                #
-#  typically reaches it in fewer iterations on stiff metrics, at the           #
-#  cost of a small m x m solve per iteration.  damping (beta) affects          #
-#  only stability and iteration count, not the endpoint.                       #
-#                                                                              #
+#  prior log-prob and prior metric and pushes the metric forward to free      #
+#  unconstrained coordinates (spaces.push_forward_metric).                    #
+#                                                                             #
+#  Both solvers return the same endpoint up to fp_tol. Anderson               #
+#  typically reaches it in fewer iterations on stiff metrics, at the          #
+#  cost of a small m x m solve per iteration.  damping (beta) affects         #
+#  only stability and iteration count, not the endpoint.                      #
+#                                                                             #
 # =========================================================================== #
 
 class RMHMC(HamiltonianSampler):
@@ -447,10 +453,14 @@ class RMHMC(HamiltonianSampler):
     fallback_damping : tuple of float
         Fallback ladder: on non-convergence, re-solve the failed chains with the
         base solver damped by each factor in turn (each in (0, 1), relative to
-        ``damping``; default ``(0.5, 0.25)``). Endpoint-preserving, so it removes
-        solver-driven rejections. ``()`` disables it.
+        ``damping``, default ``(0.5, 0.25)``). Endpoint-preserving, so it makes
+        solver-driven rejections rare. ``()`` disables it.
     fallback_iter_scale : int
         Per-level iteration cap as a multiple of ``fp_max_iter``. Default 4.
+    step_normalization : {None, "fixed", "max"}
+        Hold the trajectory length ``num_steps * step_size`` at its initial value
+        while step sizes adapt. ``"max"`` also re-derives ``num_steps`` from the
+        fastest chain. Default None (off).
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence. Default 100.
@@ -459,15 +469,15 @@ class RMHMC(HamiltonianSampler):
     -----
     Unlike :class:`HMC` / :class:`LMC`, RMHMC exposes no ``target_accept_prob``.
     The implicit-midpoint integrator can conserve energy over a wide range of
-    step sizes -- exactly, up to the fixed-point tolerance, on a Gaussian target
-    -- so acceptance is a poor thing to adapt against: whenever the solve
-    converges it saturates near 1 and carries almost no gradient on the step
-    size. The true knob is integrator accuracy, so the REINFORCE adapter instead
-    targets solver cost and energy error (residual and iteration count per
-    substep together with |delta_H|; see :meth:`adapt`). This keeps acceptance
-    close to 1 while steering the step size by how well the trajectory is
-    actually resolved; ``adaptation_sigma`` sets the exploration scale of that
-    search.
+    step sizes, and exactly so on a Gaussian target up to the fixed-point
+    tolerance. That makes acceptance a poor thing to adapt against, because
+    whenever the solve converges it saturates near 1 and carries almost no
+    gradient on the step size. The true knob is integrator accuracy, so the
+    REINFORCE adapter instead targets solver cost and energy error, meaning the
+    residual and iteration count per substep together with |delta_H| as described
+    in :meth:`adapt`. This keeps acceptance close to 1 while steering the step
+    size by how well the trajectory is actually resolved. ``adaptation_sigma``
+    sets the exploration scale of that search.
     """
 
     def __init__(
@@ -510,7 +520,7 @@ class RMHMC(HamiltonianSampler):
         self._fallback = [(f, fallback_iter_scale * fp_max_iter)
                           for f in fallback_damping]
 
-        # The adapters work on the log step size; step_size = exp(adapter value).
+        # The adapters work on the log step size, so step_size is its exponential.
         log_eps = math.log(step_size)
         if adapt_step_size:
             adapter = Reinforce(sigma=adaptation_sigma, init=log_eps)
@@ -560,9 +570,10 @@ class RMHMC(HamiltonianSampler):
         (read by :meth:`acceptance_delta` and :meth:`adapt`).
 
         The solve is warm-started by extrapolating the endpoint from the last
-        two converged displacements (quadratic; linear on the second substep,
-        trivial on the first). The guess only changes the iteration count, not
-        the fixed point, so the map -- and detailed balance -- are unchanged.
+        two converged displacements. The extrapolation is quadratic in general,
+        linear on the second substep and trivial on the first. The guess only
+        changes the iteration count and not the fixed point, so neither the map
+        nor detailed balance is affected.
         The displacements reset per trajectory (``accept`` builds a fresh state
         without them)."""
         z_start = torch.cat([state.q, state.p], dim=-1)
@@ -603,19 +614,19 @@ class RMHMC(HamiltonianSampler):
     def adapt(self, accept_prob, delta_H):
         """Derivative-free (REINFORCE) step-size adaptation from this transition's
         energy error ``delta_H`` and worst solver residual / iteration count."""
-        # Cost f_t = -log(efficiency), lower = better step size. The efficiency is
-        # accepted travel per solver iteration -- exp(-|dH|) ~ accept prob times
-        # step_size ~ distance over num_iters ~ solver cost -- weighted by
-        # exp(-residual/step_size), an analogous acceptance term for the solver
-        # error. The eta floor (normalised by |log eta|) gives rare failures
-        # large weight.
-        eta = 1.e-3
+        # Cost f_t = -log(efficiency), lower = better step size. Efficiency is
+        # accepted travel per unit of solver work: step_size (distance) over
+        # num_iters (cost), times exp(-|dH|) (the acceptance probability), times
+        # exp(-residual/step_size) (the analogous acceptance term for the solver
+        # error). The additive floor, normalised by |log(floor)|, bounds the cost
+        # so rare failures carry large but finite weight.
+        floor = 1.e-3
         num_iters       = self._step_iters
         solver_penalty  = torch.exp(-self._step_residual / self.step_size)
         delta_H_penalty = torch.exp(-delta_H.abs())
         f_t = (-0.5 * torch.log(
-                    solver_penalty * delta_H_penalty * self.step_size / num_iters + eta
-               ) / abs(math.log(eta)))                                      # (N,)
+                    solver_penalty * delta_H_penalty * self.step_size / num_iters + floor
+               ) / abs(math.log(floor)))                                    # (N,)
         self._step_size_adapter.update(f_t)
 
     def reset_extra_diagnostics(self):

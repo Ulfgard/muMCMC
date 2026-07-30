@@ -6,44 +6,44 @@ import torch
 from .HamiltonianSampler import HamiltonianSampler
 from .adapters import DualAveraging, NoAdaptation
 
-# ============================================================================ #
-#  Lagrangian Monte Carlo  (explicit geodesic integrator)                      #
-# ============================================================================ #
-#  Riemannian sampling in the velocity v = G(q)^-1 p (Lan, Stathopoulos,       #
-#  Shahbaba & Girolami 2015).  The substitution p -> v turns RMHMC's implicit  #
-#  generalized leapfrog into a fully explicit integrator (no fixed-point       #
-#  solve), at the price of a non-unit Jacobian in the Metropolis test.         #
-#                                                                              #
-#  Energy.  p ~ N(0, G) and p = G v give v | q ~ N(0, G^-1) and                #
-#                                                                              #
-#      E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,                     #
-#                                                                              #
-#  the log-det sign opposite RMHMC's Hamiltonian (p -> v contributes +det G).  #
-#                                                                              #
-#  Explicit integrator (Lan et al. Algorithm 2, e-RMLMC).  With the matrix     #
-#  Omega(q, v)_ij = sum_k v_k Gamma^i_kj and phi = U + 1/2 log det G, one step #
-#  is two matrix-solve half-kicks around an explicit drift:                    #
-#                                                                              #
-#      v_half = [I + (eps/2) Omega(q, v)]^-1 (v - (eps/2) G^-1 grad phi(q))    #
-#      q'     = q + eps v_half                                                 #
-#      v'     = [I + (eps/2) Omega(q', v_half)]^-1 (v_half - (eps/2) ...)      #
-#                                                                              #
-#  The velocity update is a d-by-d linear solve (explicit, no fixed point).    #
-#                                                                              #
-#  The map is reversible but not volume-preserving.  Each half-kick has        #
-#  log-Jacobian  log det(I - (eps/2) Omega(v_out)) - log det(I + (eps/2)       #
-#  Omega(v_in)), summed over the trajectory into                               #
-#                                                                              #
-#      alpha = min(1, exp(E_old - E_new) * det J).                             #
-#                                                                              #
-#  phi = U + 1/2 log det G, so grad phi is one backward pass.  Omega is built  #
-#  directly, without the rank-3 Christoffel tensor: with w = G v and v fixed,  #
-#  J = dw/dq is one batched reverse pass, D = (v . grad) G a double-backward,  #
-#  and Omega(v) = 1/2 G^-1 (D + J - J^T).                                      #
-#                                                                              #
-#  With G constant Omega and the Jacobian vanish and LMC reduces to HMC with   #
-#  mass matrix G.                                                              #
-# ============================================================================ #
+# =========================================================================== #
+#  Lagrangian Monte Carlo  (explicit geodesic integrator)                     #
+# =========================================================================== #
+#  Riemannian sampling in the velocity v = G(q)^-1 p (Lan, Stathopoulos,      #
+#  Shahbaba & Girolami 2015).  The substitution p -> v turns RMHMC's implicit #
+#  generalized leapfrog into a fully explicit integrator (no fixed-point      #
+#  solve), at the price of a non-unit Jacobian in the Metropolis test.        #
+#                                                                             #
+#  Energy.  p ~ N(0, G) and p = G v give v | q ~ N(0, G^-1) and               #
+#                                                                             #
+#      E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,                    #
+#                                                                             #
+#  the log-det sign opposite RMHMC's Hamiltonian (p -> v contributes +det G). #
+#                                                                             #
+#  Explicit integrator (Lan et al. Algorithm 2, e-RMLMC).  With the matrix    #
+#  Omega(q, v)_ij = sum_k v_k Gamma^i_kj and phi = U + 1/2 log det G, one     #
+#  step is two matrix-solve half-kicks around an explicit drift:              #
+#                                                                             #
+#      v_half = [I + (eps/2) Omega(q, v)]^-1 (v - (eps/2) G^-1 grad phi(q))   #
+#      q'     = q + eps v_half                                                #
+#      v'     = [I + (eps/2) Omega(q', v_half)]^-1 (v_half - (eps/2) ...)     #
+#                                                                             #
+#  The velocity update is a d-by-d linear solve (explicit, no fixed point).   #
+#                                                                             #
+#  The map is reversible but not volume-preserving.  Each half-kick has       #
+#  log-Jacobian  log det(I - (eps/2) Omega(v_out)) - log det(I + (eps/2)      #
+#  Omega(v_in)), summed over the trajectory into                              #
+#                                                                             #
+#      alpha = min(1, exp(E_old - E_new) * det J).                            #
+#                                                                             #
+#  phi = U + 1/2 log det G, so grad phi is one backward pass.  Omega is built #
+#  directly, without the rank-3 Christoffel tensor: with w = G v and v fixed, #
+#  J = dw/dq is one batched reverse pass, D = (v . grad) G a double-backward, #
+#  and Omega(v) = 1/2 G^-1 (D + J - J^T).                                     #
+#                                                                             #
+#  With G constant Omega and the Jacobian vanish and LMC reduces to HMC with  #
+#  mass matrix G.                                                             #
+# =========================================================================== #
 
 
 class LMCState:
@@ -56,7 +56,7 @@ class LMCState:
     q : Tensor, shape (N, d)
         Position in free unconstrained coordinates.
     v : Tensor, shape (N, d), or None
-        Velocity. Drawn by ``sample_momentum``; ``None`` only on the initial
+        Velocity. Drawn by ``sample_momentum`` and ``None`` only on the initial
         state before the first step.
     U : TemperedAffine or None
         Potential at ``q``.
@@ -86,7 +86,7 @@ class LMCState:
 
     def select_accepted(self, accepted: torch.Tensor, other: "LMCState") -> "LMCState":
         """Per-chain choice between this endpoint (where ``accepted``) and the
-        start ``other``; the Jacobian accumulator resets for the next step."""
+        start ``other``. The Jacobian accumulator resets for the next step."""
         pick = accepted.unsqueeze(-1)
         z = torch.zeros(self.q.shape[0], dtype=self.q.dtype, device=self.q.device)
         return LMCState(
@@ -99,9 +99,9 @@ class LMCState:
 
 
 # =========================================================================== #
-#                                                                              #
-#  LMC sampler                                                                 #
-#                                                                              #
+#                                                                             #
+#  LMC sampler                                                                #
+#                                                                             #
 # =========================================================================== #
 
 class LMC(HamiltonianSampler):
@@ -113,7 +113,7 @@ class LMC(HamiltonianSampler):
 
     with ``U`` the full unconstrained potential and ``G`` the metric assembled
     by ``MCMCSampler``. The integrator is explicit (a linear solve per
-    half-kick); acceptance carries the trajectory Jacobian ``det J``.
+    half-kick) and acceptance carries the trajectory Jacobian ``det J``.
 
     User contract
     -------------
@@ -159,7 +159,7 @@ class LMC(HamiltonianSampler):
             raise ValueError(
                 f"target_accept_prob must be in (0, 1), got {target_accept_prob}")
 
-        # The adapters work on the log step size; step_size = exp(adapter value).
+        # The adapters work on the log step size, so step_size is its exponential.
         log_eps = math.log(step_size)
         if adapt_step_size:
             adapter = DualAveraging(init=log_eps, gamma=da_gamma)

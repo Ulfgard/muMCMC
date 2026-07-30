@@ -1,42 +1,35 @@
-"""
-Parameter spaces and their transforms.
-
-Each space exposes ``prior_log_prob_vector``, operating on flat free vectors,
-and ``prior_metric``, returning the constrained-space metric contribution of
-the prior as a ``(d_full, d_full)`` SPD tensor, or None when there is no
-contribution.
-
-``push_forward_metric`` pushes a constrained-space metric forward to the free
-unconstrained coordinates.  ``TemperedAffine`` holds a quantity affinely in an
-inverse temperature.
-
-Prior contract
---------------
-The prior ``p(y)`` is assumed to (a) **factorize** over the parameter names and
-(b) be a **normalized** density over the free coordinates. Both are relied on by
-anything that reads ``log p(x) = log ∫ p(x|y) p(y) dy`` as an evidence.
-Factorization lets a marginal drop the integrated-out names cleanly. A missing
-normalizer shifts the evidence by exactly that constant.
-
-Factorization also fixes the marginal interface. ``prior_log_prob`` is keyed on
-*which* free names are present in its argument. Passing every free name returns
-the full log-prior. Passing a subset returns the marginal log-prior over that
-subset, the sum of just those factors. The footgun is that a name accidentally
-dropped from the argument silently yields a marginal rather than an error, an
-accepted cost of keeping the interface a single dict-in method.
-
-A space normalizes any prior it *defines itself*. For example the implicit
-uniform of a bounded box contributes ``-log(u_i - l_i)`` per coordinate.
-User-supplied per-name priors are taken as given. The caller is responsible for
-their normalization, and in particular an explicit prior is **not** renormalized
-for truncation to a box. Detecting an unnormalized prior is out of scope for the
-current interface, so it is a documented precondition rather than a checked one.
-"""
-
 import contextlib
 from functools import cached_property
 
 import torch
+
+# =========================================================================== #
+#                                                                             #
+#  Prior contract                                                             #
+#                                                                             #
+#  Every space assumes its prior p(y) factorizes over the parameter names and #
+#  is a normalized density over the free coordinates. Both assumptions are    #
+#  preconditions the interface does not check.                                #
+#                                                                             #
+#  Anything reading log p(x) = log INT p(x|y) p(y) dy as an evidence relies   #
+#  on both. Factorization lets a marginal drop the integrated-out names       #
+#  cleanly. A missing normalizer shifts the evidence by exactly that          #
+#  constant.                                                                  #
+#                                                                             #
+#  Factorization is also what makes the marginal interface work.              #
+#  prior_log_prob is keyed on which free names appear in its argument. Every  #
+#  free name gives the full log-prior, a subset gives the marginal over that  #
+#  subset, which is the sum of just those factors. A name left out by         #
+#  accident therefore returns a marginal instead of raising. That is the      #
+#  price of keeping the interface a single method taking one dict.            #
+#                                                                             #
+#  A space normalizes any prior it defines itself. The implicit uniform of a  #
+#  bounded box, for instance, contributes -log(u_i - l_i) per coordinate.     #
+#  A prior supplied by the caller is taken as given, so the caller owns its   #
+#  normalization, and an explicit prior is not renormalized for truncation to #
+#  a box.                                                                     #
+#                                                                             #
+# =========================================================================== #
 
 
 @contextlib.contextmanager
@@ -155,13 +148,25 @@ class transforms:
         return transforms._box(p, p_prime, l, u).inv
 
 
-# ====================================================================== #
-#  Tempered evaluation objects: metric and potential, affine in beta     #
-# ====================================================================== #
+# =========================================================================== #
+#  Tempered evaluation objects: metric and potential, affine in beta          #
+# =========================================================================== #
 
 def _solve_triangular_vec(triag_mat: torch.Tensor, vec: torch.Tensor, upper: bool):
     # triag_mat is (..., d, d) and vec is (..., d).
     return torch.linalg.solve_triangular(triag_mat, vec[..., None], upper=upper)[..., 0]
+
+
+def broadcast_beta(beta, n_trailing: int):
+    """``beta`` reshaped to broadcast over ``n_trailing`` trailing axes.
+
+    A per-batch-element ``beta`` is a ``(N,)`` tensor that has to line up with a
+    ``(N, *feat)`` quantity. A scalar (Python float or 0-d tensor) already
+    broadcasts and is returned unchanged.
+    """
+    if torch.is_tensor(beta) and beta.ndim > 0:
+        return beta.reshape((-1,) + (1,) * n_trailing)
+    return beta
 
 
 class TemperedAffine:
@@ -211,10 +216,7 @@ class TemperedAffine:
 
     def _beta_bcast(self):
         """``beta`` reshaped to broadcast over ``lik``'s trailing feature axes."""
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:
-            beta = beta.reshape((-1,) + (1,) * (self.lik.dim() - 1))
-        return beta
+        return broadcast_beta(self.beta, self.lik.dim() - 1)
 
     @cached_property
     def value(self) -> torch.Tensor:
@@ -275,9 +277,9 @@ class TemperedMetric(TemperedAffine):
         return (self.L @ xi[..., None])[..., 0].detach()
 
 
-# ====================================================================== #
-#  Spaces                                                                #
-# ====================================================================== #
+# =========================================================================== #
+#  Spaces                                                                     #
+# =========================================================================== #
  
 
 
@@ -354,9 +356,15 @@ class UnconstrainedSpace:
         """Factorized log-prior over the free names present in ``y``.
 
         Passing every free name gives the full log-prior. Passing a subset gives
-        the marginal log-prior over that subset, valid because the prior
-        factorizes over names. Footgun: a name accidentally dropped from ``y``
-        silently yields a marginal instead of raising."""
+        the marginal log-prior over that subset, which is valid because the prior
+        factorizes over names. A name left out of ``y`` therefore returns a
+        marginal rather than raising.
+
+        Raises
+        ------
+        ValueError
+            If the space has no priors, or if ``y`` holds none of the free names.
+        """
         if self.priors is None:
             raise ValueError("Unconstrained space without priors does not allow for prior_log_prob to be computed")
         names = [yi for yi in self._free_names if yi in y]
@@ -514,9 +522,14 @@ class UniformBoxSpace:
         contribute ``-log(u_i - l_i)``. Explicit per-coordinate priors are added
         as given (not renormalized for truncation to the box). Passing every free
         name gives the full log-prior. Passing a subset gives the marginal
-        log-prior over that subset, since the prior factorizes over names.
-        Footgun: a name accidentally dropped from ``y`` silently yields a
-        marginal."""
+        log-prior over that subset, since the prior factorizes over names. A name
+        left out of ``y`` therefore returns a marginal rather than raising.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` holds none of the free names.
+        """
         first = next(iter(y.values()))
         names = [yi for yi in self.free_names if yi in y]
         if not names:

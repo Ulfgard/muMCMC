@@ -3,10 +3,11 @@
 The RATTLE step is exercised through :meth:`ChartRATTLE.integrate` on crafted
 states, checking the properties that make it a valid MCMC proposal:
 
-1. The position solve drives the orthogonality residual F(η1) to tolerance.
+1. The position solve drives the orthogonality residual F(q1) to tolerance.
 2. On an affine map (constant metric, linear F) the frozen-Jacobian
    preconditioner is the exact Jacobian, so the solve converges in one step.
-3. The step is time-reversible: forward, flip π, forward returns to the start.
+3. The step is time-reversible: forward, flip p, forward returns to the start,
+   and it is symplectic, hence volume-preserving on (q, p).
 4. Anderson and Picard reach the same endpoint.
 5. Per-chain convergence is independent, and a failed solve is flagged.
 6. Energy is conserved to second order: halving the step at a fixed trajectory
@@ -15,7 +16,8 @@ states, checking the properties that make it a valid MCMC proposal:
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState, ChartConstraint
+from muMCMC.ChartRATTLE import (
+    ChartRATTLE, ChartRATTLEState, ChartConstraint, LocationScaleChart)
 from muMCMC.RMHMC import _hamiltonian
 from muMCMC.spaces import UnconstrainedSpace
 
@@ -96,8 +98,8 @@ def _H(st):
 def test_position_solve_reaches_orthogonality_tolerance():
     # Recompute the RATTLE position residual at the endpoint from the constraint
     # itself, not from the solver's own stopping value:
-    #   F(η1) = (η1 − η0) − β W0ᵀ(ψ(η1) − ψ0) − hπ0 + (h²/2)∇V(η0).
-    # At convergence F(η1) is at tolerance, so η1 sits on the RATTLE update.
+    #   F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − hp0 + (h²/2)∇V(q0).
+    # At convergence F(q1) is at tolerance, so q1 sits on the RATTLE update.
     h = 0.2
     s = _funnel_sampler(step_size=h, num_steps=1, fp_tol=1e-12, fp_max_iter=200)
     torch.manual_seed(1)
@@ -115,7 +117,7 @@ def test_position_solve_reaches_orthogonality_tolerance():
 # ========================================================================== #
 
 def test_affine_solve_converges_in_one_iteration():
-    # F is affine with Jacobian G_M(η0), which is exactly the preconditioner, so
+    # F is affine with Jacobian G_M(q0), which is exactly the preconditioner, so
     # the frozen-Jacobian step is a Newton step and lands in a single iteration.
     s, n = _affine_sampler(step_size=0.5, num_steps=1, fp_tol=1e-12, fp_max_iter=50)
     torch.manual_seed(2)
@@ -140,6 +142,46 @@ def test_step_is_time_reversible(h):
     back = s.integrate(_restart(fwd, fwd.q.clone(), -fwd.p.clone()), hh)
     assert torch.allclose(back.q, st.q, atol=1e-9)
     assert torch.allclose(back.p, -st.p, atol=1e-9)
+
+
+def test_step_preserves_volume_and_symplectic_form():
+    # The step is the variational integrator of the discrete Lagrangian
+    #   S_h(q0,q1) = ||q1-q0||^2/(2h) + beta||psi1-psi0||^2/(2h) - (h/2)[V0+V1],
+    # so it is symplectic: M^T Omega M = Omega, hence det M = 1. That volume
+    # property is the half of Metropolis exactness reversibility does not give,
+    # so it is worth pinning independently. Finite differences, since the step
+    # detaches and autograd cannot see through it.
+    n, m, h = 2, 3, 0.3
+    torch.manual_seed(11)
+    A = 0.7 * torch.randn(m, n)
+    B = torch.eye(m) + 0.3 * torch.diag(torch.tensor([1.0, -1.0, 0.5]))
+    Sigma = B @ B.transpose(-2, -1)
+    # Nonlinear in q through both the mean and the scale, so a step that was only
+    # accidentally symplectic (e.g. on a constant metric) would show up here.
+    chart = LocationScaleChart(lambda q: torch.tanh(q @ A.transpose(-2, -1)),
+                               lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
+                               torch.randn(m))
+    s = ChartRATTLE(chart, UnconstrainedSpace([f"v{i}" for i in range(n)]),
+                    step_size=h, num_steps=1, adapt_step_size=False,
+                    solver="anderson", fp_tol=1e-14, fp_max_iter=500)
+    s.init(torch.zeros(1, n))                     # seeds the solver diagnostics
+
+    def step_map(z):
+        st = _seed_state(s, z[:n].reshape(1, n))
+        out = s.integrate(_restart(st, st.q, z[n:].reshape(1, n)), torch.full((1,), h))
+        return torch.cat([out.q.reshape(-1), out.p.reshape(-1)])
+
+    z0 = torch.cat([torch.randn(n), torch.randn(n)])
+    d = 1e-6
+    M = torch.stack([(step_map(z0 + d * e) - step_map(z0 - d * e)) / (2 * d)
+                     for e in torch.eye(2 * n)], dim=1)
+
+    Omega = torch.zeros(2 * n, 2 * n)
+    Omega[:n, n:] = torch.eye(n)
+    Omega[n:, :n] = -torch.eye(n)
+
+    assert abs(float(torch.det(M)) - 1.0) < 1e-6                        # volume
+    assert float((M.T @ Omega @ M - Omega).abs().max()) < 1e-6          # symplectic
 
 
 def test_affine_step_is_time_reversible():

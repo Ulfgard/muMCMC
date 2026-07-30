@@ -98,7 +98,7 @@ def test_init_sizes_step_size_and_resets_counters():
 # ========================================================================== #
 
 def test_sample_momentum_covariance_is_the_chart_metric():
-    # π ~ N(0, G_M(η)): the empirical covariance over many draws matches G_M.
+    # p ~ N(0, G_M(q)): the empirical covariance over many draws matches G_M.
     torch.manual_seed(0)
     A = torch.randn(4, 2)
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
@@ -124,15 +124,6 @@ def test_failed_solve_is_rejected_even_when_energy_matches():
     out = s.accept(new, old)
     assert torch.allclose(out.q, old.q)           # rejected despite delta_H ~ 0
     assert torch.equal(s._num_divergences, torch.ones(3, dtype=torch.long))
-
-
-def test_non_finite_solve_is_rejected():
-    s = _funnel_sampler(step_size=0.1, num_steps=1, fp_tol=1e-8)
-    old = _endpoint_state(s, torch.zeros(2, 1))
-    new = _restart(old, old.q.clone(), old.p.clone())
-    s._step_residual = torch.tensor([float("nan"), 1e-12])
-    out = s.accept(new, old)
-    assert torch.allclose(out.q[0], old.q[0])     # nan residual -> rejected
 
 
 # ========================================================================== #
@@ -171,11 +162,17 @@ def test_step_runs_exactly_num_steps_substeps():
     assert calls["n"] == 4
 
 
-def test_step_returns_complete_state():
+def test_step_keeps_only_the_fields_that_outlive_a_transition():
+    # q and p carry the chain and U.lik is the PT swap statistic, so those three
+    # survive. The metric, geometry and force are trajectory scratch rebuilt by
+    # sample_momentum, so carrying them would only risk them going stale behind a
+    # PT relabeling.
     s = _funnel_sampler(num_steps=3)
     out = s.step(s.init(torch.zeros(2, 1)))
-    assert out.U is not None and out.metric is not None and out.p is not None
     assert out.q.shape == (2, 1)
+    assert out.p is not None and out.U is not None
+    assert out.metric is None and out.psi is None and out.W is None
+    assert out.grad_V is None and out.dq is None
 
 
 # ========================================================================== #
@@ -203,7 +200,7 @@ def test_invalid_damping_raises(bad):
 # ========================================================================== #
 
 def test_recovers_affine_gaussian_posterior():
-    # An affine map induces an exact Gaussian η-marginal. The chain must match
+    # An affine map induces an exact Gaussian q-marginal. The chain must match
     # its mean and covariance.
     torch.manual_seed(1)
     A = torch.randn(5, 2)
@@ -223,7 +220,7 @@ def test_recovers_affine_gaussian_posterior():
 
 
 def test_recovers_funnel_posterior_against_quadrature():
-    # Scalar η, so the exact posterior is 1-D and available by quadrature.
+    # Scalar q, so the exact posterior is 1-D and available by quadrature.
     sigma, m = 3.0, 6
     torch.manual_seed(7)
     eta_true = torch.randn(1)

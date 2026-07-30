@@ -10,24 +10,27 @@ from .MCMCSampler import MCMCSampler
 # =========================================================================== #
 #                                                                             #
 #  HamiltonianSampler: shared driver for the explicit-integrator family       #
-#  (HMC, LMC, RMHMC).                                                          #
+#  (HMC, LMC, RMHMC).                                                         #
 #                                                                             #
 #  This class owns the transition loop, the Metropolis accept/reject, the     #
-#  warmup step-size freeze, and the per-chain diagnostics.  A subclass         #
+#  warmup step-size freeze, and the per-chain diagnostics.  A subclass        #
 #  supplies its integrator and energy by overriding these hooks:              #
 #                                                                             #
-#      build_initial_state(q)      -> initial chain state at q                 #
-#      sample_momentum(state)      -> state with a fresh momentum / velocity   #
-#      integrate(state, step_size) -> one integrator substep                   #
-#      acceptance_delta(new, old)  -> Metropolis exponent (energy + Jacobian)  #
-#      adapt(accept_prob, delta_H) -> feed the step-size (etc.) adapter        #
-#      reset_extra_diagnostics()   -> reset a subclass's running diagnostics   #
+#      build_initial_state(q)      -> initial chain state at q                #
+#      sample_momentum(state)      -> state with a fresh momentum / velocity  #
+#      integrate(state, step_size) -> one integrator substep                  #
+#      acceptance_delta(new, old)  -> Metropolis exponent (energy + Jacobian) #
+#      adapt(accept_prob, delta_H) -> feed the step-size (etc.) adapter       #
+#      reset_extra_diagnostics()   -> reset a subclass's running diagnostics  #
 #                                                                             #
-#  and a state exposing q, reorder(perm) and select_accepted(accepted, other).#
-#  The step size lives in a step-size adapter (subclass-provided), so the      #
-#  integrator receives it as an argument rather than reading it off self.      #
-#  Diagnostics and progress-bar entries are registries a subclass extends from #
-#  its __init__ (register_*), so it never overrides diagnostics()/logging().   #
+#  and a state exposing q, reorder(perm) and                                  #
+#  select_accepted(accepted, other).                                          #
+#                                                                             #
+#  The step size lives in a step-size adapter supplied by the subclass, so    #
+#  the integrator receives it as an argument rather than reading it off self. #
+#  Diagnostics and progress-bar entries are registries a subclass extends     #
+#  from its __init__ through register_*, so it never overrides diagnostics()  #
+#  or logging().                                                              #
 #                                                                             #
 # =========================================================================== #
 
@@ -96,7 +99,7 @@ class HamiltonianSampler(MCMCSampler):
         self.register_diagnostic("delta_H_abs_max",  lambda: self._delta_H_abs_max)
 
         # Progress-bar entries: key -> callable giving a preformatted string.
-        # Kept minimal; subclasses add the ones that matter for them.
+        # Kept minimal. Subclasses add the ones that matter for them.
         self._logging = {}
         self.register_logging("eps",       lambda: "{:.2e}".format(float(self.step_size.mean())))
         self.register_logging("acc. prob", lambda: "{:.3f}".format(float((self._accepted / max(self._step, 1)).mean())))
@@ -134,7 +137,7 @@ class HamiltonianSampler(MCMCSampler):
     def _normalize_trajectory(self):
         """Hold the trajectory length at ``trajectory_length`` (no-op when
         normalization is off). In "max" mode ``num_steps`` is re-derived from the
-        fastest chain (``ceil`` so the cap binds it exactly, floored at 1); either
+        fastest chain (``ceil`` so the cap binds it exactly, floored at 1). Either
         way every step size is capped at ``trajectory_length / num_steps``."""
         if self._step_normalization is None:
             return
@@ -229,28 +232,28 @@ class HamiltonianSampler(MCMCSampler):
     @abstractmethod
     def build_initial_state(self, q):
         """Hook, called by :meth:`init`. Return the initial chain state at
-        positions ``q`` (model evaluated; momentum drawn later by
-        :meth:`step`)."""
+        positions ``q``, with the model evaluated and the momentum drawn later by
+        :meth:`step`."""
         ...
 
     @abstractmethod
     def sample_momentum(self, state):
         """Hook, called at the start of each :meth:`step`. Draw a fresh momentum
-        on ``state`` (and reset any per-transition scratch); return ``state``."""
+        on ``state``, reset any per-transition scratch, and return ``state``."""
         ...
 
     @abstractmethod
     def integrate(self, state, step_size):
         """Hook, called ``num_steps`` times per :meth:`step`. Advance ``state``
-        by one integrator substep at the per-chain ``step_size``; return the new
-        state."""
+        by one integrator substep at the per-chain ``step_size`` and return the
+        new state."""
         ...
 
     @abstractmethod
     def acceptance_delta(self, new, old):
         """Hook, called by :meth:`accept`. Return the per-chain Metropolis
         exponent (accept with probability ``min(1, exp(-delta))``), including
-        any Jacobian correction; a non-finite value forces rejection. Must also
+        any Jacobian correction. A non-finite value forces rejection. Must also
         populate ``new.U`` (and ``new.metric``) so the selected state carries
         them."""
         ...

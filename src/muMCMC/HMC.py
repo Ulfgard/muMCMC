@@ -16,10 +16,11 @@ from .adapters import DualAveraging, NoAdaptation
 #  shares the HamiltonianSampler transition machinery.                        #
 #                                                                             #
 #  The chain state carries q with the momentum p and the potential and its    #
-#  gradient as tempered objects.  A trajectory ends where the next one starts, #
-#  so the endpoint evaluation is stored and no gradient is recomputed at the   #
-#  start of a step.  reorder retempers the tempered objects, so PT can permute #
-#  a swapped configuration across temperature slots without a model eval.      #
+#  gradient as tempered objects.  A trajectory ends where the next one        #
+#  starts, so the endpoint evaluation is stored and no gradient is recomputed #
+#  at the start of a step.  reorder retempers the tempered objects, so PT can #
+#  permute a swapped configuration across temperature slots without a model   #
+#  eval.                                                                      #
 #                                                                             #
 # =========================================================================== #
 
@@ -37,7 +38,7 @@ class HMCState:
     grad : TemperedAffine
         Gradient ``dU/dq`` at ``q``.
     p : Tensor, shape (N, d), or None
-        Momentum. Drawn by ``sample_momentum``; ``None`` only on the initial
+        Momentum. Drawn by ``sample_momentum`` and ``None`` only on the initial
         state before the first step.
     """
 
@@ -125,7 +126,7 @@ class HMC(HamiltonianSampler):
             raise ValueError(
                 f"target_accept_prob must be in (0, 1), got {target_accept_prob}")
 
-        # The adapters work on the log step size; step_size = exp(adapter value).
+        # The adapters work on the log step size, so step_size is its exponential.
         log_eps = math.log(step_size)
         if adapt_step_size:
             adapter = DualAveraging(init=log_eps, gamma=da_gamma)
@@ -189,8 +190,8 @@ class HMC(HamiltonianSampler):
         return HMCState(q, U, grad, p)
 
     def acceptance_delta(self, new, old):
-        """``delta_H = H(new) - H(old)``; the endpoint potential is already on
-        ``new`` (evaluated by the last leapfrog step)."""
+        """``delta_H = H(new) - H(old)``. The endpoint potential is already on
+        ``new``, evaluated by the last leapfrog step."""
         H_new = new.U.value + self._kinetic(new.p)
         H_old = old.U.value + self._kinetic(old.p)
         return H_new - H_old
