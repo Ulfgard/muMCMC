@@ -132,19 +132,9 @@ class MCMCSampler(ABC):
         :meth:`to_position`."""
         return q_free
 
-    def _init_position(self, initial_params: torch.Tensor) -> torch.Tensor:
-        """Variable vector, full or free, to the chain's starting position. The
-        two layouts coincide when nothing is fixed."""
-        width = initial_params.shape[-1]
-        if width == self.space.d_full:
-            theta_free = self.space.to_free(initial_params)
-        elif width == self.space.d:
-            theta_free = initial_params
-        else:
-            raise ValueError(
-                f"initial_params must have size {self.space.d} (free) or "
-                f"{self.space.d_full} (full), got {width}.")
-        return self.to_position(theta_free)
+    def _init_position(self, initial_params: dict) -> torch.Tensor:
+        """Starting point keyed by name to the chain's starting position."""
+        return self.to_position(self.space.to_free_vector(initial_params))
 
     def logging(self) -> dict:
         """Per-step statistics for the progress bar, as a dict of short
@@ -177,7 +167,7 @@ class MCMCSampler(ABC):
 
     def run_mcmc(
         self,
-        initial_params: torch.Tensor,
+        initial_params: dict,
         num_samples: int,
         num_warmup_steps: int,
         *,
@@ -193,8 +183,9 @@ class MCMCSampler(ABC):
 
         Parameters
         ----------
-        initial_params : Tensor
-            Flat variable vector, full or free.
+        initial_params : dict[str, Tensor]
+            Starting point keyed by name, in the form a run returns. Fixed names
+            are ignored.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -310,7 +301,7 @@ class PyroSampler(MCMCSampler):
 
     def run_mcmc(
         self,
-        initial_params: torch.Tensor,
+        initial_params: dict,
         num_samples: int,
         num_warmup_steps: int,
         *,
@@ -325,7 +316,8 @@ class PyroSampler(MCMCSampler):
         Parameters
         ----------
         initial_params : Tensor
-            Full flat variable vector (including fixed parameters).
+            Starting point keyed by name, in the form a run returns. Fixed
+            names are ignored.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int

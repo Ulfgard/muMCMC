@@ -106,10 +106,6 @@ class UnnormalizedSpace(Space):
     def as_transform(self):
         return self._transform
 
-    @property
-    def is_proper(self) -> bool:
-        return False
-
     def prior_log_prob(self, y: dict) -> torch.Tensor:
         raise ValueError(
             "UnnormalizedSpace carries no prior, so prior_log_prob is not "

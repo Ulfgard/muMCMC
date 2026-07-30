@@ -403,11 +403,11 @@ class ChartRATTLE(HamiltonianSampler):
         adapter = NoAdaptation(init=log_eps)
         if adapt_step_size:
             adapter = Reinforce(sigma=adaptation_sigma, init=log_eps)
-        if not space.is_proper:
+        if space.prior_metric(space.as_transform.interior_point) is None:
             raise ValueError(
-                "ChartRATTLE needs a space with a prior, whose normal chart "
-                "supplies the constant prior block M of G_M = M + beta W^T W. "
-                "UnnormalizedSpace has no chart and so no M.")
+                "ChartRATTLE needs a space with a prior, whose chart supplies "
+                "the constant prior block M of G_M = M + beta W^T W. A space "
+                "with no prior has no M.")
         super().__init__(None, space, requires_metric=True, num_steps=num_steps,
                          adapter=adapter, divergence_threshold=divergence_threshold,
                          trajectory_length=num_steps * step_size)

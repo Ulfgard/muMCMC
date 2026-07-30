@@ -171,8 +171,7 @@ class SMC:
         C, M, N = num_chains, num_particles, num_chains * num_particles
 
         # initial populations ~ prior
-        theta0 = space.to_vector(space.sample(N))                 # (N, d_full)
-        q = sampler._init_position(theta0)                        # (N, d)
+        q = sampler._init_position(space.sample(N))               # (N, d)
         d = q.shape[-1]
 
         beta = torch.zeros(C, dtype=q.dtype, device=q.device)     # per-chain

@@ -189,7 +189,7 @@ def test_lmc_recovers_gaussian_on_curved_metric():
     torch.manual_seed(0)
     s = LMC(_curved_model, _space(), step_size=0.3, num_steps=5,
             adapt_step_size=False)
-    out = s.run_mcmc(torch.zeros(2), num_samples=2000, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=2000, num_warmup_steps=200,
                      num_chains=6, disable_progbar=True)
     for i, n in enumerate(NAMES):
         assert abs(float(out[n].mean()) - float(POST_MEAN[i])) < 0.1
@@ -199,7 +199,7 @@ def test_lmc_recovers_gaussian_on_curved_metric():
 def test_lmc_common_diagnostics_schema():
     torch.manual_seed(0)
     s = LMC(_curved_model, _space(), step_size=0.3, num_steps=4)
-    s.run_mcmc(torch.zeros(2), num_samples=40, num_warmup_steps=40,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=40, num_warmup_steps=40,
                num_chains=3, disable_progbar=True)
     d = s.diagnostics()
     for k in ("accept_rate", "num_divergences", "step_size"):

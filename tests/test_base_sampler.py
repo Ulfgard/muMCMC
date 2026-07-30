@@ -180,29 +180,28 @@ def test_to_full_splices_fixed():
     assert torch.allclose(full[..., 2], torch.full((5,), 2.0), atol=ATOL)
 
 
-def test_init_position_identity_space_is_passthrough():
-    space = UnnormalizedSpace(["a", "b"])
-    s = _RecordingSampler(space)
-    theta = torch.randn(2)
-    assert torch.allclose(s._init_position(theta), theta, atol=ATOL)
-
-
 def test_init_position_is_the_variables_themselves():
-    # The chain runs on the variables, so the starting position is the free
-    # block of what the caller gave, with no map applied.
-    space = LogNormalSpace(["x", "y"])
-    s = _RecordingSampler(space)
-    theta = torch.tensor([0.3, 2.0])
-    assert torch.allclose(s._init_position(theta), theta, atol=ATOL)
+    # The chain runs on the variables, so the starting position is the caller's
+    # point stacked in free-name order, with no map applied.
+    s = _RecordingSampler(LogNormalSpace(["x", "y"]))
+    point = {"x": torch.tensor(0.3), "y": torch.tensor(2.0)}
+    assert torch.allclose(s._init_position(point),
+                          torch.tensor([0.3, 2.0]), atol=ATOL)
 
 
-def test_init_position_drops_fixed_coordinates():
-    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 9.0})
-    s = _RecordingSampler(space)
-    theta_full = torch.tensor([1.0, 2.0, 9.0])
-    z = s._init_position(theta_full)
-    assert z.shape == (2,)                        # only free a, b
-    assert torch.allclose(z, torch.tensor([1.0, 2.0]), atol=ATOL)
+def test_init_position_drops_fixed_names():
+    s = _RecordingSampler(UnnormalizedSpace(["a", "b", "c"], fixed={"c": 9.0}))
+    point = {"a": torch.tensor(1.0), "b": torch.tensor(2.0),
+             "c": torch.tensor(9.0)}
+    q = s._init_position(point)
+    assert q.shape == (2,)                         # only free a, b
+    assert torch.allclose(q, torch.tensor([1.0, 2.0]), atol=ATOL)
+
+
+def test_init_position_rejects_a_missing_name():
+    s = _RecordingSampler(UnnormalizedSpace(["a", "b"]))
+    with pytest.raises(ValueError, match="missing"):
+        s._init_position({"a": torch.tensor(1.0)})
 
 
 # ========================================================================== #
@@ -212,7 +211,7 @@ def test_init_position_drops_fixed_coordinates():
 def test_driver_calls_and_warmup_boundary():
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=5, num_warmup_steps=3,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=5, num_warmup_steps=3,
                      num_chains=4, disable_progbar=True)
     assert s.calls["init"] == 1
     assert s.calls["step"] == 3 + 5              # warmup + sampling
@@ -229,7 +228,7 @@ def test_driver_collects_only_post_warmup_states_in_order():
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space, delta=1.0)
     W, S = 4, 6
-    out = s.run_mcmc(torch.zeros(2), num_samples=S, num_warmup_steps=W,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=S, num_warmup_steps=W,
                      num_chains=2, disable_progbar=True)
     expected_row = torch.arange(W + 1, W + S + 1, dtype=torch.get_default_dtype())
     assert torch.allclose(out["a"][0], expected_row, atol=ATOL)
@@ -239,7 +238,7 @@ def test_driver_collects_only_post_warmup_states_in_order():
 def test_driver_zero_warmup_is_clean():
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=0,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=0,
                      num_chains=3, disable_progbar=True)
     assert s.calls["step"] == 4
     assert s.calls["end_warmup"] == 1
@@ -250,7 +249,7 @@ def test_driver_zero_warmup_is_clean():
 def test_driver_default_single_chain_shape():
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=2,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=2,
                      disable_progbar=True)
     assert out["a"].shape == (1, 4)
 
@@ -258,7 +257,7 @@ def test_driver_default_single_chain_shape():
 def test_driver_splices_fixed_into_output():
     space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 7.0})
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(3), num_samples=4, num_warmup_steps=2,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=2,
                      num_chains=2, disable_progbar=True)
     assert set(out) == {"a", "b", "c"}
     assert torch.allclose(out["c"], torch.full((2, 4), 7.0), atol=ATOL)
@@ -268,7 +267,7 @@ def test_driver_accepts_and_ignores_extra_kwargs():
     # The Pyro path takes mp_context; the base driver must tolerate it.
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=3, num_warmup_steps=1,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=3, num_warmup_steps=1,
                      num_chains=2, disable_progbar=True, mp_context="spawn")
     assert out["a"].shape == (2, 3)
 

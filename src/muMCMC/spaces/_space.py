@@ -28,11 +28,11 @@ class Space:
     free-name order, and raises when it misses a free name or is the wrong
     shape.
 
-    Vectors come in two layouts. A full vector is ``(..., d_full)`` over
-    :attr:`names` in order, which is what a model potential is handed. A free
-    vector is ``(..., d)`` over :attr:`free_names` in the same relative order,
-    which is what the transform and the prior act on. :meth:`to_full` and
-    :meth:`to_free` move between them.
+    A point is a dict keyed by name, which is the only form a caller deals in.
+    Inside, it is a free vector ``(..., d)`` over :attr:`free_names`, which the
+    chain and the prior act on, and :meth:`to_full` widens that to the
+    ``(..., d_full)`` layout over :attr:`names` that a model potential is
+    handed.
 
     Parameters
     ----------
@@ -85,13 +85,6 @@ class Space:
         """The map ``theta = T(z)`` over the free variables."""
         raise NotImplementedError
 
-    @property
-    def is_proper(self) -> bool:
-        """Whether the prior is a normalized density, and so has a normal chart.
-        False for a space carrying no prior, whose evidence and entropy are then
-        not defined."""
-        return True
-
     # ---- vector layouts ---------------------------------------------------- #
 
     def _template(self, ref: torch.Tensor) -> torch.Tensor:
@@ -105,13 +98,6 @@ class Space:
             self._template_cache[key] = t
         return self._template_cache[key]
 
-    def to_free(self, theta_full: torch.Tensor) -> torch.Tensor:
-        """Full vector ``(..., d_full)`` to free vector ``(..., d)``."""
-        if not self.fixed:
-            return theta_full
-        idx = torch.as_tensor(self.free_indices, device=theta_full.device)
-        return theta_full.index_select(-1, idx)
-
     def to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Free vector ``(..., d)`` to full vector ``(..., d_full)``, with each
         fixed variable at its value."""
@@ -123,32 +109,34 @@ class Space:
         out[..., idx] = theta_free
         return out
 
-    def to_vector(self, samples: dict) -> torch.Tensor:
-        """Dict keyed by name to a full vector ``(..., d_full)``. Fixed names
-        absent from ``samples`` are filled in."""
-        samples = self.add_fixed(samples)
-        return torch.stack([samples[name] for name in self.names], dim=-1)
-
     def to_free_vector(self, samples: dict) -> torch.Tensor:
-        """Dict keyed by name to a free vector ``(..., d)``."""
+        """Dict keyed by name to a free vector ``(..., d)``. Fixed names in
+        ``samples`` are ignored, since they are not sampled.
+
+        Raises
+        ------
+        ValueError
+            If ``samples`` is missing a free name.
+        """
+        missing = [name for name in self._free_names if name not in samples]
+        if missing:
+            raise ValueError(f"samples is missing {missing}")
         return torch.stack([samples[name] for name in self._free_names], dim=-1)
 
-    def from_full_vector(self, theta_full: torch.Tensor) -> dict:
-        """Full vector ``(..., d_full)`` to a dict over every name."""
-        self._check_width(theta_full, self.d_full, "full")
-        return {name: theta_full[..., i] for i, name in enumerate(self.names)}
-
     def from_free_vector(self, theta_free: torch.Tensor) -> dict:
-        """Free vector ``(..., d)`` to a dict over the free names."""
-        self._check_width(theta_free, self.d, "free")
+        """Free vector ``(..., d)`` to a dict over the free names.
+
+        Raises
+        ------
+        ValueError
+            If the vector is not ``d`` wide.
+        """
+        if theta_free.shape[-1] != self.d:
+            raise ValueError(
+                f"expected a free vector of size {self.d}, got "
+                f"{theta_free.shape[-1]}.")
         return {name: theta_free[..., i]
                 for i, name in enumerate(self._free_names)}
-
-    def _check_width(self, vec, width, layout):
-        if vec.shape[-1] != width:
-            raise ValueError(
-                f"expected a {layout} vector of size {width}, got "
-                f"{vec.shape[-1]}.")
 
     # ---- fixed variables --------------------------------------------------- #
 

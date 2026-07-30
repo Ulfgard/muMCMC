@@ -228,7 +228,7 @@ def test_recovers_affine_gaussian_posterior():
     s = ChartRATTLE(c, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-10)
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
     assert torch.allclose(draws.mean(0), mu, atol=0.03)
@@ -262,7 +262,7 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     s = ChartRATTLE(c, NormalSpace(["a", "b"], mu=m0, sigma=s0),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="anderson", fp_tol=1e-10)
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
     assert torch.allclose(draws.mean(0), mu, atol=0.03)
@@ -309,7 +309,7 @@ def test_a_wide_prior_mixes_across_its_own_width():
     s = ChartRATTLE(c, NormalSpace(names, sigma=math.sqrt(S)), step_size=0.15,
                     num_steps=10, adapt_step_size=False, solver="anderson",
                     fp_tol=1e-10)
-    out = s.run_mcmc(torch.zeros(n), num_samples=400, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
                      num_chains=16, disable_progbar=True)
     # One chain, so this measures mixing rather than the spread of the
     # independent starts.
@@ -329,7 +329,7 @@ def test_newton_recovers_the_affine_gaussian_posterior():
     s = ChartRATTLE(c, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="newton", fp_tol=1e-10)
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     draws = torch.stack([out["a"], out["b"]], dim=-1).reshape(-1, 2)
     assert torch.allclose(draws.mean(0), mu, atol=0.03)
@@ -355,7 +355,7 @@ def test_recovers_funnel_posterior_against_quadrature():
     s = ChartRATTLE(c, NormalSpace(["v"]),
                     step_size=0.08, num_steps=16,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-9)
-    out = s.run_mcmc(torch.zeros(1), num_samples=400, num_warmup_steps=200,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
                      num_chains=64, disable_progbar=True)
     v = out["v"].reshape(-1)
     assert abs(float(v.mean()) - float(mean_q)) < 0.03

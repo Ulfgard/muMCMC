@@ -50,7 +50,7 @@ def prior_run():
     names = ["a", "b"]
     space = NormalSpace(names)
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.zeros(2), num_samples=N_SAMPLES,
+    out = nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=N_SAMPLES,
                         num_warmup_steps=N_WARMUP, num_chains=1,
                         disable_progbar=True)
     return out
@@ -65,7 +65,7 @@ def chart_run():
     torch.manual_seed(0)
     space = LogNormalSpace(["x", "y"])
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.tensor([1.0, 1.0]), num_samples=8 * N_SAMPLES,
+    out = nuts.run_mcmc({n: torch.tensor(1.0) for n in nuts.space.free_names}, num_samples=8 * N_SAMPLES,
                         num_warmup_steps=4 * N_WARMUP, num_chains=1,
                         disable_progbar=True)
     return space, nuts, out
@@ -118,7 +118,7 @@ def test_fixed_parameter_is_spliced_as_constant():
     space = NormalSpace(names,
                                fixed={"c": 1.5})
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.zeros(3), num_samples=40, num_warmup_steps=20,
+    out = nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=40, num_warmup_steps=20,
                         num_chains=1, disable_progbar=True)
     assert set(out) == {"a", "b", "c"}
     assert out["a"].shape == (1, 40)
@@ -164,7 +164,7 @@ def test_reproducible_with_fixed_seed():
         pyro.set_rng_seed(123)
         space = NormalSpace(names)
         nuts = NUTS(_flat_likelihood, space)
-        return nuts.run_mcmc(torch.zeros(2), num_samples=30, num_warmup_steps=20,
+        return nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=30, num_warmup_steps=20,
                              num_chains=1, disable_progbar=True)
 
     first, second = run(), run()

@@ -53,7 +53,8 @@ def main():
         solver="anderson", fp_tol=1e-9,
     )
     out = sampler.run_mcmc(
-        torch.zeros(1), num_samples=300, num_warmup_steps=150,
+        {"log_scale": torch.tensor(0.0)},
+        num_samples=300, num_warmup_steps=150,
         num_chains=48, disable_progbar=False,
     )
     v = out["log_scale"].reshape(-1)

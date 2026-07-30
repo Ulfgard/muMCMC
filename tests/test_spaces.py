@@ -2,11 +2,10 @@
 
 A space owns the parameter naming, the free/fixed split, the chart between the
 constrained variables and the standard normal, and the prior. The samplers drive
-spaces through a fixed protocol -- ``to_vector`` / ``to_free_vector``,
-``from_full_vector`` / ``from_free_vector``, ``to_full`` / ``to_free``,
-``add_fixed`` / ``remove_fixed``, ``as_transform``, ``prior_log_prob[_vector]``,
-``prior_metric``, ``free_block``, ``sample`` -- so these tests exercise that
-protocol's invariants.
+spaces through a fixed protocol -- ``to_free_vector`` / ``from_free_vector``,
+``to_full``, ``add_fixed`` / ``remove_fixed``, ``as_transform``,
+``prior_log_prob[_vector]``, ``prior_metric``, ``free_block``, ``sample`` -- so
+these tests exercise that protocol's invariants.
 """
 import math
 
@@ -85,19 +84,19 @@ def test_tensor_parameter_of_the_wrong_length_raises():
 #  Vector layouts                                                             #
 # --------------------------------------------------------------------------- #
 
-def test_to_full_splices_fixed_and_to_free_removes_it():
+def test_to_full_splices_fixed_at_its_place():
     s = NormalSpace(NAMES, fixed={"b": 7.0})
     theta_free = torch.randn(5, 2)
     full = s.to_full(theta_free)
     assert full.shape == (5, 3)
     assert torch.allclose(full[:, 1], torch.full((5,), 7.0), atol=ATOL)
-    assert torch.allclose(s.to_free(full), theta_free, atol=ATOL)
+    assert torch.allclose(full[:, [0, 2]], theta_free, atol=ATOL)
 
 
 def test_to_full_is_a_no_op_without_fixed():
     s = NormalSpace(NAMES)
     v = torch.randn(4, 3)
-    assert s.to_full(v) is v and s.to_free(v) is v
+    assert s.to_full(v) is v
 
 
 def test_to_full_preserves_dtype_and_leading_axes():
@@ -106,32 +105,35 @@ def test_to_full_preserves_dtype_and_leading_axes():
     assert full.shape == (2, 6, 3) and full.dtype == torch.float32
 
 
-def test_dict_and_vector_round_trip():
+def test_dict_and_free_vector_round_trip():
+    # The dict is the only form a caller deals in, and the free vector is the
+    # only form inside, so this pair is the whole conversion surface.
     s = NormalSpace(NAMES, fixed={"c": 9.0})
-    theta_free = torch.randn(4, 2)
-    full = s.to_full(theta_free)
-    as_dict = s.from_full_vector(full)
-    assert set(as_dict) == set(NAMES)
-    assert torch.allclose(s.to_vector(as_dict), full, atol=ATOL)
-    assert torch.allclose(s.to_free_vector(as_dict), theta_free, atol=ATOL)
+    point = {"a": torch.randn(4), "b": torch.randn(4)}
+    vec = s.to_free_vector(point)
+    assert vec.shape == (4, 2)
+    back = s.from_free_vector(vec)
+    assert set(back) == {"a", "b"}
+    assert all(torch.allclose(back[k], point[k], atol=ATOL) for k in point)
 
 
-def test_from_free_vector_keys_on_the_free_names():
-    s = NormalSpace(NAMES, fixed={"b": 1.0})
-    assert set(s.from_free_vector(torch.randn(4, 2))) == {"a", "c"}
+def test_to_free_vector_ignores_a_fixed_name():
+    s = NormalSpace(NAMES, fixed={"c": 9.0})
+    point = {"a": torch.randn(4), "b": torch.randn(4), "c": torch.randn(4)}
+    assert s.to_free_vector(point).shape == (4, 2)
 
 
-def test_to_vector_fills_in_a_missing_fixed_name():
-    s = NormalSpace(NAMES, fixed={"c": 4.0})
-    full = s.to_vector({"a": torch.zeros(3), "b": torch.zeros(3)})
-    assert torch.allclose(full[:, 2], torch.full((3,), 4.0), atol=ATOL)
+def test_to_free_vector_rejects_a_missing_free_name():
+    s = NormalSpace(NAMES)
+    with pytest.raises(ValueError, match="missing"):
+        s.to_free_vector({"a": torch.zeros(3), "b": torch.zeros(3)})
 
 
 @pytest.mark.parametrize("width", [1, 4])
-def test_from_vector_rejects_the_wrong_width(width):
+def test_from_free_vector_rejects_the_wrong_width(width):
     s = NormalSpace(NAMES, fixed={"c": 1.0})
-    with pytest.raises(ValueError, match="vector of size"):
-        s.from_full_vector(torch.zeros(2, width))
+    with pytest.raises(ValueError, match="free vector of size"):
+        s.from_free_vector(torch.zeros(2, width))
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +288,6 @@ def test_unnormalized_chart_is_the_identity():
 def test_unnormalized_contributes_no_potential_and_no_metric():
     s = UnnormalizedSpace(NAMES)
     z = torch.randn(4, 3)
-    assert not s.is_proper
     assert torch.allclose(s.prior_log_prob_vector(z), torch.zeros(4), atol=ATOL)
     assert s.prior_metric(z) is None
 
