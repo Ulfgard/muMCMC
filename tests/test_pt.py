@@ -11,7 +11,7 @@ import math
 import torch
 import pytest
 
-from muMCMC import RMHMC, PT, UnconstrainedSpace
+from muMCMC import RMHMC, PT, NormalSpace, UnnormalizedSpace
 from pyro.distributions import Normal
 
 torch.set_default_dtype(torch.float64)
@@ -26,12 +26,7 @@ def gaussian_1d(lam, mu):
 
 
 def gaussian_1d_space():
-    return UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 1.0)},
-        prior_metric_fn=lambda theta: torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    return NormalSpace(["x"])
 
 
 def bimodal_1d(m, s):
@@ -107,12 +102,7 @@ def test_pt_multi_ladder_shapes_and_rhat():
 def test_pt_recovers_bimodal_with_balanced_mass():
     torch.manual_seed(0)
     m, s = 2.5, 0.5
-    space = UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 2.0)},
-        prior_metric_fn=lambda theta: 0.25 * torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    space = NormalSpace(["x"], sigma=2.0)
     sampler = RMHMC(bimodal_1d(m, s), space, step_size=0.25, num_steps=6,
                     adapt_step_size=False)
     pt = PT(sampler, torch.linspace(0.0, 1.0, 6))

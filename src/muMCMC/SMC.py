@@ -170,7 +170,7 @@ class SMC:
         sampler, space = self.sampler, self.space
         C, M, N = num_chains, num_particles, num_chains * num_particles
 
-        # initial populations ~ prior, in unconstrained free coordinates
+        # initial populations ~ prior, read in the normal chart
         theta0 = space.to_vector(space.sample(N))                 # (N, d_full)
         z = sampler._init_z_free(theta0)                          # (N, d)
         d = z.shape[-1]
@@ -226,8 +226,8 @@ class SMC:
         sampler.beta = 1.0                                        # restore kernel default
         z = s.q                                                   # final mutated population
 
-        theta_free = space.map_to_constrained_vector(z).mapped_point
-        free = space.from_vector(theta_free)
+        theta_free = space.as_transform.forward(z).mapped_point
+        free = space.from_free_vector(theta_free)
         if C >= 2:
             self._r_hat = {name: _rhat(v.reshape(C, M)) for name, v in free.items()}
         return {k: v.reshape(C, M) for k, v in space.add_fixed(free).items()}

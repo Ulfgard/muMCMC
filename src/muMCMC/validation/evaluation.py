@@ -234,7 +234,7 @@ class PosteriorEvaluation:
 
         # Unconstrained draws grouped by chain. Detached so the cached draws (and
         # everything derived from them: log f, q̂) never carry an autograd graph.
-        self._z = self.space.map_to_unconstrained_vector(theta_free).mapped_point.detach()
+        self._z = self.space.as_transform.inverse(theta_free).mapped_point.detach()
         self._n1 = K * n
         self._n0 = K * n if n_q is None else int(n_q)
 
@@ -270,7 +270,7 @@ class PosteriorEvaluation:
         """Posterior entropy ``H[p(y|x)] = logZ − E_post[loglik] − E_post[log_prior]``,
         a plain Monte Carlo average over the draws (w.r.t. ``dy``)."""
         z = self._z.reshape(self._n1, self._d)
-        theta_free = self.space.map_to_constrained_vector(z).mapped_point
+        theta_free = self.space.as_transform.forward(z).mapped_point
         loglik = self._tempered_loglik(z)
         log_prior = self.space.prior_log_prob_vector(theta_free)
         return self.log_evidence - float(loglik.mean()) - float(log_prior.mean())
@@ -288,7 +288,7 @@ class PosteriorEvaluation:
         """
         excluded = [name for name in self.space.free_names if name not in y_star]
         if not excluded:
-            z = self.space.map_to_unconstrained_vector(
+            z = self.space.as_transform.inverse(
                 self.space.to_free_vector(y_star)).mapped_point
             ig = self._tempered_loglik(z) - self.log_evidence
             return (ig, None) if return_ess else ig
@@ -334,9 +334,9 @@ class PosteriorEvaluation:
         excluded = [name for name in self.space.free_names if name not in y]
         if not excluded:
             theta_free = self.space.to_free_vector(y)
-            z = self.space.map_to_unconstrained_vector(theta_free).mapped_point
+            z = self.space.as_transform.inverse(theta_free).mapped_point
             value = self.sampler.evaluate_model(z)[0].value
-            jac = self.space.map_to_constrained_vector(z).jacobian_log_det
+            jac = self.space.as_transform.forward(z).jacobian_log_det
             # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
             log_post = -value - jac - self.log_evidence
             return (log_post, None) if return_ess else log_post
@@ -367,15 +367,14 @@ class PosteriorEvaluation:
         a_t = torch.tensor(a_idx, device=device)
         b_t = torch.tensor(b_idx, device=device)
 
-        # Query y_a -> unconstrained z_a. The transform is elementwise, so fill
-        # the b block with any interior placeholder (the image of z = 0) and keep
-        # only the a coordinates of the result.
-        y0 = self.space.from_vector(
-            self.space.map_to_constrained_vector(torch.zeros(d, dtype=dtype, device=device)).mapped_point)
+        # Query y_a -> chart coordinate z_a. The transform is elementwise, so
+        # fill the b block with the interior placeholder T(0) and keep only the a
+        # coordinates of the result.
+        y0 = self.space.from_free_vector(self.space.as_transform.interior_point.to(dtype))
         full = {name: y[name] for name in a_names}
         for name in b_names:
             full[name] = y0[name].expand(M)
-        z_a = self.space.map_to_unconstrained_vector(
+        z_a = self.space.as_transform.inverse(
             self.space.to_free_vector(full)).mapped_point[:, a_t]        # (M, |a|)
 
         # Conditional q(z_b | z_a) from the pooled joint fit (itself a mixture).
@@ -391,7 +390,7 @@ class PosteriorEvaluation:
                 full_p = {name: y0[name].expand(n_prior) for name in a_names}
                 for name in b_names:
                     full_p[name] = prior[name]
-                z_bp = self.space.map_to_unconstrained_vector(
+                z_bp = self.space.as_transform.inverse(
                     self.space.to_free_vector(full_p)).mapped_point[:, b_t]
                 blocks.append(z_bp[None].expand(M, n_prior, nb))
             z_b = torch.cat(blocks, dim=1)                               # (M, n, |b|)
@@ -400,7 +399,7 @@ class PosteriorEvaluation:
             z_full[..., a_t] = z_a[:, None, :].expand(M, n, na)
             z_full[..., b_t] = z_b
             z_flat = z_full.reshape(M * n, d)
-            tmap = self.space.map_to_constrained_vector(z_flat)
+            tmap = self.space.as_transform.forward(z_flat)
             jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, n)
             prior_b = self.space.prior_log_prob(
                 {name: tmap.mapped_point[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)

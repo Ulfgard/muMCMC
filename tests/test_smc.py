@@ -11,7 +11,7 @@ import math
 import torch
 import pytest
 
-from muMCMC import RMHMC, SMC, UnconstrainedSpace
+from muMCMC import RMHMC, SMC, NormalSpace, UnnormalizedSpace
 from muMCMC.SMC import _systematic_resample
 from pyro.distributions import Normal
 
@@ -35,12 +35,7 @@ def gaussian_1d(lam, mu):
 
 
 def gaussian_1d_space():
-    return UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 1.0)},
-        prior_metric_fn=lambda theta: torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    return NormalSpace(["x"])
 
 
 def bimodal_1d(m, s):
@@ -201,12 +196,7 @@ def test_recovers_gaussian_posterior_and_evidence():
 def test_recovers_bimodal_posterior_with_balanced_mass():
     torch.manual_seed(0)
     m, s = 2.0, 0.5
-    space = UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 2.0)},
-        prior_metric_fn=lambda theta: 0.25 * torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    space = NormalSpace(["x"], sigma=2.0)
     smc = make_smc(bimodal_1d(m, s), space, step_size=0.25, num_steps=8,
                    num_mcmc_steps=8)
 

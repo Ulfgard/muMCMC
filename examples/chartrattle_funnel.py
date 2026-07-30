@@ -16,7 +16,7 @@ the chain against it. Run:  python examples/chartrattle_funnel.py
 import torch
 
 from muMCMC.ChartRATTLE import ChartRATTLE, LocationScaleChart
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -46,15 +46,9 @@ def main():
     # position equation in a few iterations per substep.
     sampler = ChartRATTLE(
         constraint,
-        # eta ~ N(0, 1) is the model's own prior, so the space carries it. A
-        # space with no prior would give ChartRATTLE a flat one.
-        UnconstrainedSpace(
-            ["log_scale"],
-            priors={"log_scale": torch.distributions.Normal(torch.tensor(0.0),
-                                                            torch.tensor(1.0))},
-            # ChartRATTLE takes the prior block M of G_M = M + beta W^T W off
-            # the space. eta ~ N(0, 1) has unit precision, so M = I.
-            prior_metric_fn=lambda th: torch.eye(1).expand(th.shape[0], 1, 1)),
+        # eta ~ N(0, 1) is the model's own prior, so the space carries it. The
+        # chain runs in its normal chart, which is where M = I comes from.
+        NormalSpace(["log_scale"], mu=0.0, sigma=1.0),
         step_size=0.08, num_steps=12, adapt_step_size=False,
         solver="anderson", fp_tol=1e-9,
     )

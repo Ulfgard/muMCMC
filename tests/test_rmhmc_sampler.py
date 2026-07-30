@@ -11,7 +11,7 @@ import pytest
 
 from muMCMC.RMHMC import RMHMC, RMHMCState
 from muMCMC._adapters import Reinforce, NoAdaptation
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -34,7 +34,7 @@ def model_qdep(theta):
 
 
 def make_sampler(model_fn=model_simple, *, adapt=False, **kw):
-    space = UnconstrainedSpace([f"x{i}" for i in range(D)])
+    space = UnnormalizedSpace([f"x{i}" for i in range(D)])
     kw.setdefault("step_size", 0.1)
     return RMHMC(model_fn, space, adapt_step_size=adapt, **kw)
 

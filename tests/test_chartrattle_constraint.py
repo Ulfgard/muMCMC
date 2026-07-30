@@ -20,7 +20,7 @@ import torch
 import pytest
 
 from muMCMC.ChartRATTLE import ChartRATTLE, ChartConstraint, LocationScaleChart
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -90,9 +90,7 @@ def _eval(constraint, eta, beta=1.0, grad=True):
     """evaluate_model through a minimal sampler at the given temperature."""
     n = eta.shape[-1]
     names = [f"v{i}" for i in range(n)]
-    s = ChartRATTLE(constraint,
-                    UnconstrainedSpace(names, priors={k: _N01() for k in names},
-                                       prior_metric_fn=_eye(n)),
+    s = ChartRATTLE(constraint, NormalSpace(names),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -216,57 +214,56 @@ def test_beta_tempers_the_data_fit_only():
 #  3b. The space's prior replaces the standard-normal latent                #
 # ========================================================================== #
 
-def _prior_eval(constraint, eta, priors, beta=1.0, grad=True):
-    """evaluate_model through a sampler whose space carries ``priors``."""
+def _prior_eval(constraint, eta, mu, sigma, beta=1.0, grad=True):
+    """evaluate_model through a sampler whose space has a Normal(mu, sigma)
+    prior, so the chart is theta = mu + sigma q."""
     names = [f"v{i}" for i in range(eta.shape[-1])]
-    s = ChartRATTLE(constraint,
-                    UnconstrainedSpace(names, priors=priors,
-                                       prior_metric_fn=_eye(len(names))),
+    s = ChartRATTLE(constraint, NormalSpace(names, mu=mu, sigma=sigma),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
 
 
-def _base_of(constraint, eta, priors):
-    """U.base at ``eta`` for a space carrying ``priors`` (None for no prior)."""
-    space = UnconstrainedSpace(["v0"], priors=priors, prior_metric_fn=_eye(1))
-    s = ChartRATTLE(constraint, space, step_size=0.1, adapt_step_size=False)
+def _base_of(constraint, eta, mu=0.0, sigma=1.0):
+    """U.base at ``eta`` for a space with a Normal(mu, sigma) prior."""
+    s = ChartRATTLE(constraint, NormalSpace(["v0"], mu=mu, sigma=sigma),
+                    step_size=0.1, adapt_step_size=False)
     return s.evaluate_model(eta, grad=False)[0].base
 
 
-def test_absent_prior_is_flat():
-    # The prior always comes off the space, as for every other sampler, so a
-    # space without one contributes nothing rather than a standard normal. U.base
-    # is then the volume term alone.
+def test_a_space_without_a_prior_is_rejected():
+    # ChartRATTLE reads M off the chart, and a space with no prior has none.
     c, _, _ = _funnel_pair()
-    eta = torch.randn(7, 1)
-    assert torch.allclose(_base_of(c, eta, None), c.log_abs_det_B(eta), atol=1e-12)
+    with pytest.raises(ValueError, match="prior"):
+        ChartRATTLE(c, UnnormalizedSpace(["v0"]), step_size=0.1,
+                    adapt_step_size=False)
 
 
 def test_standard_normal_prior_is_the_non_centered_latent():
-    # Asked for by name, the standard normal reproduces 1/2||q||^2 up to its
-    # normalizer.
+    # The chart of Normal(0, 1) is the identity, so U.base is 1/2||q||^2 up to
+    # its normalizer, plus the volume term.
     c, _, _ = _funnel_pair()
     eta = torch.randn(7, 1)
     expected = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
                 + c.log_abs_det_B(eta))
-    assert torch.allclose(_base_of(c, eta, {"v0": _N01()}), expected, atol=1e-12)
+    assert torch.allclose(_base_of(c, eta), expected, atol=1e-12)
 
 
-def test_space_prior_replaces_the_standard_normal_in_U():
-    # A Normal(mu0, s0) prior on the space shows up in U as -log p(q), so U
-    # differs from the default by exactly that swap and the likelihood part is
-    # untouched.
+def test_space_prior_enters_U_as_its_chart():
+    # A Normal(mu0, s0) prior is the chart theta = mu0 + s0 q, so U.base stays
+    # the standard normal potential plus the volume term read at theta, and the
+    # likelihood is the one evaluated at theta rather than at q.
     c, _, _ = _funnel_pair(sigma=2.0, m=4, seed=3)
     eta = torch.randn(9, 1)
-    prior = torch.distributions.Normal(torch.tensor(0.7), torch.tensor(1.6))
+    mu0, s0 = 0.7, 1.6
+    theta = mu0 + s0 * eta
 
-    U_def = _eval(c, eta)[0]                       # standard-normal latent
-    U_pri = _prior_eval(c, eta, {"v0": prior})[0]
+    U_pri = _prior_eval(c, eta, mu0, s0)[0]
 
-    swap = _N01().log_prob(eta[:, 0]) - prior.log_prob(eta[:, 0])
-    assert torch.allclose(U_pri.value, U_def.value + swap, atol=1e-10)
-    assert torch.allclose(U_pri.lik, U_def.lik, atol=1e-12)
+    expected_base = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
+                     + c.log_abs_det_B(theta))
+    assert torch.allclose(U_pri.base, expected_base, atol=1e-10)
+    assert torch.allclose(U_pri.lik, _eval(c, theta)[0].lik, atol=1e-10)
 
 
 def test_space_prior_enters_the_force():
@@ -278,12 +275,11 @@ def test_space_prior_enters_the_force():
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
     eta = torch.randn(3, 2)
-    priors = {"v0": torch.distributions.Normal(torch.tensor(0.4), torch.tensor(2.0)),
-              "v1": torch.distributions.Normal(torch.tensor(-0.3), torch.tensor(0.7))}
-    gV = _prior_eval(c, eta, priors)[4]
+    mu, sd = [0.4, -0.3], [2.0, 0.7]
+    gV = _prior_eval(c, eta, mu, sd)[4]
 
     def V(e):
-        U, metric, _, _ = _prior_eval(c, e, priors, grad=False)
+        U, metric, _, _ = _prior_eval(c, e, mu, sd, grad=False)
         return U.value + 0.5 * metric.log_det_metric()
     h = 1e-6
     gfd = torch.zeros_like(eta)
@@ -294,15 +290,15 @@ def test_space_prior_enters_the_force():
     assert torch.allclose(gV, gfd, atol=1e-6)
 
 
-def test_space_prior_leaves_the_metric_alone():
-    # G_M is chart geometry, not a prior term, so swapping the prior must not
-    # move it. The preconditioner of the position solve rests on this.
+def test_prior_block_of_the_metric_is_the_identity():
+    # M is the prior block of G_M and the matrix the position solve
+    # preconditions with. In the chart it is the identity whatever the prior,
+    # which is what makes it constant.
     c, _, _ = _funnel_pair()
     eta = torch.randn(5, 1)
-    m_def = _eval(c, eta)[1]
-    m_pri = _prior_eval(c, eta, {"v0": torch.distributions.Normal(
-        torch.tensor(2.0), torch.tensor(0.3))})[1]
-    assert torch.allclose(m_pri.value, m_def.value, atol=1e-12)
+    for mu, sd in [(0.0, 1.0), (2.0, 0.3)]:
+        m = _prior_eval(c, eta, mu, sd)[1]
+        assert torch.allclose(m.base, torch.eye(1).expand(5, 1, 1), atol=1e-12)
 
 
 def test_space_prior_is_untempered():
@@ -310,10 +306,8 @@ def test_space_prior_is_untempered():
     # swap statistic stays temperature-free.
     c, _, _ = _funnel_pair()
     eta = torch.randn(6, 1)
-    priors = {"v0": torch.distributions.Normal(torch.tensor(0.2),
-                                               torch.tensor(1.3))}
-    U1 = _prior_eval(c, eta, priors, beta=1.0)[0]
-    Ub = _prior_eval(c, eta, priors, beta=0.25)[0]
+    U1 = _prior_eval(c, eta, 0.2, 1.3, beta=1.0)[0]
+    Ub = _prior_eval(c, eta, 0.2, 1.3, beta=0.25)[0]
     assert torch.allclose(U1.base, Ub.base, atol=1e-12)
     assert torch.allclose(U1.lik, Ub.lik, atol=1e-12)
     assert torch.allclose(Ub.value, Ub.base + 0.25 * Ub.lik, atol=1e-12)

@@ -18,7 +18,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_evidence
 
 torch.set_default_dtype(torch.float64)
@@ -44,7 +44,7 @@ def _gaussian_model(x):
     """Return (sampler, x, logZ_true) for the conjugate Gaussian at observed x."""
     d = x.shape[0]
     names = [f"y{i}" for i in range(d)]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    space = NormalSpace(names)
     const = 0.5 * d * math.log(2 * math.pi)
 
     def potential_fn(theta):                      # U_lik = -log N(x; theta, I)
@@ -73,7 +73,7 @@ def _linear_gaussian_model(x_obs, sigma):
     (sampler, names, mu_post, Sigma_post).
     """
     names = ["y0", "y1"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    space = NormalSpace(names)
     const = 0.5 * math.log(2 * math.pi * sigma ** 2)
 
     def potential_fn(theta):                      # U_lik = -log N(x_obs; y0+y1, sigma^2)
@@ -384,7 +384,7 @@ def _bimodal_model(m, s, sigma0, w):
     U_lik = log_prior - log f cancels the space prior in evaluate_model, so the
     unnormalized posterior is exactly f (which integrates to 1).
     """
-    space = UnconstrainedSpace(["y"], priors={"y": Normal(0.0, sigma0)})
+    space = NormalSpace(["y"], sigma=sigma0)
     prior, cp, cm = Normal(0.0, sigma0), Normal(m, s), Normal(-m, s)
 
     def potential_fn(theta):

@@ -9,7 +9,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import LMC, HMC, UnconstrainedSpace
+from muMCMC import LMC, HMC, NormalSpace, UnnormalizedSpace
 from muMCMC.LMC import LMCState
 
 torch.set_default_dtype(torch.float64)
@@ -22,7 +22,7 @@ POST_STD = (SIGMA2 / (SIGMA2 + 1.0)) ** 0.5
 
 
 def _space():
-    return UnconstrainedSpace(NAMES, priors={n: Normal(0.0, 1.0) for n in NAMES})
+    return NormalSpace(NAMES)
 
 
 def _curved_model(theta):
@@ -49,8 +49,11 @@ def test_constant_metric_reduces_to_hmc():
     def hmc_model(theta):
         return 0.5 * ((theta - MU) ** 2).sum(-1)
 
-    lmc = LMC(lmc_model, _space(), step_size=0.2, num_steps=6, adapt_step_size=False)
-    hmc = HMC(hmc_model, _space(), step_size=0.2, num_steps=6,
+    # A prior-free space, so the free metric is exactly the model's G rather
+    # than G plus the prior's identity block.
+    space = UnnormalizedSpace(NAMES)
+    lmc = LMC(lmc_model, space, step_size=0.2, num_steps=6, adapt_step_size=False)
+    hmc = HMC(hmc_model, space, step_size=0.2, num_steps=6,
               mass_matrix=M, adapt_step_size=False)
 
     q0 = torch.tensor([[0.3, -0.2], [0.1, 0.4]])
@@ -150,7 +153,7 @@ def _armed_geometry():
     """An LMC over an identity, prior-free space (so ``phi = U + 1/2 log det G``
     isolates the geometry and the free metric is exactly the model's ``G``),
     with fixed positions/velocities the reference is checked against."""
-    lmc = LMC(_curved_model, UnconstrainedSpace(NAMES), step_size=0.1,
+    lmc = LMC(_curved_model, UnnormalizedSpace(NAMES), step_size=0.1,
               num_steps=1, adapt_step_size=False)
     lmc.init(torch.zeros(3, 2))                   # arm the adapter at 0.1
     torch.manual_seed(0)

@@ -10,13 +10,16 @@ configuration is retempered to its slot's temperature by ``reorder``/``select``
 alone.
 """
 import pytest
+import math
+
 import torch
 
 from muMCMC.spaces import (
     TemperedMetric,
     TemperedAffine,
-    UnconstrainedSpace,
-    UniformBoxSpace,
+    LogNormalSpace,
+    NormalSpace,
+    UnnormalizedSpace,
 )
 
 torch.set_default_dtype(torch.float64)
@@ -34,7 +37,7 @@ def _matvec(M, v):
 
 
 def _identity_space(d):
-    return UnconstrainedSpace([f"x{i}" for i in range(d)])
+    return UnnormalizedSpace([f"x{i}" for i in range(d)])
 
 
 # --------------------------------------------------------------------------- #
@@ -47,28 +50,28 @@ def test_push_forward_identity_is_free_block():
     s = _identity_space(d)
     G = _rand_spd(n, d)
     z = torch.randn(n, d)
-    A = s.push_forward_metric(G, s.map_to_constrained_vector(z))
+    A = s.push_forward_metric(G, s.as_transform.forward(z).jacobian_diag)
     assert torch.allclose(A, G, atol=ATOL)          # identity J, no fixed
 
 
 def test_push_forward_projects_out_fixed():
     torch.manual_seed(1)
     n = 4
-    s = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 0.0})   # free = a, b
+    s = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 0.0})   # free = a, b
     G = _rand_spd(n, 3)
     z_free = torch.randn(n, 2)
-    A = s.push_forward_metric(G, s.map_to_constrained_vector(z_free))
+    A = s.push_forward_metric(G, s.as_transform.forward(z_free).jacobian_diag)
     assert torch.allclose(A, G[:, :2, :2], atol=ATOL)
 
 
-def test_push_forward_box_scales_by_jacobian():
+def test_push_forward_nonidentity_chart_scales_by_jacobian():
     torch.manual_seed(2)
     n, d = 4, 2
-    s = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"], device="cpu")
+    s = LogNormalSpace(["x", "y"])
     G = _rand_spd(n, d)
     z = torch.randn(n, d)
-    theta_map = s.map_to_constrained_vector(z)
-    A = s.push_forward_metric(G, theta_map)
+    theta_map = s.as_transform.forward(z)
+    A = s.push_forward_metric(G, theta_map.jacobian_diag)
     dJ = theta_map.jacobian_diag
     assert torch.allclose(A, dJ[..., :, None] * G * dJ[..., None, :], atol=ATOL)
 
@@ -201,19 +204,17 @@ def test_evaluate_model_assembles_potential_and_metric():
         G = torch.eye(n, dtype=theta.dtype) + 0.2 * theta[..., :, None] * theta[..., None, :]
         return U, G
 
-    space = UnconstrainedSpace(
-        ["x0", "x1", "x2"],
-        prior_metric_fn=lambda theta: torch.eye(3, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 3, 3),
-    )
+    space = NormalSpace(["x0", "x1", "x2"])
     s = RMHMC(model, space, step_size=0.1, adapt_step_size=False)
     z = torch.randn(5, 3)
     beta = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
 
     potential, metric = s.evaluate_model(z, beta)
-    # no prior log-prob and identity Jacobian, so U_base = 0 and U = beta * U_lik.
+    # The chart is the identity here, and U_base is the standard normal
+    # potential, so U = beta * U_lik + ½‖z‖² + (3/2) log 2π.
     U_lik = 0.5 * (z ** 2).sum(-1)
-    assert torch.allclose(potential.value, beta * U_lik, atol=ATOL)
+    U_base = 0.5 * (z ** 2).sum(-1) + 1.5 * math.log(2.0 * math.pi)
+    assert torch.allclose(potential.value, beta * U_lik + U_base, atol=ATOL)
     # metric at beta: G_u = beta*(I + theta theta^T) + I
     v = torch.randn(5, 3)
     G = beta.reshape(-1, 1, 1) * (torch.eye(3) + 0.2 * z[:, :, None] * z[:, None, :]) + torch.eye(3)

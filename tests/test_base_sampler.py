@@ -25,7 +25,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import UnconstrainedSpace, UniformBoxSpace, transforms
+from muMCMC.spaces import NormalSpace, LogNormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -78,7 +78,7 @@ def _matvec(M, v):
 def test_potential_adds_prior_on_identity_space():
     # Identity transform (Jacobian log-det = 0): U = U_lik - log prior.
     names = ["a", "b"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    space = NormalSpace(names)
     s = _RecordingSampler(space, potential_fn=lambda th: 0.5 * (th ** 2).sum(-1))
 
     z = torch.randn(5, 2)
@@ -89,17 +89,15 @@ def test_potential_adds_prior_on_identity_space():
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
 
 
-def test_potential_subtracts_jacobian_log_det_on_box_space():
-    # Uniform box: the implicit prior is uniform on the box and normalized, so
-    # U = U_lik(theta) - log_prior(theta) - log|det J|, with log_prior the
-    # constant -log(u_i - l_i) summed over free coords. theta passed to
-    # potential_fn must be the *constrained* (box) value.
-    space = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"],
-                            device="cpu")
+def test_potential_subtracts_jacobian_log_det_on_a_nonidentity_chart():
+    # On any chart, U = U_lik(theta) - log_prior(theta) - log|det J|, which is
+    # the collapse the normal chart is built on. theta passed to potential_fn
+    # must be the constrained value.
+    space = LogNormalSpace(["x", "y"])
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
     z = torch.randn(6, 2)
-    theta_map = space.map_to_constrained_vector(z)
+    theta_map = space.as_transform.forward(z)
     theta = theta_map.mapped_point
     prior_lp = space.prior_log_prob_vector(theta)
     expected = theta.sum(-1) - prior_lp - theta_map.jacobian_log_det
@@ -110,7 +108,7 @@ def test_potential_splices_fixed_coordinate_and_skips_its_prior():
     # c is fixed at 2.0: potential_fn sees the full vector (so its sum includes
     # the +2.0), while the prior sums over the free names a, b only.
     names = ["a", "b", "c"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names},
+    space = NormalSpace(names,
                                fixed={"c": 2.0})
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
@@ -123,7 +121,7 @@ def test_potential_splices_fixed_coordinate_and_skips_its_prior():
 
 def test_potential_fn_receives_full_width_vector_with_fixed():
     names = ["a", "b", "c"]
-    space = UnconstrainedSpace(names, fixed={"c": 2.0})
+    space = UnnormalizedSpace(names, fixed={"c": 2.0})
     seen = {}
 
     def potential_fn(theta_full):
@@ -148,7 +146,7 @@ def _metric_model(scale):
 
 def test_metric_branch_returns_pulled_back_likelihood_metric():
     # No prior metric, identity transform: the pulled-back metric is just G_lik.
-    space = UnconstrainedSpace(["a", "b"])        # no priors, no prior metric
+    space = UnnormalizedSpace(["a", "b"])        # no priors, no prior metric
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
     z = torch.randn(4, 2)
@@ -160,19 +158,15 @@ def test_metric_branch_returns_pulled_back_likelihood_metric():
 
 
 def test_metric_branch_adds_prior_metric():
-    # G_full = G_lik + G_prior = (2 + 3) I, so G^{-1} v == v / 5.
-    def prior_metric_fn(theta_full):
-        n = theta_full.shape[-1]
-        return 3.0 * torch.eye(n, dtype=theta_full.dtype).expand(
-            *theta_full.shape[:-1], n, n)
-
-    space = UnconstrainedSpace(["a", "b"], prior_metric_fn=prior_metric_fn)
+    # The prior's metric in its own chart is the identity, so
+    # G = G_lik + I = (2 + 1) I and G^{-1} v == v / 3.
+    space = NormalSpace(["a", "b"])
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
     z = torch.randn(4, 2)
     _, metric = s.evaluate_model(z)
     v = torch.randn(4, 2)
-    assert torch.allclose(metric.inv_metric_times_vec(v), v / 5.0, atol=ATOL)
+    assert torch.allclose(metric.inv_metric_times_vec(v), v / 3.0, atol=ATOL)
 
 
 # ========================================================================== #
@@ -180,10 +174,10 @@ def test_metric_branch_adds_prior_metric():
 # ========================================================================== #
 
 def test_free_to_full_splices_fixed():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 2.0})
+    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 2.0})
     s = _RecordingSampler(space)
     theta_free = torch.randn(5, 2)
-    full = s._free_to_full(theta_free)
+    full = space.to_full(theta_free)
     assert full.shape == (5, 3)
     assert torch.allclose(full[..., 0], theta_free[..., 0], atol=ATOL)
     assert torch.allclose(full[..., 1], theta_free[..., 1], atol=ATOL)
@@ -191,24 +185,22 @@ def test_free_to_full_splices_fixed():
 
 
 def test_init_z_free_identity_space_is_passthrough():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     theta = torch.randn(2)
     assert torch.allclose(s._init_z_free(theta), theta, atol=ATOL)
 
 
-def test_init_z_free_box_space_unconstrains():
-    space = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"],
-                            device="cpu")
+def test_init_z_free_nonidentity_chart_inverts_it():
+    space = LogNormalSpace(["x", "y"])
     s = _RecordingSampler(space)
     theta = torch.tensor([0.3, 2.0])
     z = s._init_z_free(theta)
-    expected = transforms.box_inv(theta, space.l, space.u).mapped_point
-    assert torch.allclose(z, expected, atol=ATOL)
+    assert torch.allclose(z, torch.log(theta), atol=ATOL)
 
 
 def test_init_z_free_drops_fixed_coordinates():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 9.0})
+    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 9.0})
     s = _RecordingSampler(space)
     theta_full = torch.tensor([1.0, 2.0, 9.0])
     z = s._init_z_free(theta_full)
@@ -221,7 +213,7 @@ def test_init_z_free_drops_fixed_coordinates():
 # ========================================================================== #
 
 def test_driver_calls_and_warmup_boundary():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     out = s.run_mcmc(torch.zeros(2), num_samples=5, num_warmup_steps=3,
                      num_chains=4, disable_progbar=True)
@@ -237,7 +229,7 @@ def test_driver_collects_only_post_warmup_states_in_order():
     # step adds delta=1 each call from q0=0, so the j-th collected sample is
     # (num_warmup + 1 + j): a deterministic check of "collect post-warmup,
     # grouped (chain, sample)" plus the identity map-back.
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space, delta=1.0)
     W, S = 4, 6
     out = s.run_mcmc(torch.zeros(2), num_samples=S, num_warmup_steps=W,
@@ -248,7 +240,7 @@ def test_driver_collects_only_post_warmup_states_in_order():
 
 
 def test_driver_zero_warmup_is_clean():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=0,
                      num_chains=3, disable_progbar=True)
@@ -259,7 +251,7 @@ def test_driver_zero_warmup_is_clean():
 
 
 def test_driver_default_single_chain_shape():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=2,
                      disable_progbar=True)
@@ -267,7 +259,7 @@ def test_driver_default_single_chain_shape():
 
 
 def test_driver_splices_fixed_into_output():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 7.0})
+    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 7.0})
     s = _RecordingSampler(space)
     out = s.run_mcmc(torch.zeros(3), num_samples=4, num_warmup_steps=2,
                      num_chains=2, disable_progbar=True)
@@ -277,7 +269,7 @@ def test_driver_splices_fixed_into_output():
 
 def test_driver_accepts_and_ignores_extra_kwargs():
     # The Pyro path takes mp_context; the base driver must tolerate it.
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     out = s.run_mcmc(torch.zeros(2), num_samples=3, num_warmup_steps=1,
                      num_chains=2, disable_progbar=True, mp_context="spawn")
@@ -289,7 +281,7 @@ def test_driver_accepts_and_ignores_extra_kwargs():
 # ========================================================================== #
 
 def test_logging_and_diagnostics_default_empty():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     assert s.logging() == {}
     assert s.diagnostics() == {}

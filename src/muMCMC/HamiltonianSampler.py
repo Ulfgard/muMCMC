@@ -43,7 +43,7 @@ class HamiltonianSampler(MCMCSampler):
     model_fn : callable
         Model potential in constrained coordinates (see ``MCMCSampler``).
     space : object
-        Parameter space (priors, transform, free/fixed split).
+        Parameter space: the prior's normal chart and the free/fixed split.
     requires_metric : bool
         Whether the sampler needs a position-dependent metric.
     num_steps : int

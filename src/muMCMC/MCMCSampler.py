@@ -30,8 +30,8 @@ class MCMCSampler(ABC):
         Model potential ``U = -log p`` in constrained coordinates. Signature is
         method-dependent (see ``evaluate_model``).
     space
-        Parameter space: transforms, free/fixed split, vector<->dict
-        conversions, prior, and prior metric.
+        Parameter space: the prior's normal chart, the free/fixed split, and the
+        vector and dict conversions.
     requires_metric : bool
         Whether the sampler needs a position-dependent metric.
     """
@@ -52,9 +52,11 @@ class MCMCSampler(ABC):
         self, z_free: torch.Tensor, beta: Optional[float] = None,
         grad: bool = False,
     ):
-        """``value = beta * U_lik + U_base``, ``U_base = U_prior - log|det dtheta/dz|``.
+        """``value = beta * U_lik + U_base``, ``U_base = -log N(z; 0, I)``.
 
-        Posterior evaluation at the unconstrained free vector ``z``. The user's
+        Posterior evaluation at the free vector ``z`` in the space's normal
+        chart. ``U_base`` is the prior together with the change of variables,
+        which collapse to the standard normal potential in ``z``. The user's
         ``potential_fn`` is:
 
           requires_metric=False:  potential_fn(theta) -> scalar U_lik
@@ -66,7 +68,7 @@ class MCMCSampler(ABC):
         Parameters
         ----------
         z_free : Tensor
-            Unconstrained free vector.
+            Free vector in the normal chart.
         beta : float, optional
             Inverse temperature. Default ``self.beta`` (1.0 = untempered).
         grad : bool
@@ -77,9 +79,10 @@ class MCMCSampler(ABC):
         potential
             ``value = beta * U_lik + U_base``.
         metric
-            ``G_u(beta) = beta * A_lik + A_prior``, likelihood/prior metrics
-            pushed forward to free unconstrained coordinates. ``None`` when
-            ``requires_metric`` is False.
+            ``G_u(beta) = beta * A_lik + A_prior``, the likelihood metric pushed
+            forward to the normal chart plus the prior's metric there, which is
+            the identity for a space carrying a prior and ``None`` for one that
+            does not. ``None`` when ``requires_metric`` is False.
         gradient
             ``value = ∂U/∂z``. Returned only when ``grad`` is True.
         """
@@ -89,9 +92,8 @@ class MCMCSampler(ABC):
             z_free = z_free.detach().requires_grad_(True)
 
         with torch.enable_grad() if grad else nullcontext():
-            theta_map = self.space.map_to_constrained_vector(z_free)
-            theta_free = theta_map.mapped_point
-            theta_full = self._free_to_full(theta_free)
+            theta_map = self.space.as_transform.forward(z_free)
+            theta_full = self.space.to_full(theta_map.mapped_point)
 
             result = self.potential_fn(theta_full)
             if self.requires_metric:
@@ -99,21 +101,19 @@ class MCMCSampler(ABC):
             else:
                 u_likelihood = result
 
-            U_base = -self.space.prior_log_prob_vector(theta_free) - theta_map.jacobian_log_det
+            U_base = -self.space.prior_log_prob_normal(z_free)
 
         metric = None
         if self.requires_metric:
-            G_prior = self.space.prior_metric(theta_full)
-            A_lik = self.space.push_forward_metric(G_lik, theta_map)
-            A_prior = None if G_prior is None else self.space.push_forward_metric(G_prior, theta_map)
-            metric = TemperedMetric(A_lik, A_prior, beta)
+            A_lik = self.space.push_forward_metric(G_lik, theta_map.jacobian_diag)
+            metric = TemperedMetric(A_lik, self.space.prior_metric_normal(z_free),
+                                    beta)
 
         if not grad:
             return TemperedAffine(u_likelihood, U_base, beta), metric
 
         def grad_of(out):
-            # guard backward: U_base has no grad with no prior and
-            # volume-preserving transform
+            # guard backward: U_base has no grad for a space with no prior
             if not out.requires_grad:
                 return torch.zeros_like(z_free)
             g, = torch.autograd.grad(out.sum(), z_free, retain_graph=True,
@@ -125,18 +125,19 @@ class MCMCSampler(ABC):
         potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
 
-    def _free_to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
-        """Free constrained vector -> full constrained vector (with fixed)."""
-        return self.space.to_vector(
-            self.space.add_fixed(self.space.from_vector(theta_free))
-        )
-
     def _init_z_free(self, initial_params: torch.Tensor) -> torch.Tensor:
-        """Full or free constrained vector -> unconstrained free vector."""
-        theta_free = self.space.to_free_vector(
-            self.space.from_vector(initial_params)
-        )
-        return self.space.map_to_unconstrained_vector(theta_free).mapped_point
+        """Constrained vector, full or free, to the free vector in the normal
+        chart. The two layouts coincide when nothing is fixed."""
+        width = initial_params.shape[-1]
+        if width == self.space.d_full:
+            theta_free = self.space.to_free(initial_params)
+        elif width == self.space.d:
+            theta_free = initial_params
+        else:
+            raise ValueError(
+                f"initial_params must have size {self.space.d} (free) or "
+                f"{self.space.d_full} (full), got {width}.")
+        return self.space.as_transform.inverse(theta_free).mapped_point
 
     def logging(self) -> dict:
         """Per-step statistics for the progress bar, as a dict of short
@@ -186,7 +187,7 @@ class MCMCSampler(ABC):
         Parameters
         ----------
         initial_params : Tensor
-            Full or free constrained flat vector.
+            Constrained flat vector, full or free.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -202,7 +203,7 @@ class MCMCSampler(ABC):
             Constrained-space samples, keyed by free parameter name, grouped by
             chain (shape ``(num_chains, num_samples, ...)``).
         """
-        # constrained point -> unconstrained free vector, batched over chains
+        # constrained point -> free vector in the normal chart, over chains
         z_free_init = self._init_z_free(initial_params)
         if z_free_init.dim() == 1:
             z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
@@ -232,8 +233,8 @@ class MCMCSampler(ABC):
 
         # (num_samples, K, d) -> (K, num_samples, d) to match group_by_chain.
         samples_unc = torch.stack(collected, dim=0).transpose(0, 1)
-        theta_free_all = self.space.map_to_constrained_vector(samples_unc).mapped_point
-        return self.space.add_fixed(self.space.from_vector(theta_free_all))
+        theta_free_all = self.space.as_transform.forward(samples_unc).mapped_point
+        return self.space.add_fixed(self.space.from_free_vector(theta_free_all))
 
 
 class PyroSampler(MCMCSampler):
@@ -336,7 +337,7 @@ class PyroSampler(MCMCSampler):
         """
         pyro.clear_param_store()
 
-        # transform constrained point to unconstrained parameters
+        # constrained point -> free vector in the normal chart
         z_free_init = self._init_z_free(initial_params)
         # Pyro expects initial_params of shape (num_chains, d) for num_chains > 1.
         # replicate the single anchor across chains.
@@ -356,7 +357,7 @@ class PyroSampler(MCMCSampler):
         # stash MCMC object for per-chain diagnostics via self.mcmc.diagnostics()
         self.mcmc = mcmc
 
-        # Transform back to constrained space.
+        # Read the draws back in constrained coordinates.
         samples_unc = mcmc.get_samples(group_by_chain=True)["params"]
-        theta_free_all = self.space.map_to_constrained_vector(samples_unc).mapped_point
-        return self.space.add_fixed(self.space.from_vector(theta_free_all))
+        theta_free_all = self.space.as_transform.forward(samples_unc).mapped_point
+        return self.space.add_fixed(self.space.from_free_vector(theta_free_all))

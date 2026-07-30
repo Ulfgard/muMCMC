@@ -10,7 +10,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import RMHMC, NUTS, UnconstrainedSpace
+from muMCMC import RMHMC, NUTS, NormalSpace, UnnormalizedSpace
 from muMCMC._adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)
@@ -27,7 +27,7 @@ POST_STD = (SIGMA2 / (SIGMA2 + 1.0)) ** 0.5     # ~0.7071
 
 
 def _space():
-    return UnconstrainedSpace(NAMES, priors={n: Normal(0.0, 1.0) for n in NAMES})
+    return NormalSpace(NAMES)
 
 
 def _rmhmc_model(theta):

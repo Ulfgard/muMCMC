@@ -13,14 +13,8 @@ from .SMC import SMC
 from .PT import PT
 from .spaces import (
     DistributionSpace,
-    ElementwiseMap,
     LogNormalSpace,
     NormalSpace,
-    NormalTransform,
-    Space,
-    TemperedAffine,
-    TemperedMetric,
-    UniformSpace,
     UnnormalizedSpace,
 )
 from .validation import PosteriorEvaluation
@@ -39,14 +33,8 @@ __all__ = [
     "SMC",
     "PT",
     "DistributionSpace",
-    "ElementwiseMap",
     "LogNormalSpace",
     "NormalSpace",
-    "NormalTransform",
-    "Space",
-    "TemperedAffine",
-    "TemperedMetric",
-    "UniformSpace",
     "UnnormalizedSpace",
     "PosteriorEvaluation",
     "__version__",
