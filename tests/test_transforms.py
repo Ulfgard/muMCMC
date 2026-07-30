@@ -1,9 +1,8 @@
 """Contract tests for ``NormalTransform`` and ``ElementwiseMap``.
 
 The transform is the chart every space leans on: it exposes both directions,
-each with its own diagonal Jacobian and log-determinant, and the samplers and
-``push_forward_metric`` trust those to match the analytic Jacobian. These tests
-pin that contract down.
+each with its own diagonal Jacobian and log-determinant, and ChartRATTLE trusts
+those to match the analytic Jacobian. These tests pin that contract down.
 
 The transform is built from callables rather than by subclassing, so these
 construct one directly instead of going through a space.

@@ -170,8 +170,8 @@ class UnnormalizedSpace(Space):
 
     The target is whatever the model potential defines, with nothing added.
     Having no normalized density, it has no evidence and no entropy, and
-    :meth:`prior_metric_normal` is None so a scheme needing the prior's metric
-    is not available.
+    :meth:`prior_metric` is None so a scheme needing the prior's metric is not
+    available.
 
     Raises
     ------
@@ -206,11 +206,7 @@ class UnnormalizedSpace(Space):
         return torch.zeros(theta_free.shape[:-1], dtype=theta_free.dtype,
                            device=theta_free.device)
 
-    def prior_log_prob_normal(self, z_free: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(z_free.shape[:-1], dtype=z_free.dtype,
-                           device=z_free.device)
-
-    def prior_metric_normal(self, z_free: torch.Tensor):
+    def prior_metric(self, theta_free: torch.Tensor):
         return None
 
     def sample(self, n_samples: int, *, generator=None) -> dict:

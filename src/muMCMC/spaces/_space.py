@@ -6,21 +6,15 @@ from ._transform import NormalTransform, _std_normal_log_pdf
 # =========================================================================== #
 #  The two identities of the normal chart                                     #
 #                                                                             #
-#  A prior held as theta = T(z) with z ~ N(0, I) makes both of the quantities #
-#  below closed forms in z, which is what prior_log_prob_normal and           #
-#  prior_metric_normal return.                                                #
+#  A chain runs on the variables, where the prior contributes -log p(theta)   #
+#  to the potential and M_theta = J^-T J^-1, with J = dtheta/dz, to the        #
+#  metric. That metric is the pullback of the identity along the chart, so it  #
+#  is the one the prior itself induces, and it varies with position.          #
 #                                                                             #
-#  With log p(theta) = log phi(z) - log|det J| and J = dtheta/dz, the         #
-#  temperature-free potential collapses,                                      #
-#                                                                             #
-#      U_base = -log p(theta) - log|det J| = -log phi(z),                     #
-#                                                                             #
-#  so a sampler needs neither the prior nor the Jacobian in its inner loop.   #
-#  And the prior's metric in theta is M_theta = J^-T J^-1, whose pushforward  #
-#  J^T M_theta J is the identity. That identity is also the exact Hessian of  #
-#  U_base, since the prior read in its own chart is N(0, I) rather than       #
-#  something approximated by it, so a scheme needing a constant prior metric  #
-#  puts no condition on the prior.                                            #
+#  Read instead in the chart, the prior is exactly N(0, I) and its metric is   #
+#  J^T M_theta J = I, constant. A scheme needing a fixed prior block therefore #
+#  puts no condition on the prior, only on where it is read, and it can        #
+#  compute both from the chart without asking the space for them.             #
 # =========================================================================== #
 
 
@@ -214,37 +208,24 @@ class Space:
         """Log-prior on a free vector ``(..., d)``, shape ``(...)``."""
         return self.as_transform.log_prob(theta_free).sum(-1)
 
-    def prior_log_prob_normal(self, z_free: torch.Tensor) -> torch.Tensor:
-        """Log-prior read in the normal chart, ``log N(z; 0, I)``, for ``z`` of
-        shape ``(..., d)``. It equals ``prior_log_prob_vector(T(z))`` plus
-        ``log|det dtheta/dz|``, so a caller wanting both takes this one."""
-        return _std_normal_log_pdf(z_free).sum(-1)
+    def prior_metric(self, theta_free: torch.Tensor):
+        """The prior's natural metric at ``theta_free``, the diagonal
+        ``(..., d, d)`` matrix
 
-    def prior_metric(self, theta_free: torch.Tensor) -> torch.Tensor:
-        """Diagonal of the prior's natural metric at ``theta_free``, shape
-        ``(..., d)``. Its pushforward to the normal chart is the identity, which
-        is what :meth:`prior_metric_normal` returns."""
-        return self.as_transform.metric(theta_free)
+            M_ii = (dz_i/dtheta_i)²,
 
-    def prior_metric_normal(self, z_free: torch.Tensor):
-        """The prior's metric in the normal chart, the identity of shape
-        ``(..., d, d)``, or None when the space carries no prior."""
-        eye = torch.eye(self.d, dtype=z_free.dtype, device=z_free.device)
-        return eye.expand(z_free.shape[:-1] + (self.d, self.d))
-
-    def push_forward_metric(self, G: torch.Tensor,
-                            jacobian_diag: torch.Tensor) -> torch.Tensor:
-        """The metric ``G`` on the variables, of shape ``(..., d_full, d_full)``,
-        read in the normal chart, giving ``(..., d, d)``,
-
-            G_z = diag(J) G_ff diag(J),   J = dtheta/dz,
-
-        with ``G_ff`` the free block of ``G`` and ``jacobian_diag`` the ``(...,
-        d)`` diagonal from ``as_transform.forward(z)``.
+        or None when the space carries no prior. It is the pullback of the
+        identity along the chart, so it is the metric the prior itself induces on
+        the variables, and it varies with position.
         """
+        return torch.diag_embed(self.as_transform.metric(theta_free))
+
+    def free_block(self, G: torch.Tensor) -> torch.Tensor:
+        """The free block of a metric ``G`` of shape ``(..., d_full, d_full)``
+        over every variable, giving ``(..., d, d)``. The fixed variables are not
+        sampled, so their rows and columns are dropped."""
         idx = self._free_index(G)
-        G_ff = G.index_select(-2, idx).index_select(-1, idx)
-        return jacobian_diag[..., :, None] * G_ff * jacobian_diag[..., None, :]
+        return G.index_select(-2, idx).index_select(-1, idx)
 
     def sample(self, n_samples: int, *, generator=None) -> dict:
         """``n_samples`` draws from the prior, keyed by name and including the

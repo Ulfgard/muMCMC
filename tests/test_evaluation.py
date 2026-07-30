@@ -308,7 +308,7 @@ def test_posterior_evaluation_detaches_accumulated_tensors():
     samples = {k: v.requires_grad_(True) for k, v in samples.items()}
     ev = PosteriorEvaluation(sampler, samples,
                              generator=torch.Generator().manual_seed(61))
-    assert not ev._z.requires_grad
+    assert not ev._theta.requires_grad
     assert not ev._log_f_post.requires_grad
     assert not ev._q_pool.means.requires_grad
 
@@ -323,7 +323,7 @@ def test_bar_evidence_matches_pooled_estimate():
     ev = PosteriorEvaluation(sampler, samples, generator=gen)
 
     # Same seed, same draws, same fit -> reproduces the pooled estimate exactly.
-    z = ev._z.reshape(-1, d)
+    z = ev._theta.reshape(-1, d)
     est = _bar_evidence(z, ev._log_target, generator=torch.Generator().manual_seed(15))
     assert abs(est - ev.log_evidence) < 1e-6
 

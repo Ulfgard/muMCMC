@@ -49,15 +49,14 @@ class MCMCSampler(ABC):
         self.beta = 1.0   # inverse temperature
 
     def evaluate_model(
-        self, z_free: torch.Tensor, beta: Optional[float] = None,
+        self, theta_free: torch.Tensor, beta: Optional[float] = None,
         grad: bool = False,
     ):
-        """``value = beta * U_lik + U_base``, ``U_base = -log N(z; 0, I)``.
+        """``value = beta * U_lik + U_base``, ``U_base = -log p(theta)``.
 
-        Posterior evaluation at the free vector ``z`` in the space's normal
-        chart. ``U_base`` is the prior together with the change of variables,
-        which collapse to the standard normal potential in ``z``. The user's
-        ``potential_fn`` is:
+        Posterior evaluation at the free variable vector ``theta``, which is
+        where the chain runs and where the model is written, so nothing is
+        transformed. The user's ``potential_fn`` is:
 
           requires_metric=False:  potential_fn(theta) -> scalar U_lik
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
@@ -67,8 +66,8 @@ class MCMCSampler(ABC):
 
         Parameters
         ----------
-        z_free : Tensor
-            Free vector in the normal chart.
+        theta_free : Tensor
+            Free variable vector.
         beta : float, optional
             Inverse temperature. Default ``self.beta`` (1.0 = untempered).
         grad : bool
@@ -79,21 +78,19 @@ class MCMCSampler(ABC):
         potential
             ``value = beta * U_lik + U_base``.
         metric
-            ``G_u(beta) = beta * A_lik + A_prior``, the likelihood metric pushed
-            forward to the normal chart plus the prior's metric there, which is
-            the identity for a space carrying a prior and ``None`` for one that
-            does not. ``None`` when ``requires_metric`` is False.
+            ``G(beta) = beta * A_lik + M``, the free block of the likelihood
+            metric plus the prior's own metric on the variables, ``None`` for a
+            space with no prior. ``None`` when ``requires_metric`` is False.
         gradient
-            ``value = ∂U/∂z``. Returned only when ``grad`` is True.
+            ``value = ∂U/∂theta``. Returned only when ``grad`` is True.
         """
         if beta is None:
             beta = self.beta
         if grad:
-            z_free = z_free.detach().requires_grad_(True)
+            theta_free = theta_free.detach().requires_grad_(True)
 
         with torch.enable_grad() if grad else nullcontext():
-            chart = self.space.as_transform.forward(z_free)
-            theta_full = self.space.to_full(chart.mapped_point)
+            theta_full = self.space.to_full(theta_free)
 
             result = self.potential_fn(theta_full)
             if self.requires_metric:
@@ -101,13 +98,12 @@ class MCMCSampler(ABC):
             else:
                 u_likelihood = result
 
-            U_base = -self.space.prior_log_prob_normal(z_free)
+            U_base = -self.space.prior_log_prob_vector(theta_free)
 
         metric = None
         if self.requires_metric:
-            A_lik = self.space.push_forward_metric(G_lik, chart.jacobian_diag)
-            metric = TemperedMetric(A_lik, self.space.prior_metric_normal(z_free),
-                                    beta)
+            metric = TemperedMetric(self.space.free_block(G_lik),
+                                    self.space.prior_metric(theta_free), beta)
 
         if not grad:
             return TemperedAffine(u_likelihood, U_base, beta), metric
@@ -115,19 +111,30 @@ class MCMCSampler(ABC):
         def grad_of(out):
             # guard backward: U_base has no grad for a space with no prior
             if not out.requires_grad:
-                return torch.zeros_like(z_free)
-            g, = torch.autograd.grad(out.sum(), z_free, retain_graph=True,
+                return torch.zeros_like(theta_free)
+            g, = torch.autograd.grad(out.sum(), theta_free, retain_graph=True,
                                      allow_unused=True)
-            return torch.zeros_like(z_free) if g is None else g
+            return torch.zeros_like(theta_free) if g is None else g
 
         gradient = TemperedAffine(grad_of(u_likelihood).detach(),
                                   grad_of(U_base).detach(), beta)
         potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
 
-    def _init_z_free(self, initial_params: torch.Tensor) -> torch.Tensor:
-        """Variable vector, full or free, to the free vector in the normal
-        chart. The two layouts coincide when nothing is fixed."""
+    def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """The chain's position at the free variables ``theta_free``. The chain
+        runs on the variables, so this is the identity. A sampler running in
+        other coordinates overrides it together with :meth:`to_variables`."""
+        return theta_free
+
+    def to_variables(self, q_free: torch.Tensor) -> torch.Tensor:
+        """The free variables at the chain's position ``q_free``, the inverse of
+        :meth:`to_position`."""
+        return q_free
+
+    def _init_position(self, initial_params: torch.Tensor) -> torch.Tensor:
+        """Variable vector, full or free, to the chain's starting position. The
+        two layouts coincide when nothing is fixed."""
         width = initial_params.shape[-1]
         if width == self.space.d_full:
             theta_free = self.space.to_free(initial_params)
@@ -137,7 +144,7 @@ class MCMCSampler(ABC):
             raise ValueError(
                 f"initial_params must have size {self.space.d} (free) or "
                 f"{self.space.d_full} (full), got {width}.")
-        return self.space.as_transform.inverse(theta_free).mapped_point
+        return self.to_position(theta_free)
 
     def logging(self) -> dict:
         """Per-step statistics for the progress bar, as a dict of short
@@ -153,9 +160,9 @@ class MCMCSampler(ABC):
     # ---- operator interface (composed by the batched run_mcmc) -------------- #
 
     @abstractmethod
-    def init(self, z_free: torch.Tensor):
-        """Return the initial batched chain state at the chart positions
-        ``z_free`` (shape ``(num_chains, d)``)."""
+    def init(self, q_free: torch.Tensor):
+        """Return the initial batched chain state at the positions ``q_free``
+        (shape ``(num_chains, d)``)."""
         ...
 
     @abstractmethod
@@ -203,12 +210,12 @@ class MCMCSampler(ABC):
             Samples on the variables, keyed by free parameter name, grouped by
             chain (shape ``(num_chains, num_samples, ...)``).
         """
-        # variable point -> free vector in the normal chart, over chains
-        z_free_init = self._init_z_free(initial_params)
-        if z_free_init.dim() == 1:
-            z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
+        # variable point -> the chain's starting position, over chains
+        q_init = self._init_position(initial_params)
+        if q_init.dim() == 1:
+            q_init = q_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
-        s = self.init(z_free_init)
+        s = self.init(q_init)
         collected = []
         total = num_warmup_steps + num_samples
 
@@ -232,8 +239,8 @@ class MCMCSampler(ABC):
                 bar.update()
 
         # (num_samples, K, d) -> (K, num_samples, d) to match group_by_chain.
-        samples_unc = torch.stack(collected, dim=0).transpose(0, 1)
-        theta_free_all = self.space.as_transform.forward(samples_unc).mapped_point
+        positions = torch.stack(collected, dim=0).transpose(0, 1)
+        theta_free_all = self.to_variables(positions)
         return self.space.add_fixed(self.space.from_free_vector(theta_free_all))
 
 
@@ -259,7 +266,7 @@ class PyroSampler(MCMCSampler):
         "interface (init/step/end_warmup) is not used."
     )
 
-    def init(self, z_free: torch.Tensor):
+    def init(self, q_free: torch.Tensor):
         raise NotImplementedError(self._NO_BATCHED_IFACE)
 
     def step(self, state):
@@ -338,16 +345,16 @@ class PyroSampler(MCMCSampler):
         """
         pyro.clear_param_store()
 
-        # variable point -> free vector in the normal chart
-        z_free_init = self._init_z_free(initial_params)
+        # variable point -> the chain's starting position
+        q_init = self._init_position(initial_params)
         # Pyro expects initial_params of shape (num_chains, d) for num_chains > 1.
         # replicate the single anchor across chains.
-        if num_chains > 1 and z_free_init.dim() == 1:
-            z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
+        if num_chains > 1 and q_init.dim() == 1:
+            q_init = q_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
         mcmc = MCMC(
             self.kernel,
-            initial_params={"params": z_free_init},
+            initial_params={"params": q_init},
             num_samples=num_samples,
             warmup_steps=num_warmup_steps,
             num_chains=num_chains,
@@ -359,6 +366,6 @@ class PyroSampler(MCMCSampler):
         self.mcmc = mcmc
 
         # Read the draws back on the variables.
-        samples_unc = mcmc.get_samples(group_by_chain=True)["params"]
-        theta_free_all = self.space.as_transform.forward(samples_unc).mapped_point
+        theta_free_all = self.to_variables(
+            mcmc.get_samples(group_by_chain=True)["params"])
         return self.space.add_fixed(self.space.from_free_vector(theta_free_all))

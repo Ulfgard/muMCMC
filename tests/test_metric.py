@@ -1,7 +1,7 @@
-"""Contract tests for the metric pipeline: ``space.push_forward_metric`` and the
+"""Contract tests for the metric pipeline: ``space.free_block`` and the
 tempering-aware evaluation objects ``TemperedMetric`` / ``TemperedAffine``.
 
-``push_forward_metric`` restricts a constrained-space metric to the free block
+``free_block`` restricts a metric over every variable to the free block
 and scales by the diagonal Jacobian ``dθ/dz`` (elementwise transforms, so the
 free block of the push-forward is the push-forward of the free block).
 ``TemperedMetric`` and ``TemperedAffine`` assemble the metric and potential
@@ -41,7 +41,7 @@ def _identity_space(d):
 
 
 # --------------------------------------------------------------------------- #
-#  push_forward_metric                                                        #
+#  free_block                                                                 #
 # --------------------------------------------------------------------------- #
 
 def test_push_forward_identity_is_free_block():
@@ -50,7 +50,7 @@ def test_push_forward_identity_is_free_block():
     s = _identity_space(d)
     G = _rand_spd(n, d)
     z = torch.randn(n, d)
-    A = s.push_forward_metric(G, s.as_transform.forward(z).jacobian_diag)
+    A = s.free_block(G)
     assert torch.allclose(A, G, atol=ATOL)          # identity J, no fixed
 
 
@@ -60,20 +60,18 @@ def test_push_forward_projects_out_fixed():
     s = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 0.0})   # free = a, b
     G = _rand_spd(n, 3)
     z_free = torch.randn(n, 2)
-    A = s.push_forward_metric(G, s.as_transform.forward(z_free).jacobian_diag)
+    A = s.free_block(G)
     assert torch.allclose(A, G[:, :2, :2], atol=ATOL)
 
 
-def test_push_forward_nonidentity_chart_scales_by_jacobian():
-    torch.manual_seed(2)
-    n, d = 4, 2
-    s = LogNormalSpace(["x", "y"])
-    G = _rand_spd(n, d)
-    z = torch.randn(n, d)
-    theta_map = s.as_transform.forward(z)
-    A = s.push_forward_metric(G, theta_map.jacobian_diag)
-    dJ = theta_map.jacobian_diag
-    assert torch.allclose(A, dJ[..., :, None] * G * dJ[..., None, :], atol=ATOL)
+def test_prior_metric_is_the_precision_of_the_prior():
+    # Normal(0, s) has precision 1/s^2 on the variables, and that is what the
+    # chain's metric picks up from the prior.
+    s = NormalSpace(["x", "y"], sigma=2.0)
+    theta = torch.randn(4, 2)
+    M = s.prior_metric(theta)
+    assert M.shape == (4, 2, 2)
+    assert torch.allclose(M, 0.25 * torch.eye(2).expand(4, 2, 2), atol=ATOL)
 
 
 # --------------------------------------------------------------------------- #

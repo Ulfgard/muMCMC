@@ -455,13 +455,19 @@ class ChartRATTLE(HamiltonianSampler):
         # Detached leaf regardless of ``grad``: W comes from a reverse pass
         # through psi, so the input has to carry a graph either way.
         q = z_free.detach().requires_grad_(True)
-        A_prior = self.space.prior_metric_normal(q)
+        # In the chart the prior is exactly N(0, I), so its potential is ½‖q‖²
+        # and the prior block M of G_M is the identity. Both hold for any prior,
+        # which is the whole reason this sampler runs here.
+        A_prior = torch.eye(q.shape[-1], dtype=q.dtype, device=q.device).expand(
+            q.shape[:-1] + (q.shape[-1], q.shape[-1]))
 
         with torch.enable_grad():
             psi, W, log_abs_det_B = self._chart.psi_with_jvp(q)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
             lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
-            base = -self.space.prior_log_prob_normal(q) + log_abs_det_B
+            base = (0.5 * (q * q).sum(-1)
+                    + 0.5 * q.shape[-1] * math.log(2.0 * math.pi)
+                    + log_abs_det_B)
             if grad:
                 G = A_prior + broadcast_beta(beta, 2) * gram
                 # Cholesky, not torch.logdet: same factorization the metric uses
@@ -477,6 +483,19 @@ class ChartRATTLE(HamiltonianSampler):
         if grad:
             out = out + (grad_V.detach(),)
         return out
+
+    # ---- the chain's coordinates ------------------------------------------- #
+
+    def to_position(self, theta_free):
+        """The chart coordinate q at the variables theta, so q = T⁻¹(theta).
+        The chain runs in the chart, where the prior block M of G_M is constant,
+        which is the one thing the step needs and the variables cannot give."""
+        return self.space.as_transform.inverse(theta_free).mapped_point
+
+    def to_variables(self, q_free):
+        """The variables theta = T(q) at the chart coordinate q, which is what a
+        run reports."""
+        return self.space.as_transform.forward(q_free).mapped_point
 
     # ---- integrator hooks -------------------------------------------------- #
 

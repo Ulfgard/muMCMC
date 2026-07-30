@@ -11,11 +11,10 @@
 #  Derivation of the evidence estimator (BAR, the Bennett acceptance ratio in #
 #  its reverse-logistic-regression form).                                     #
 #                                                                             #
-#  Work happens in the sampler's chart coordinates z, where                   #
-#  sampler.evaluate_model(z).value is exactly -log f(z) for the unnormalized  #
-#  posterior density                                                          #
+#  Work happens on the variables y, where sampler.evaluate_model(y).value is  #
+#  exactly -log f(y) for the unnormalized posterior density                   #
 #                                                                             #
-#      f(z) = p(x|y(z)) p(y(z)) |dy/dz|,                                      #
+#      f(y) = p(x|y) p(y),                                                    #
 #                                                                             #
 #  whose integral over z is the evidence. Fit a reference q-hat, a Gaussian   #
 #  mixture, to the z-draws and form the log-ratio                             #
@@ -160,7 +159,7 @@ class PosteriorEvaluation:
 
     The estimator is BAR (Bennett acceptance ratio, Bennett 1976), cast as
     reverse logistic regression (Geyer 1994). A reference ``q̂`` is fitted to the
-    draws as a Gaussian mixture in the sampler's chart coordinates, and
+    draws as a Gaussian mixture on the variables, and
     ``log Z`` is the intercept discriminating the draws from samples of ``q̂``.
     Fitting ``q̂`` on the same draws leaves the estimator consistent. The quality
     of the mixture fit sets the variance, not the limit.
@@ -232,31 +231,32 @@ class PosteriorEvaluation:
         if self._jackknife and K < 2:
             raise ValueError("jackknife needs at least two chains")
 
-        # Chart draws grouped by chain. Detached so the cached draws (and
-        # everything derived from them: log f, q̂) never carry an autograd graph.
-        self._z = self.space.as_transform.inverse(theta_free).mapped_point.detach()
+        # Draws grouped by chain. Detached so the cached draws (and everything
+        # derived from them: log f, q̂) never carry an autograd graph.
+        self._theta = theta_free.detach()
         self._n1 = K * n
         self._n0 = K * n if n_q is None else int(n_q)
 
         # log f on the posterior draws, the one expensive evaluation. Reused for
         # the pooled estimate, the per-chain estimates, and the W diagnostic.
-        self._log_f_post = self._log_target(self._z.reshape(K * n, d))
+        self._log_f_post = self._log_target(self._theta.reshape(K * n, d))
 
         # Joint q̂ over all coordinates, fitted once. Drives the pooled estimate,
         # the W diagnostic, and the conditional proposal for marginals.
         self._q_pool = GaussianMixture.fit(
-            self._z.reshape(K * n, d), self._n_components, jitter=jitter,
+            self._theta.reshape(K * n, d), self._n_components, jitter=jitter,
             generator=generator, max_iter=self._max_iter, tol=self._tol)
 
         # Main estimate: BAR on the pooled draws over all chains.
         self._log_evidence = _bar_evidence(
-            self._z.reshape(K * n, d), self._log_target, n_q=self._n0,
+            self._theta.reshape(K * n, d), self._log_target, n_q=self._n0,
             jitter=jitter, generator=generator, log_target_z=self._log_f_post,
             q=self._q_pool)
 
-    def _log_target(self, z: torch.Tensor) -> torch.Tensor:
-        """``log f(z) = −evaluate_model(z).value`` for a batch ``(N, d)``."""
-        return -self.sampler.evaluate_model(z)[0].value
+    def _log_target(self, theta: torch.Tensor) -> torch.Tensor:
+        """``log f(theta) = −evaluate_model(theta).value`` for a batch
+        ``(N, d)``."""
+        return -self.sampler.evaluate_model(theta)[0].value
 
     @property
     def log_evidence(self) -> float:
@@ -269,10 +269,9 @@ class PosteriorEvaluation:
     def entropy(self) -> float:
         """Posterior entropy ``H[p(y|x)] = logZ − E_post[loglik] − E_post[log_prior]``,
         a plain Monte Carlo average over the draws (w.r.t. ``dy``)."""
-        z = self._z.reshape(self._n1, self._d)
-        theta_free = self.space.as_transform.forward(z).mapped_point
-        loglik = self._tempered_loglik(z)
-        log_prior = self.space.prior_log_prob_vector(theta_free)
+        theta = self._theta.reshape(self._n1, self._d)
+        loglik = self._tempered_loglik(theta)
+        log_prior = self.space.prior_log_prob_vector(theta)
         return self.log_evidence - float(loglik.mean()) - float(log_prior.mean())
 
     def information_gain(self, y_star: dict, *, target_ess: Optional[float] = None,
@@ -288,9 +287,8 @@ class PosteriorEvaluation:
         """
         excluded = [name for name in self.space.free_names if name not in y_star]
         if not excluded:
-            z = self.space.as_transform.inverse(
-                self.space.to_free_vector(y_star)).mapped_point
-            ig = self._tempered_loglik(z) - self.log_evidence
+            ig = self._tempered_loglik(
+                self.space.to_free_vector(y_star)) - self.log_evidence
             return (ig, None) if return_ess else ig
 
         log_post, ess = self._log_marginal_posterior(
@@ -333,12 +331,10 @@ class PosteriorEvaluation:
         """
         excluded = [name for name in self.space.free_names if name not in y]
         if not excluded:
-            theta_free = self.space.to_free_vector(y)
-            z = self.space.as_transform.inverse(theta_free).mapped_point
-            value = self.sampler.evaluate_model(z)[0].value
-            jac = self.space.as_transform.forward(z).jacobian_log_det
-            # log p(y|x) = loglik + log_prior − logZ = −value − log|dθ/dz| − logZ.
-            log_post = -value - jac - self.log_evidence
+            value = self.sampler.evaluate_model(
+                self.space.to_free_vector(y))[0].value
+            # log p(y|x) = loglik + log_prior − logZ = −value − logZ.
+            log_post = -value - self.log_evidence
             return (log_post, None) if return_ess else log_post
 
         log_post, ess = self._log_marginal_posterior(
@@ -363,25 +359,23 @@ class PosteriorEvaluation:
 
         M = y[a_names[0]].shape[0]
         d = self._d
-        dtype, device = self._z.dtype, self._z.device
+        dtype, device = self._theta.dtype, self._theta.device
         a_t = torch.tensor(a_idx, device=device)
         b_t = torch.tensor(b_idx, device=device)
 
-        # Query y_a -> chart coordinate z_a. The transform is elementwise, so
-        # fill the b block with the interior placeholder T(0) and keep only the a
-        # coordinates of the result.
+        # The b block is filled with the interior placeholder T(0), which is in
+        # the support of every coordinate, and dropped again straight after.
         y0 = self.space.from_free_vector(self.space.as_transform.interior_point.to(dtype))
         full = {name: y[name] for name in a_names}
         for name in b_names:
             full[name] = y0[name].expand(M)
-        z_a = self.space.as_transform.inverse(
-            self.space.to_free_vector(full)).mapped_point[:, a_t]        # (M, |a|)
+        theta_a = self.space.to_free_vector(full)[:, a_t]                 # (M, |a|)
 
         # Conditional q(z_b | z_a) from the pooled joint fit (itself a mixture).
-        q_b = self._q_pool.conditional(a_idx, b_idx, z_a, jitter=self._jitter)
+        q_b = self._q_pool.conditional(a_idx, b_idx, theta_a, jitter=self._jitter)
 
         def draw(n_prior, n_cond):
-            """One mixture batch -> (loglik, log_prior_z, log_qcond), each (M, n)."""
+            """One mixture batch -> (loglik, log_prior, log_qcond), each (M, n)."""
             blocks = []
             if n_cond > 0:
                 blocks.append(q_b.sample(n_cond, generator=generator))
@@ -390,21 +384,18 @@ class PosteriorEvaluation:
                 full_p = {name: y0[name].expand(n_prior) for name in a_names}
                 for name in b_names:
                     full_p[name] = prior[name]
-                z_bp = self.space.as_transform.inverse(
-                    self.space.to_free_vector(full_p)).mapped_point[:, b_t]
-                blocks.append(z_bp[None].expand(M, n_prior, nb))
-            z_b = torch.cat(blocks, dim=1)                               # (M, n, |b|)
-            n = z_b.shape[1]
-            z_full = torch.empty(M, n, d, dtype=dtype, device=device)
-            z_full[..., a_t] = z_a[:, None, :].expand(M, n, na)
-            z_full[..., b_t] = z_b
-            z_flat = z_full.reshape(M * n, d)
-            chart = self.space.as_transform.forward(z_flat)
-            jac_b = torch.log(chart.jacobian_diag[:, b_t]).sum(-1).reshape(M, n)
+                theta_bp = self.space.to_free_vector(full_p)[:, b_t]
+                blocks.append(theta_bp[None].expand(M, n_prior, nb))
+            theta_b = torch.cat(blocks, dim=1)                           # (M, n, |b|)
+            n = theta_b.shape[1]
+            theta_full = torch.empty(M, n, d, dtype=dtype, device=device)
+            theta_full[..., a_t] = theta_a[:, None, :].expand(M, n, na)
+            theta_full[..., b_t] = theta_b
+            theta_flat = theta_full.reshape(M * n, d)
             prior_b = self.space.prior_log_prob(
-                {name: chart.mapped_point[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
-            loglik = self._tempered_loglik(z_flat).reshape(M, n)
-            return loglik, prior_b + jac_b, q_b.log_prob(z_b)
+                {name: theta_flat[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
+            loglik = self._tempered_loglik(theta_flat).reshape(M, n)
+            return loglik, prior_b, q_b.log_prob(theta_b)
 
         # Accumulate mixture draws until every point reaches target_ess or the
         # cap is spent. log_qmix uses the running sampling fractions, so weights
@@ -441,9 +432,9 @@ class PosteriorEvaluation:
         log_post = self.space.prior_log_prob(y) + log_integral - self.log_evidence
         return log_post, ess
 
-    def _tempered_loglik(self, z: torch.Tensor) -> torch.Tensor:
-        """``beta·loglik(z) = −beta·U_lik``, the tempered log-likelihood."""
-        pot = self.sampler.evaluate_model(z)[0]
+    def _tempered_loglik(self, theta: torch.Tensor) -> torch.Tensor:
+        """``beta·loglik(theta) = −beta·U_lik``, the tempered log-likelihood."""
+        pot = self.sampler.evaluate_model(theta)[0]
         return -pot.value if pot.base is None else pot.base - pot.value
 
     @cached_property
@@ -460,7 +451,7 @@ class PosteriorEvaluation:
         lf = self._log_f_post.reshape(K, n)
         est = torch.tensor([
             _bar_evidence(
-                self._z[[j for j in range(K) if j != k]].reshape((K - 1) * n, self._d),
+                self._theta[[j for j in range(K) if j != k]].reshape((K - 1) * n, self._d),
                 self._log_target, n_components=self._n_components, n_q=self._n0,
                 jitter=self._jitter, generator=self._generator,
                 log_target_z=lf[[j for j in range(K) if j != k]].reshape(-1),
@@ -488,7 +479,7 @@ class PosteriorEvaluation:
         """
         K, n = self._n_chains, self._n_per_chain
         return torch.tensor([
-            _bar_evidence(self._z[k], self._log_target, n_components=self._n_components,
+            _bar_evidence(self._theta[k], self._log_target, n_components=self._n_components,
                           jitter=self._jitter, generator=self._generator,
                           log_target_z=self._log_f_post[k * n:(k + 1) * n],
                           init=self._q_pool, max_iter=self._max_iter, tol=self._tol)
@@ -514,8 +505,8 @@ class PosteriorEvaluation:
         alarm), and ``jackknife_estimates`` (the delete-one estimates), and the
         SE is the jackknife standard error.
         """
-        z_flat = self._z.reshape(self._n1, self._d)
-        Wp = (self._log_f_post - self._q_pool.log_prob(z_flat)).double()
+        theta_flat = self._theta.reshape(self._n1, self._d)
+        Wp = (self._log_f_post - self._q_pool.log_prob(theta_flat)).double()
         probs = torch.tensor([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99],
                              dtype=torch.float64)
         percentiles = {float(p): float(v)

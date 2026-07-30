@@ -89,19 +89,15 @@ def test_potential_adds_prior_on_identity_space():
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
 
 
-def test_potential_subtracts_jacobian_log_det_on_a_nonidentity_chart():
-    # On any chart, U = U_lik(theta) - log_prior(theta) - log|det J|, which is
-    # the collapse the normal chart is built on. theta passed to potential_fn
-    # must be the constrained value.
+def test_potential_is_the_likelihood_plus_the_prior_on_the_variables():
+    # The chain runs on the variables, so U = U_lik(theta) - log_prior(theta)
+    # with nothing transformed and no Jacobian anywhere.
     space = LogNormalSpace(["x", "y"])
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
-    z = torch.randn(6, 2)
-    theta_map = space.as_transform.forward(z)
-    theta = theta_map.mapped_point
-    prior_lp = space.prior_log_prob_vector(theta)
-    expected = theta.sum(-1) - prior_lp - theta_map.jacobian_log_det
-    assert torch.allclose(s.evaluate_model(z)[0].value, expected, atol=ATOL)
+    theta = torch.rand(6, 2) + 0.5
+    expected = theta.sum(-1) - space.prior_log_prob_vector(theta)
+    assert torch.allclose(s.evaluate_model(theta)[0].value, expected, atol=ATOL)
 
 
 def test_potential_splices_fixed_coordinate_and_skips_its_prior():
@@ -158,22 +154,22 @@ def test_metric_branch_returns_pulled_back_likelihood_metric():
 
 
 def test_metric_branch_adds_prior_metric():
-    # The prior's metric in its own chart is the identity, so
-    # G = G_lik + I = (2 + 1) I and G^{-1} v == v / 3.
-    space = NormalSpace(["a", "b"])
+    # A Normal(0, s) prior has precision 1/s^2 on the variables, so with a
+    # likelihood metric of 2 I the total is (2 + 1/4) I.
+    space = NormalSpace(["a", "b"], sigma=2.0)
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
-    z = torch.randn(4, 2)
-    _, metric = s.evaluate_model(z)
+    theta = torch.randn(4, 2)
+    _, metric = s.evaluate_model(theta)
     v = torch.randn(4, 2)
-    assert torch.allclose(metric.inv_metric_times_vec(v), v / 3.0, atol=ATOL)
+    assert torch.allclose(metric.inv_metric_times_vec(v), v / 2.25, atol=ATOL)
 
 
 # ========================================================================== #
 #  vector <-> coordinate helpers                                             #
 # ========================================================================== #
 
-def test_free_to_full_splices_fixed():
+def test_to_full_splices_fixed():
     space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 2.0})
     s = _RecordingSampler(space)
     theta_free = torch.randn(5, 2)
@@ -184,26 +180,27 @@ def test_free_to_full_splices_fixed():
     assert torch.allclose(full[..., 2], torch.full((5,), 2.0), atol=ATOL)
 
 
-def test_init_z_free_identity_space_is_passthrough():
+def test_init_position_identity_space_is_passthrough():
     space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     theta = torch.randn(2)
-    assert torch.allclose(s._init_z_free(theta), theta, atol=ATOL)
+    assert torch.allclose(s._init_position(theta), theta, atol=ATOL)
 
 
-def test_init_z_free_nonidentity_chart_inverts_it():
+def test_init_position_is_the_variables_themselves():
+    # The chain runs on the variables, so the starting position is the free
+    # block of what the caller gave, with no map applied.
     space = LogNormalSpace(["x", "y"])
     s = _RecordingSampler(space)
     theta = torch.tensor([0.3, 2.0])
-    z = s._init_z_free(theta)
-    assert torch.allclose(z, torch.log(theta), atol=ATOL)
+    assert torch.allclose(s._init_position(theta), theta, atol=ATOL)
 
 
-def test_init_z_free_drops_fixed_coordinates():
+def test_init_position_drops_fixed_coordinates():
     space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 9.0})
     s = _RecordingSampler(space)
     theta_full = torch.tensor([1.0, 2.0, 9.0])
-    z = s._init_z_free(theta_full)
+    z = s._init_position(theta_full)
     assert z.shape == (2,)                        # only free a, b
     assert torch.allclose(z, torch.tensor([1.0, 2.0]), atol=ATOL)
 

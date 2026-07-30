@@ -5,12 +5,8 @@ constrained variables and the standard normal, and the prior. The samplers drive
 spaces through a fixed protocol -- ``to_vector`` / ``to_free_vector``,
 ``from_full_vector`` / ``from_free_vector``, ``to_full`` / ``to_free``,
 ``add_fixed`` / ``remove_fixed``, ``as_transform``, ``prior_log_prob[_vector]``,
-``prior_log_prob_normal``, ``prior_metric[_normal]``, ``push_forward_metric``,
-``sample`` -- so these tests exercise that protocol's invariants.
-
-The one identity worth naming is the collapse the design rests on:
-``prior_log_prob_normal(z)`` equals ``prior_log_prob_vector(T(z))`` plus
-``log|det dtheta/dz|``, for every space that carries a prior.
+``prior_metric``, ``free_block``, ``sample`` -- so these tests exercise that
+protocol's invariants.
 """
 import math
 
@@ -194,26 +190,6 @@ def test_remove_fixed_tolerates_an_absent_name():
 #  The prior and its chart                                                    #
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("build", PROPER)
-def test_prior_log_prob_normal_is_the_collapse(build):
-    # -log p(theta) - log|det J| = -log phi(z). This is the identity the whole
-    # design rests on, and it must hold for every chart.
-    s = build()
-    z = torch.randn(6, 3)
-    m = s.as_transform.forward(z)
-    lhs = s.prior_log_prob_normal(z)
-    rhs = s.prior_log_prob_vector(m.mapped_point) + m.jacobian_log_det
-    assert torch.allclose(lhs, rhs, atol=1e-8)
-
-
-@pytest.mark.parametrize("build", PROPER)
-def test_prior_log_prob_normal_is_the_standard_normal(build):
-    s = build()
-    z = torch.randn(6, 3)
-    expected = -0.5 * (z * z).sum(-1) - 1.5 * math.log(2.0 * math.pi)
-    assert torch.allclose(s.prior_log_prob_normal(z), expected, atol=ATOL)
-
-
 def test_prior_log_prob_matches_the_reference_density():
     s = NormalSpace(NAMES, mu=0.3, sigma=1.7)
     theta = 0.3 + 1.7 * torch.randn(5, 3)
@@ -252,28 +228,27 @@ def test_prior_log_prob_without_any_free_name_raises():
 
 
 @pytest.mark.parametrize("build", PROPER)
-def test_prior_metric_pushes_forward_to_the_identity(build):
-    # The metric in theta is J^-T J^-1, so in the chart it is the identity, and
-    # that is what prior_metric_normal reports.
+def test_prior_metric_is_the_pullback_of_the_identity(build):
+    # M = J^-T J^-1 on the variables, which is what a chain running there reads,
+    # and its pushforward to the chart is the identity, which is what a chain
+    # running in the chart reads.
     s = build()
     z = torch.randn(5, 3)
     m = s.as_transform.forward(z)
-    diag = s.prior_metric(m.mapped_point)
+    M = s.prior_metric(m.mapped_point)
+    assert M.shape == (5, 3, 3)
+    diag = M.diagonal(dim1=-2, dim2=-1)
     assert torch.allclose(diag * m.jacobian_diag ** 2, torch.ones_like(diag),
                           atol=1e-8)
-    assert torch.allclose(s.prior_metric_normal(z),
-                          torch.eye(3).expand(5, 3, 3), atol=ATOL)
+    assert torch.allclose(diag, 1.0 / m.jacobian_diag ** 2, atol=1e-8)
 
 
-def test_push_forward_metric_scales_the_free_block_by_the_jacobian():
-    s = LogNormalSpace(NAMES, fixed={"c": 1.0})
-    z = torch.randn(4, 2)
-    dJ = s.as_transform.forward(z).jacobian_diag
-    G = torch.eye(3).expand(4, 3, 3) * 3.0
-    A = s.push_forward_metric(G, dJ)
+def test_free_block_drops_the_fixed_rows_and_columns():
+    s = LogNormalSpace(NAMES, fixed={"b": 1.0})
+    G = torch.arange(9.0).reshape(3, 3).expand(4, 3, 3)
+    A = s.free_block(G)
     assert A.shape == (4, 2, 2)
-    assert torch.allclose(A, 3.0 * dJ[..., :, None] * torch.eye(2) * dJ[..., None, :],
-                          atol=ATOL)
+    assert torch.allclose(A, G[:, [[0], [2]], [[0, 2]]], atol=ATOL)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,9 +308,8 @@ def test_unnormalized_contributes_no_potential_and_no_metric():
     s = UnnormalizedSpace(NAMES)
     z = torch.randn(4, 3)
     assert not s.is_proper
-    assert torch.allclose(s.prior_log_prob_normal(z), torch.zeros(4), atol=ATOL)
     assert torch.allclose(s.prior_log_prob_vector(z), torch.zeros(4), atol=ATOL)
-    assert s.prior_metric_normal(z) is None
+    assert s.prior_metric(z) is None
 
 
 def test_unnormalized_refuses_the_prior_density_and_a_draw():
@@ -363,6 +337,5 @@ def test_protocol_accepts_arbitrary_leading_axes(build):
     z = torch.randn(2, 5, 3)
     m = s.as_transform.forward(z)
     assert m.mapped_point.shape == (2, 5, 3)
-    assert s.prior_log_prob_normal(z).shape == (2, 5)
     assert s.prior_log_prob_vector(m.mapped_point).shape == (2, 5)
-    assert s.prior_metric_normal(z).shape == (2, 5, 3, 3)
+    assert s.prior_metric(m.mapped_point).shape == (2, 5, 3, 3)

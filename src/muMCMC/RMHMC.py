@@ -212,9 +212,9 @@ class RMHMCState:
 #  energy through the build_initial_state / sample_momentum / integrate /     #
 #  acceptance_delta / adapt hooks. All chains run in one batched state.       #
 #                                                                             #
-#  model_fn is specified on the variables. MCMCSampler adds the prior and     #
-#  pushes the metric forward to the space's normal chart                      #
-#  (Space.push_forward_metric).                                               #
+#  model_fn is specified on the variables, which is where the chain runs, so  #
+#  MCMCSampler adds the prior's potential and its metric and takes the free   #
+#  block of the likelihood metric. Nothing is transformed.                    #
 #                                                                             #
 # =========================================================================== #
 

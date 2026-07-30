@@ -96,14 +96,12 @@ class TemperedAffine:
 
 class TemperedMetric(TemperedAffine):
     """
-    Metric ``G = beta * A_lik + A_prior`` in the normal chart, an ``(N, d, d)``
-    SPD :attr:`value` whose operations are built from its Cholesky factor
-    ``G = L Lᵀ``.
+    Metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD :attr:`value`
+    whose operations are built from its Cholesky factor ``G = L Lᵀ``.
 
-    ``A_lik`` (``lik``) is the likelihood metric pushed forward to the chart (see
-    ``Space.push_forward_metric``). ``A_prior`` (``base``) is the prior's metric
-    there, which is the identity for a space carrying a prior and ``None`` for
-    one that does not.
+    ``A_lik`` (``lik``) is the free block of the model's metric and ``A_prior``
+    (``base``) the prior's own, ``None`` for a space carrying no prior. Both are
+    read in the coordinates the chain runs in.
     """
 
     @cached_property
