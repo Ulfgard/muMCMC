@@ -164,6 +164,18 @@ def _solve_triangular_vec(triag_mat: torch.Tensor, vec: torch.Tensor, upper: boo
     return torch.linalg.solve_triangular(triag_mat, vec[..., None], upper=upper)[..., 0]
 
 
+def broadcast_beta(beta, n_trailing: int):
+    """``beta`` reshaped to broadcast over ``n_trailing`` trailing axes.
+
+    A per-batch-element ``beta`` is a ``(N,)`` tensor that has to line up with a
+    ``(N, *feat)`` quantity; a scalar (Python float or 0-d tensor) already
+    broadcasts and is returned unchanged.
+    """
+    if torch.is_tensor(beta) and beta.ndim > 0:
+        return beta.reshape((-1,) + (1,) * n_trailing)
+    return beta
+
+
 class TemperedAffine:
     """
     Quantity assembled affinely in an inverse temperature:
@@ -211,10 +223,7 @@ class TemperedAffine:
 
     def _beta_bcast(self):
         """``beta`` reshaped to broadcast over ``lik``'s trailing feature axes."""
-        beta = self.beta
-        if torch.is_tensor(beta) and beta.ndim > 0:
-            beta = beta.reshape((-1,) + (1,) * (self.lik.dim() - 1))
-        return beta
+        return broadcast_beta(self.beta, self.lik.dim() - 1)
 
     @cached_property
     def value(self) -> torch.Tensor:

@@ -106,7 +106,7 @@ def _midpoint_map(
 # ``F(z_k) = z_k − r_k`` and the Anderson residual (Walker & Ni's notation) is
 # ``f_k = F(z_k) − z_k = −r_k``.  A fresh updater is built per solve, so any
 # internal history it keeps is scoped to a single solve. An updater may carry a
-# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(η0)⁻¹ for
+# fixed preconditioner P, stepping along P r_k in place of r_k (P = G_M(q0)⁻¹ for
 # the ChartRATTLE position solve, absent for the RMHMC midpoint solve).
 #
 # Relaxed Picard (β < 1) pulls the iteration eigenvalues (β − 1) + β λ toward
@@ -141,9 +141,9 @@ class _PicardUpdate:
         self._precond = precond
 
     def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions with preconditioner
-        ``precond``."""
-        return _PicardUpdate(self.beta, precond)
+        """Fresh per-solve updater for ``d``-dim positions. ``precond`` overrides
+        the preconditioner; omitted, this updater's own is carried over."""
+        return _PicardUpdate(self.beta, self._precond if precond is None else precond)
 
     def propose(self, z, r):
         if self._precond is not None:
@@ -151,8 +151,9 @@ class _PicardUpdate:
         return z - self.beta * r
 
     def damped(self, factor):
-        """Copy with β scaled by ``factor`` (fallback ladder)."""
-        return _PicardUpdate(self.beta * factor)
+        """Copy with β scaled by ``factor``, same preconditioner (fallback
+        ladder)."""
+        return _PicardUpdate(self.beta * factor, self._precond)
 
 
 class _AndersonUpdate:
@@ -188,10 +189,12 @@ class _AndersonUpdate:
         self._F = []   # Anderson residuals f_k = −r_k (each (N, 2d))
 
     def new(self, d, precond=None):
-        """Fresh per-solve updater for ``d``-dim positions with preconditioner
-        ``precond``, resolving a None ``history`` to ``d``."""
+        """Fresh per-solve updater for ``d``-dim positions, resolving a None
+        ``history`` to ``d``. ``precond`` overrides the preconditioner; omitted,
+        this updater's own is carried over."""
         return _AndersonUpdate(
-            d if self.history is None else self.history, self.beta, precond)
+            d if self.history is None else self.history, self.beta,
+            self._precond if precond is None else precond)
 
     def propose(self, z, r):
         if self._precond is not None:
@@ -229,8 +232,9 @@ class _AndersonUpdate:
         return z_next
 
     def damped(self, factor):
-        """Copy with β scaled by ``factor``, same history (fallback ladder)."""
-        return _AndersonUpdate(self.history, self.beta * factor)
+        """Copy with β scaled by ``factor``, same history and preconditioner
+        (fallback ladder)."""
+        return _AndersonUpdate(self.history, self.beta * factor, self._precond)
 
 
 # ---- Implicit midpoint step --------------------------------------------- #
@@ -289,8 +293,10 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
     ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
     not converge are re-solved with progressively stronger under-relaxation.
     Damping does not move the fixed point, so this resolves a stuck chain rather
-    than rejecting it (a solver-driven rejection would break detailed balance).
-    ``z_init`` warm-starts the first solve; the fallback re-solves from ``(q, p)``."""
+    than rejecting it -- a rejection on forward-solve failure alone is not a
+    symmetric criterion, so the ladder makes that biased last resort rare.
+    ``z_init`` warm-starts the first solve; the fallback re-solves from
+    ``(q, p)``."""
     d = q.shape[-1]
     base = solver if solver is not None else _PicardUpdate()
 
@@ -447,10 +453,14 @@ class RMHMC(HamiltonianSampler):
     fallback_damping : tuple of float
         Fallback ladder: on non-convergence, re-solve the failed chains with the
         base solver damped by each factor in turn (each in (0, 1), relative to
-        ``damping``; default ``(0.5, 0.25)``). Endpoint-preserving, so it removes
-        solver-driven rejections. ``()`` disables it.
+        ``damping``; default ``(0.5, 0.25)``). Endpoint-preserving, so it makes
+        solver-driven rejections rare. ``()`` disables it.
     fallback_iter_scale : int
         Per-level iteration cap as a multiple of ``fp_max_iter``. Default 4.
+    step_normalization : {None, "fixed", "max"}
+        Hold the trajectory length ``num_steps * step_size`` at its initial value
+        while step sizes adapt. ``"max"`` also re-derives ``num_steps`` from the
+        fastest chain. Default None (off).
     divergence_threshold : float
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence. Default 100.
@@ -603,19 +613,19 @@ class RMHMC(HamiltonianSampler):
     def adapt(self, accept_prob, delta_H):
         """Derivative-free (REINFORCE) step-size adaptation from this transition's
         energy error ``delta_H`` and worst solver residual / iteration count."""
-        # Cost f_t = -log(efficiency), lower = better step size. The efficiency is
-        # accepted travel per solver iteration -- exp(-|dH|) ~ accept prob times
-        # step_size ~ distance over num_iters ~ solver cost -- weighted by
-        # exp(-residual/step_size), an analogous acceptance term for the solver
-        # error. The eta floor (normalised by |log eta|) gives rare failures
-        # large weight.
-        eta = 1.e-3
+        # Cost f_t = -log(efficiency), lower = better step size. Efficiency is
+        # accepted travel per unit of solver work: step_size (distance) over
+        # num_iters (cost), times exp(-|dH|) (the acceptance probability), times
+        # exp(-residual/step_size) (the analogous acceptance term for the solver
+        # error). The additive floor, normalised by |log(floor)|, bounds the cost
+        # so rare failures carry large but finite weight.
+        floor = 1.e-3
         num_iters       = self._step_iters
         solver_penalty  = torch.exp(-self._step_residual / self.step_size)
         delta_H_penalty = torch.exp(-delta_H.abs())
         f_t = (-0.5 * torch.log(
-                    solver_penalty * delta_H_penalty * self.step_size / num_iters + eta
-               ) / abs(math.log(eta)))                                      # (N,)
+                    solver_penalty * delta_H_penalty * self.step_size / num_iters + floor
+               ) / abs(math.log(floor)))                                    # (N,)
         self._step_size_adapter.update(f_t)
 
     def reset_extra_diagnostics(self):

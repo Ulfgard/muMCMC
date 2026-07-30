@@ -1,13 +1,13 @@
 """Constraint / evaluate_model tests for ChartRATTLE.
 
-The geometry and potential rest on the inverse map ψ(η) = φ_η⁻¹(x). evaluate_model
+The geometry and potential rest on the inverse map ψ(q) = φ_q⁻¹(x). evaluate_model
 turns a constraint into the tempered pieces (U a TemperedAffine, G_M a
 TemperedMetric). Here we check, against closed forms, that:
 
 1. G_M = I + β Wᵀ W and its Cholesky are what evaluate_model returns.
 2. The explicit-Jacobian fast path agrees with the classic-autograd W, and ∇V
    matches a finite difference.
-3. The potential U.value is exactly −log p(η | x): the funnel posterior, the
+3. The potential U.value is exactly −log p(q | x): the funnel posterior, the
    affine Gaussian, and the β-tempered funnel.
 4. U.lik = ½‖ψ‖² is the temperature-free swap statistic.
 5. The returned pieces are detached (no autograd graph pinned).
@@ -22,8 +22,8 @@ torch.set_default_dtype(torch.float64)
 
 
 class FunnelChart(ChartConstraint):
-    """Neal funnel x = e^{σ η / 2} ε with η ~ N(0, 1). ψ = e^{−σ η / 2} x,
-    W = (σ/2) ψ, log|det B| = (m/2) σ η. Temperature-free."""
+    """Neal funnel x = e^{σ q / 2} ε with q ~ N(0, 1). ψ = e^{−σ q / 2} x,
+    W = (σ/2) ψ, log|det B| = (m/2) σ q. Temperature-free."""
 
     def __init__(self, sigma, x):
         super().__init__(x)
@@ -41,7 +41,7 @@ class FunnelChart(ChartConstraint):
 
 
 class AffineChart(ChartConstraint):
-    """φ_η(ε) = c + A η + B ε, so ψ(η) = B⁻¹(x − c) − (B⁻¹A) η. W = B⁻¹A and
+    """φ_q(ε) = c + A q + B ε, so ψ(q) = B⁻¹(x − c) − (B⁻¹A) q. W = B⁻¹A and
     log|det B| are constant, and the induced posterior is exactly Gaussian."""
 
     def __init__(self, A, B, c, x):
@@ -147,7 +147,7 @@ def test_grad_V_matches_finite_difference():
 
 
 # ========================================================================== #
-#  3. The potential is exactly −log p(η | x)                                #
+#  3. The potential is exactly −log p(q | x)                                #
 # ========================================================================== #
 
 def test_potential_matches_funnel_posterior():
