@@ -142,7 +142,7 @@ class _PicardUpdate:
 
     def new(self, d, precond=None):
         """Fresh per-solve updater for ``d``-dim positions. ``precond`` overrides
-        the preconditioner; omitted, this updater's own is carried over."""
+        the preconditioner. Omitted, this updater's own is carried over."""
         return _PicardUpdate(self.beta, self._precond if precond is None else precond)
 
     def propose(self, z, r):
@@ -190,7 +190,7 @@ class _AndersonUpdate:
 
     def new(self, d, precond=None):
         """Fresh per-solve updater for ``d``-dim positions, resolving a None
-        ``history`` to ``d``. ``precond`` overrides the preconditioner; omitted,
+        ``history`` to ``d``. ``precond`` overrides the preconditioner. Omitted,
         this updater's own is carried over."""
         return _AndersonUpdate(
             d if self.history is None else self.history, self.beta,
@@ -293,9 +293,9 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, max_iter, tol,
     ``fallback`` is a sequence of ``(damping_factor, max_iter)``: chains that did
     not converge are re-solved with progressively stronger under-relaxation.
     Damping does not move the fixed point, so this resolves a stuck chain rather
-    than rejecting it -- a rejection on forward-solve failure alone is not a
+    than rejecting it. A rejection on forward-solve failure alone is not a
     symmetric criterion, so the ladder makes that biased last resort rare.
-    ``z_init`` warm-starts the first solve; the fallback re-solves from
+    ``z_init`` warm-starts the first solve. The fallback re-solves from
     ``(q, p)``."""
     d = q.shape[-1]
     base = solver if solver is not None else _PicardUpdate()
@@ -453,7 +453,7 @@ class RMHMC(HamiltonianSampler):
     fallback_damping : tuple of float
         Fallback ladder: on non-convergence, re-solve the failed chains with the
         base solver damped by each factor in turn (each in (0, 1), relative to
-        ``damping``; default ``(0.5, 0.25)``). Endpoint-preserving, so it makes
+        ``damping``, default ``(0.5, 0.25)``). Endpoint-preserving, so it makes
         solver-driven rejections rare. ``()`` disables it.
     fallback_iter_scale : int
         Per-level iteration cap as a multiple of ``fp_max_iter``. Default 4.

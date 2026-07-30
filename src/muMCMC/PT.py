@@ -149,8 +149,8 @@ class PT(MCMCSampler):
         evidence only when ``beta_min = 0`` *and* the kernel's beta = 0 target is
         normalized. That holds for a kernel built on the default
         ``MCMCSampler.evaluate_model``, whose beta = 0 rung is the prior. It does
-        not hold for every kernel -- ``ChartRATTLE`` leaves an unnormalized
-        reference there -- in which case the value is offset by ``log Z_0``.
+        not hold for every kernel. ``ChartRATTLE`` leaves an unnormalized
+        reference there, in which case the value is offset by ``log Z_0``.
         """
         if self._nstep == 0:
             return {}

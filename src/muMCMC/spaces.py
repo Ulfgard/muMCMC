@@ -168,7 +168,7 @@ def broadcast_beta(beta, n_trailing: int):
     """``beta`` reshaped to broadcast over ``n_trailing`` trailing axes.
 
     A per-batch-element ``beta`` is a ``(N,)`` tensor that has to line up with a
-    ``(N, *feat)`` quantity; a scalar (Python float or 0-d tensor) already
+    ``(N, *feat)`` quantity. A scalar (Python float or 0-d tensor) already
     broadcasts and is returned unchanged.
     """
     if torch.is_tensor(beta) and beta.ndim > 0:

@@ -14,7 +14,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                              #
 #  q is the library's name for the sampled position. Here it is the            #
 #  hyperparameter (q = θ), which doubles as the chart coordinate of the         #
-#  manifold below; ε is the inner latent and x the observation.                #
+#  manifold below. ε is the inner latent and x the observation.                #
 #                                                                              #
 #  Latent (q, ε) ~ N(0, I_{n+m}) and a diffeomorphism φ_q with                 #
 #                                                                              #
@@ -55,7 +55,7 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #      det Λ = (det B)² det(I + Wᵀ W) = (det B)² det G_M       (Sylvester)      #
 #                                                                              #
 #  so √(det G_M / det Λ) = 1/|det B|, which is the log|det B| term above. The    #
-#  user supplies log|det B|; the measure bookkeeping is ours.                    #
+#  user supplies log|det B|. The measure bookkeeping is ours.                    #
 #                                                                              #
 #  U is affine in β (lik = ½‖ψ‖², base = ½‖q‖² + log|det B|) and G_M is affine  #
 #  in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as a        #
@@ -91,8 +91,8 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #  in the sense that p0 = −∂S_h/∂q0 is the position equation F = 0 and          #
 #  p1 = +∂S_h/∂q1 is the momentum line. Two properties follow for free:         #
 #                                                                              #
-#    * the map is symplectic, hence volume-preserving on (q, p) -- the half of  #
-#      Metropolis exactness that self-adjointness alone does not supply;        #
+#    * the map is symplectic, hence volume-preserving on (q, p). This is the    #
+#      half of Metropolis exactness that self-adjointness alone leaves open.     #
 #    * S_h(q0, q1) = S_h(q1, q0), so the map is self-adjoint: applied to        #
 #      (q1, −p1) it returns (q0, −p0).                                          #
 #                                                                              #
@@ -104,15 +104,15 @@ from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_so
 #                                                                              #
 #  Both properties hold up to the position solve. Where F has several roots the  #
 #  forward and reverse solves can pick different ones, and self-adjointness      #
-#  holds only up to that; the roots merge as h shrinks, so it is a large-step    #
+#  holds only up to that. The roots merge as h shrinks, so it is a large-step    #
 #  effect.                                                                      #
 #                                                                              #
 #  A failed solve is rejected with +inf energy, but no reverse-projection check  #
 #  is run, and that is a deliberate trade rather than an omission. Discarding a  #
 #  step whose reverse solve lands elsewhere buys back exact reversibility at the #
 #  cost of irreducibility: the discarded set is a hard barrier, and the steps in #
-#  it are exactly the ones crossing a region of strong nonlinearity -- which,    #
-#  under a metric that already encodes that nonlinearity, are the steps the      #
+#  it are exactly the ones crossing a region of strong nonlinearity. Under a     #
+#  metric that already encodes that nonlinearity, those are the steps the        #
 #  method exists to take. The checked variant is π-reversible but can be         #
 #  reducible, and its failure is silent: acceptance stays high while a whole     #
 #  basin goes unvisited. Unchecked, the error is instead bounded, visible in the  #
@@ -259,7 +259,7 @@ def _solve_rattle_step(constraint, q, psi, W, beta_col, chol_G, rhs, q_init,
 class ChartRATTLEState:
     """Working state of one ChartRATTLE trajectory, batched over ``(N,)`` chains.
 
-    Only ``q``, ``p`` and ``U`` are guaranteed present between transitions; the
+    Only ``q``, ``p`` and ``U`` are guaranteed present between transitions. The
     geometry, force and warm-start displacement are trajectory scratch, set by
     :meth:`ChartRATTLE.sample_momentum` and dropped at the end of a transition.
 
@@ -317,7 +317,7 @@ class ChartRATTLEState:
 #  Runs in the q chart. The N(0, I) top-level prior is baked into U, so the     #
 #  space is the identity UnconstrainedSpace over the θ names and the driver     #
 #  reads the position q off as θ. evaluate_model builds U (TemperedAffine) and   #
-#  G_M (TemperedMetric) from the constraint; integrate performs the RATTLE step. #
+#  G_M (TemperedMetric) from the constraint. integrate performs the step.        #
 #                                                                              #
 # =========================================================================== #
 
@@ -536,16 +536,13 @@ class ChartRATTLE(HamiltonianSampler):
         """REINFORCE step-size adaptation from this transition's energy error and
         worst solver residual and iteration count. The ``exp(-4|delta_H|)`` term
         brakes the step as the energy error grows, so from a small start the step
-        settles below the solver-convergence cliff rather than running away. A
-        diverged step leaves an unbounded residual (already rejected); charging it
-        zero efficiency points the step down instead of poisoning the adapter."""
+        settles below the solver-convergence cliff rather than running away."""
         floor = 1.0e-3
         energy_weight = 4.0
         num_iters = self._step_iters
         solver_penalty = torch.exp(-self._step_residual / self.step_size)
         delta_H_penalty = torch.exp(-energy_weight * delta_H.abs())
         efficiency = solver_penalty * delta_H_penalty * self.step_size / num_iters
-        efficiency = torch.nan_to_num(efficiency, nan=0.0, posinf=0.0, neginf=0.0)
         f_t = -0.5 * torch.log(efficiency + floor) / abs(math.log(floor))
         self._step_size_adapter.update(f_t)
 
