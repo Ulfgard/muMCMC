@@ -11,12 +11,7 @@ from .LMC import LMC
 from .NUTS import NUTS
 from .SMC import SMC
 from .PT import PT
-from .spaces import (
-    DistributionSpace,
-    LogNormalSpace,
-    NormalSpace,
-    UnnormalizedSpace,
-)
+from .spaces import LogNormalSpace, NormalSpace, UnnormalizedSpace
 from .validation import PosteriorEvaluation
 
 __all__ = [
@@ -32,7 +27,6 @@ __all__ = [
     "NUTS",
     "SMC",
     "PT",
-    "DistributionSpace",
     "LogNormalSpace",
     "NormalSpace",
     "UnnormalizedSpace",

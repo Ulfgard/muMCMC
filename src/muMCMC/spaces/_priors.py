@@ -1,9 +1,7 @@
 import torch
 
 from ._space import Space
-from ._transform import (
-    NormalTransform, _std_normal_cdf, _std_normal_icdf, _std_normal_log_pdf,
-)
+from ._transform import NormalTransform
 
 
 def _as_parameter(value, free_names, name, dtype, device):
@@ -42,7 +40,6 @@ class NormalSpace(Space):
         self._transform = NormalTransform(
             lambda z: (mu + sigma * z, log_sigma.expand_as(z)),
             lambda th: ((th - mu) / sigma, (-log_sigma).expand_as(th)),
-            log_prob=lambda th: _std_normal_log_pdf((th - mu) / sigma) - log_sigma,
             reference=mu)
 
     @property
@@ -75,90 +72,7 @@ class LogNormalSpace(Space):
             log_theta = torch.log(theta)
             return (log_theta - mu) / sigma, -log_sigma - log_theta
 
-        self._transform = NormalTransform(
-            forward, inverse,
-            log_prob=lambda th: (_std_normal_log_pdf((torch.log(th) - mu) / sigma)
-                                 - log_sigma - torch.log(th)),
-            reference=mu)
-
-    @property
-    def as_transform(self):
-        return self._transform
-
-
-def _implements(dist, method: str) -> bool:
-    """Whether ``dist`` gives ``method`` a body rather than inheriting the one
-    that raises."""
-    try:
-        getattr(dist, method)(torch.zeros((), dtype=torch.get_default_dtype()))
-    except NotImplementedError:
-        return False
-    except Exception:
-        return True
-    return True
-
-
-def _distribution_transform(dist) -> NormalTransform:
-    """The normal chart ``theta = F⁻¹(Phi(z))`` of a batched distribution.
-
-    The Jacobian is analytic from the density, ``dtheta/dz = phi(z)/f(theta)``,
-    so ``icdf``, ``cdf`` and ``log_prob`` are all it takes.
-
-    Raises
-    ------
-    ValueError
-        If ``dist`` implements neither ``icdf`` nor ``cdf``, since the chart
-        would then have no closed form in that direction.
-    """
-    missing = [name for name in ("icdf", "cdf") if not _implements(dist, name)]
-    if missing:
-        raise ValueError(
-            f"{type(dist).__name__} does not implement {' and '.join(missing)}, "
-            f"so its normal chart has no closed form. Build the chart directly "
-            f"as a NormalTransform, or pick a distribution that does.")
-    dist = dist.expand(dist.batch_shape)
-
-    def forward(z):
-        theta = dist.icdf(_std_normal_cdf(z))
-        return theta, _std_normal_log_pdf(z) - dist.log_prob(theta)
-
-    def inverse(theta):
-        z = _std_normal_icdf(dist.cdf(theta))
-        return z, dist.log_prob(theta) - _std_normal_log_pdf(z)
-
-    params = [getattr(dist, name) for name in dist.arg_constraints
-              if torch.is_tensor(getattr(dist, name, None))]
-    reference = (params[0].expand(dist.batch_shape) if params
-                 else torch.zeros(dist.batch_shape))
-    return NormalTransform(forward, inverse, log_prob=dist.log_prob,
-                           reference=reference)
-
-
-class DistributionSpace(Space):
-    """Independent priors from one batched distribution, chart
-    ``theta = F⁻¹(Phi(z))``.
-
-    Parameters
-    ----------
-    dist : torch.distributions.Distribution
-        Univariate distribution of batch shape ``(d,)``, one entry per free
-        variable in free-name order. A batch shape of ``()`` is expanded.
-
-    Raises
-    ------
-    ValueError
-        If the batch shape is neither ``(d,)`` nor ``()``.
-    """
-
-    def __init__(self, names, dist, *, fixed=None):
-        super().__init__(names, fixed=fixed)
-        shape = tuple(dist.batch_shape)
-        if shape == ():
-            dist = dist.expand((self.d,))
-        elif shape != (self.d,):
-            raise ValueError(
-                f"dist must have batch shape ({self.d},) or (), got {shape}")
-        self._transform = _distribution_transform(dist)
+        self._transform = NormalTransform(forward, inverse, reference=mu)
 
     @property
     def as_transform(self):
@@ -186,7 +100,6 @@ class UnnormalizedSpace(Space):
         self._transform = NormalTransform(
             lambda z: (z, torch.zeros_like(z)),
             lambda th: (th, torch.zeros_like(th)),
-            log_prob=torch.zeros_like,
             reference=zero)
 
     @property

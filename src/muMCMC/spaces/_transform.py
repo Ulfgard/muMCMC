@@ -6,18 +6,6 @@ import torch
 _LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
 
 
-def _std_normal_log_pdf(z: torch.Tensor) -> torch.Tensor:
-    return -0.5 * z * z - _LOG_SQRT_2PI
-
-
-def _std_normal_cdf(z: torch.Tensor) -> torch.Tensor:
-    return 0.5 * (1.0 + torch.erf(z * (0.5 ** 0.5)))
-
-
-def _std_normal_icdf(u: torch.Tensor) -> torch.Tensor:
-    return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
-
-
 class ElementwiseMap:
     """An elementwise map evaluated at a point, with its diagonal Jacobian.
 
@@ -87,18 +75,12 @@ class NormalTransform:
     numerically and nothing is inverted by a root find, so every quantity is
     exact, differentiable to any order, and costs one evaluation.
 
-    ``log_prob`` is the exception, and is derived from ``inverse`` when it is not
-    given. That is an identity rather than an approximation and costs one call of
-    the inverse map.
-
     Parameters
     ----------
     forward : callable
         ``z -> (theta, log dtheta/dz)``, both of shape ``(..., d)``.
     inverse : callable
         ``theta -> (z, log dz/dtheta)``, in the same shapes.
-    log_prob : callable, optional
-        ``theta -> (..., d)``, the per-coordinate log-density of the prior.
     reference : Tensor, shape (d,)
         Parameter tensor fixing ``d``, the dtype and the device.
 
@@ -114,10 +96,9 @@ class NormalTransform:
         by calling both once at ``z = 0``.
     """
 
-    def __init__(self, forward, inverse, *, log_prob=None, reference):
+    def __init__(self, forward, inverse, *, reference):
         self._forward_fn = forward
         self._inverse_fn = inverse
-        self._log_prob_fn = log_prob
         self._reference = reference
 
         theta, forward_jac = forward(torch.zeros_like(reference))
@@ -164,8 +145,8 @@ class NormalTransform:
 
             log p_i(theta_i) = log phi(z_i) + log(dz_i/dtheta_i),
 
-        shape ``(..., d)``."""
-        if self._log_prob_fn is not None:
-            return self._log_prob_fn(theta)
+        shape ``(..., d)``. The inverse map already carries both terms, so this
+        is one call of it."""
         m = self.inverse(theta)
-        return _std_normal_log_pdf(m.mapped_point) + m.jacobian_log_diag
+        z = m.mapped_point
+        return -0.5 * z * z - _LOG_SQRT_2PI + m.jacobian_log_diag

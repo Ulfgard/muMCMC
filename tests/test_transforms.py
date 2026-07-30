@@ -13,26 +13,28 @@ import torch
 import pytest
 
 from muMCMC.spaces import ElementwiseMap, NormalTransform
-from muMCMC.spaces._transform import _std_normal_cdf, _std_normal_log_pdf
+from muMCMC.spaces._transform import _LOG_SQRT_2PI
 
 torch.set_default_dtype(torch.float64)
 
 ATOL = 1e-10
+
+
+def _normal_log_pdf(z):
+    return -0.5 * z * z - _LOG_SQRT_2PI
+
+
 MU = torch.tensor([0.5, -1.0, 2.0])
 SIGMA = torch.tensor([1.0, 2.0, 0.3])
 
 
-def _affine(*, log_prob=False):
-    """``theta = mu + sigma z``, with ``log_prob`` switchable so the derivation
-    from the inverse map can be checked against the closed form."""
+def _affine():
+    """``theta = mu + sigma z``."""
     log_sigma = torch.log(SIGMA)
-    kw = {}
-    if log_prob:
-        kw["log_prob"] = lambda th: _std_normal_log_pdf((th - MU) / SIGMA) - log_sigma
     return NormalTransform(
         lambda z: (MU + SIGMA * z, log_sigma.expand_as(z)),
         lambda th: ((th - MU) / SIGMA, (-log_sigma).expand_as(th)),
-        reference=MU, **kw)
+        reference=MU)
 
 
 # --------------------------------------------------------------------------- #
@@ -116,16 +118,8 @@ def test_reports_its_coordinate_count_dtype_and_device():
 
 
 # --------------------------------------------------------------------------- #
-#  log_prob, given or derived                                                 #
+#  log_prob                                                                   #
 # --------------------------------------------------------------------------- #
-
-def test_derived_log_prob_matches_the_given_one():
-    # Derived from the inverse map, which is an identity rather than an
-    # approximation, so it must agree exactly with the closed form.
-    theta = MU + SIGMA * torch.randn(9, 3)
-    assert torch.allclose(_affine(log_prob=False).log_prob(theta),
-                          _affine(log_prob=True).log_prob(theta), atol=ATOL)
-
 
 def test_log_prob_is_the_density_of_the_pushed_forward_normal():
     theta = MU + SIGMA * torch.randn(9, 3)
@@ -171,8 +165,9 @@ def test_the_forward_map_is_differentiable_to_second_order():
 def test_saturating_chart_keeps_the_log_jacobian_finite():
     # The log is the stored form precisely so that a saturating value, whose
     # Jacobian underflows, still reports a usable derivative.
+    normal_cdf = lambda z: 0.5 * (1.0 + torch.erf(z * (0.5 ** 0.5)))
     T = NormalTransform(
-        lambda z: (_std_normal_cdf(z), _std_normal_log_pdf(z)),
+        lambda z: (normal_cdf(z), _normal_log_pdf(z)),
         lambda th: (torch.zeros_like(th), torch.zeros_like(th)),
         reference=torch.zeros(2))
     m = T.forward(torch.full((1, 2), 40.0))

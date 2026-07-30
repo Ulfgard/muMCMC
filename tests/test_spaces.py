@@ -12,11 +12,9 @@ import math
 
 import torch
 import pytest
-from torch.distributions import Exponential, Gamma, Normal
+from torch.distributions import Normal
 
-from muMCMC.spaces import (
-    DistributionSpace, LogNormalSpace, NormalSpace, UnnormalizedSpace,
-)
+from muMCMC.spaces import LogNormalSpace, NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -26,8 +24,6 @@ NAMES = ["a", "b", "c"]
 PROPER = [
     lambda **kw: NormalSpace(NAMES, mu=0.3, sigma=1.7, **kw),
     lambda **kw: LogNormalSpace(NAMES, mu=-0.2, sigma=0.8, **kw),
-    lambda **kw: DistributionSpace(
-        NAMES, Exponential(torch.tensor(1.5)), **kw),
 ]
 
 
@@ -83,23 +79,6 @@ def test_dict_parameter_missing_a_free_name_raises():
 def test_tensor_parameter_of_the_wrong_length_raises():
     with pytest.raises(ValueError, match="shape"):
         NormalSpace(NAMES, sigma=torch.ones(2))
-
-
-def test_distribution_space_rejects_a_mismatched_batch_shape():
-    with pytest.raises(ValueError, match="batch shape"):
-        DistributionSpace(NAMES, Normal(torch.zeros(2), torch.ones(2)))
-
-
-def test_distribution_space_rejects_a_distribution_without_a_closed_form():
-    # Gamma has cdf but no icdf, so its chart would need a root find per
-    # evaluation. That is refused rather than paid for silently.
-    with pytest.raises(ValueError, match="icdf"):
-        DistributionSpace(NAMES, Gamma(torch.tensor(2.0), torch.tensor(1.5)))
-
-
-def test_distribution_space_expands_a_scalar_batch_shape():
-    s = DistributionSpace(NAMES, Normal(torch.tensor(0.0), torch.tensor(1.0)))
-    assert s.as_transform.d == 3
 
 
 # --------------------------------------------------------------------------- #

@@ -1,6 +1,6 @@
 import torch
 
-from ._transform import NormalTransform, _std_normal_log_pdf
+from ._transform import NormalTransform
 
 
 # =========================================================================== #
@@ -94,9 +94,6 @@ class Space:
 
     # ---- vector layouts ---------------------------------------------------- #
 
-    def _free_index(self, ref: torch.Tensor) -> torch.Tensor:
-        return torch.as_tensor(self.free_indices, device=ref.device)
-
     def _template(self, ref: torch.Tensor) -> torch.Tensor:
         """``(d_full,)`` holding each fixed value at its place and zero
         elsewhere, cached per dtype and device."""
@@ -112,7 +109,8 @@ class Space:
         """Full vector ``(..., d_full)`` to free vector ``(..., d)``."""
         if not self.fixed:
             return theta_full
-        return theta_full.index_select(-1, self._free_index(theta_full))
+        idx = torch.as_tensor(self.free_indices, device=theta_full.device)
+        return theta_full.index_select(-1, idx)
 
     def to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Free vector ``(..., d)`` to full vector ``(..., d_full)``, with each
@@ -121,7 +119,8 @@ class Space:
             return theta_free
         shape = theta_free.shape[:-1] + (self.d_full,)
         out = self._template(theta_free).expand(shape).clone()
-        out[..., self._free_index(theta_free)] = theta_free
+        idx = torch.as_tensor(self.free_indices, device=theta_free.device)
+        out[..., idx] = theta_free
         return out
 
     def to_vector(self, samples: dict) -> torch.Tensor:
@@ -224,7 +223,7 @@ class Space:
         """The free block of a metric ``G`` of shape ``(..., d_full, d_full)``
         over every variable, giving ``(..., d, d)``. The fixed variables are not
         sampled, so their rows and columns are dropped."""
-        idx = self._free_index(G)
+        idx = torch.as_tensor(self.free_indices, device=G.device)
         return G.index_select(-2, idx).index_select(-1, idx)
 
     def sample(self, n_samples: int, *, generator=None) -> dict:
