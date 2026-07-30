@@ -11,7 +11,7 @@ import math
 import torch
 import pytest
 
-from muMCMC import RMHMC, PT, UnconstrainedSpace
+from muMCMC import RMHMC, PT, NormalSpace, UnnormalizedSpace
 from pyro.distributions import Normal
 
 torch.set_default_dtype(torch.float64)
@@ -26,12 +26,7 @@ def gaussian_1d(lam, mu):
 
 
 def gaussian_1d_space():
-    return UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 1.0)},
-        prior_metric_fn=lambda theta: torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    return NormalSpace(["x"])
 
 
 def bimodal_1d(m, s):
@@ -60,7 +55,7 @@ def test_pt_swap_is_grad_free_with_grad_requiring_model():
     sampler = RMHMC(model, gaussian_1d_space(), step_size=0.3, num_steps=4,
                     adapt_step_size=False)
     pt = PT(sampler, torch.linspace(0.0, 1.0, 4))
-    pt.run_mcmc(torch.zeros(1), num_samples=20, num_warmup_steps=10,
+    pt.run_mcmc({n: torch.tensor(0.0) for n in pt.space.free_names}, num_samples=20, num_warmup_steps=10,
                 num_chains=1, disable_progbar=True)
     assert not pt._u_lik_sum.requires_grad
 
@@ -73,7 +68,7 @@ def test_pt_recovers_gaussian_and_evidence():
                     adapt_step_size=False)
     pt = PT(sampler, torch.linspace(0.0, 1.0, 6))
 
-    x = pt.run_mcmc(torch.zeros(1), num_samples=350, num_warmup_steps=100,
+    x = pt.run_mcmc({n: torch.tensor(0.0) for n in pt.space.free_names}, num_samples=350, num_warmup_steps=100,
                     num_chains=1, disable_progbar=True)["x"]
     assert x.shape == (1, 350)
 
@@ -98,7 +93,7 @@ def test_pt_multi_ladder_shapes_and_rhat():
                     adapt_step_size=False)
     pt = PT(sampler, torch.linspace(0.0, 1.0, 4))
 
-    out = pt.run_mcmc(torch.zeros(1), num_samples=60, num_warmup_steps=15,
+    out = pt.run_mcmc({n: torch.tensor(0.0) for n in pt.space.free_names}, num_samples=60, num_warmup_steps=15,
                       num_chains=3, disable_progbar=True)
     assert out["x"].shape == (3, 60)                    # three independent ladders
     assert pt.diagnostics()["swap_accept_rate"].shape == (3,)
@@ -107,17 +102,12 @@ def test_pt_multi_ladder_shapes_and_rhat():
 def test_pt_recovers_bimodal_with_balanced_mass():
     torch.manual_seed(0)
     m, s = 2.5, 0.5
-    space = UnconstrainedSpace(
-        ["x"],
-        priors={"x": Normal(0.0, 2.0)},
-        prior_metric_fn=lambda theta: 0.25 * torch.eye(1, dtype=theta.dtype).expand(
-            *theta.shape[:-1], 1, 1),
-    )
+    space = NormalSpace(["x"], sigma=2.0)
     sampler = RMHMC(bimodal_1d(m, s), space, step_size=0.25, num_steps=6,
                     adapt_step_size=False)
     pt = PT(sampler, torch.linspace(0.0, 1.0, 6))
 
-    x = pt.run_mcmc(torch.zeros(1), num_samples=600, num_warmup_steps=150,
+    x = pt.run_mcmc({n: torch.tensor(0.0) for n in pt.space.free_names}, num_samples=600, num_warmup_steps=150,
                     num_chains=1, disable_progbar=True)["x"]
 
     near_pos = (x - m).abs() < 1.0

@@ -12,9 +12,10 @@ from ._solvers import FixedPointSolver
 # =========================================================================== #
 #  ChartRATTLE: constrained HMC for hierarchical posteriors                   #
 #                                                                             #
-#  q is the library's name for the sampled position. Here it is the           #
-#  hyperparameter (q = θ) and the chart coordinate of the manifold below. ε   #
-#  is the inner latent and x the observation.                                 #
+#  q is the library's name for the sampled position. Here it is the free      #
+#  vector in the space's normal chart, so the hyperparameter is θ = T(q) and  #
+#  q is also the chart coordinate of the manifold below. ε is the inner       #
+#  latent and x the observation.                                              #
 #                                                                             #
 #  With q ~ p(q), ε ~ N(0, I_m) and a diffeomorphism φ_q, the non-centered    #
 #  reparameterization of x | q is φ_q(ε) = x, so conditioning on the data is  #
@@ -35,8 +36,10 @@ from ._solvers import FixedPointSolver
 #                                                                             #
 #      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = M + β Wᵀ W,        #
 #                                                                             #
-#  with p(q) and M the space's prior and its prior metric. An absent prior    #
-#  is flat, an absent prior metric is an error.                               #
+#  with p(q) and M the space's prior and its metric. Read in the space's      #
+#  normal chart the prior is exactly N(0, I), so −log p(q) is ½‖q‖² and M is  #
+#  the identity. Both are properties of the chart rather than conditions on   #
+#  the model, which is what lets an arbitrary prior be sampled here.          #
 #                                                                             #
 #  No co-area factor survives into U, and that is not an omission. The        #
 #  Hausdorff-measure form carries 1/√(det Λ) with Λ = Dg Dgᵀ, and reading it  #
@@ -51,11 +54,11 @@ from ._solvers import FixedPointSolver
 #                                                                             #
 #  M is not a free choice: it is the prior block of G_M, the (q1 − q0) of F   #
 #  and of the momentum line, the kinetic term of S_h, and the DF(q0) the      #
-#  solve preconditions with, all one matrix. Moved together a constant M is   #
-#  consistent, which is what matches a prior of the wrong scale, since N(0,   #
-#  s²I) has precision I/s² where M = I would draw the momentum at unit scale  #
-#  against a target of width s. M has to be position-independent, since S_h   #
-#  would otherwise need its midpoint value, a different scheme.               #
+#  solve preconditions with, all one matrix. S_h needs it position-           #
+#  independent, since it would otherwise need its midpoint value, a different #
+#  scheme. The normal chart supplies exactly that, and supplies it as the     #
+#  true Hessian of the prior term rather than as a constant standing in for   #
+#  one, so no scale is being guessed at.                                      #
 #                                                                             #
 #  U is affine in β (lik = ½‖ψ‖²) and so is G_M (A_lik = WᵀW), so             #
 #  evaluate_model returns a TemperedAffine and a TemperedMetric, giving the   #
@@ -197,6 +200,28 @@ class LocationScaleChart(ChartConstraint):
         return torch.log(L.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
 
 
+class _ChartInNormal:
+    """A constraint written on θ, read at the chart coordinate q with θ = T(q),
+
+        W_q = W_θ diag(dθ/dq),
+
+    so the constraint itself never sees the chart.
+    """
+
+    def __init__(self, constraint: "ChartConstraint", transform):
+        self.constraint = constraint
+        self.transform = transform
+        self.jvp_needs_grad = constraint.jvp_needs_grad
+
+    def psi(self, q: torch.Tensor) -> torch.Tensor:
+        return self.constraint.psi(self.transform.forward(q).mapped_point)
+
+    def psi_with_jvp(self, q: torch.Tensor):
+        chart = self.transform.forward(q)
+        psi, W, log_abs_det_B = self.constraint.psi_with_jvp(chart.mapped_point)
+        return psi, W * chart.jacobian_diag[..., None, :], log_abs_det_B
+
+
 #  ---- Position solve ------------------------------------------------------ #
 
 def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
@@ -313,12 +338,9 @@ class ChartRATTLE(HamiltonianSampler):
     constraint : ChartConstraint
         The reparameterization inverse ψ(q) = φ_q⁻¹(x) and its geometry.
     space
-        Unconstrained space over the θ (= q) names, whose z to θ map has to be
-        the identity, since the constraint reads the sampled position as θ and U
-        carries no transform Jacobian. Its prior becomes the prior on q, entering
-        U as −log p(q), and is flat when the space carries none. Its
-        ``prior_metric_fn`` becomes the prior block M of G_M = M + β WᵀW. It is
-        required, and has to be independent of position.
+        Space over the θ names. The chain runs in its normal chart, so the prior
+        enters U as ½‖q‖² and the prior block M of G_M = M + β WᵀW is the
+        identity. The constraint is evaluated at θ = T(q).
     step_size : float
         Integration step size. When adapting, start it small: the step is grown
         from here, so a too-large start begins above the solver-convergence cliff
@@ -347,8 +369,8 @@ class ChartRATTLE(HamiltonianSampler):
     Raises
     ------
     ValueError
-        If ``damping`` is outside (0, 1] or ``solver`` is not recognised. A
-        space with no prior metric raises at the first model evaluation.
+        If ``damping`` is outside (0, 1], if ``solver`` is not recognised, or if
+        the space carries no prior.
 
     Notes
     -----
@@ -381,11 +403,17 @@ class ChartRATTLE(HamiltonianSampler):
         adapter = NoAdaptation(init=log_eps)
         if adapt_step_size:
             adapter = Reinforce(sigma=adaptation_sigma, init=log_eps)
+        if space.prior_metric(space.as_transform.interior_point) is None:
+            raise ValueError(
+                "ChartRATTLE needs a space with a prior, whose chart supplies "
+                "the constant prior block M of G_M = M + beta W^T W. A space "
+                "with no prior has no M.")
         super().__init__(None, space, requires_metric=True, num_steps=num_steps,
                          adapter=adapter, divergence_threshold=divergence_threshold,
                          trajectory_length=num_steps * step_size)
 
         self.constraint = constraint
+        self._chart = _ChartInNormal(constraint, space.as_transform)
         self._fp_tol = fp_tol
 
         self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
@@ -402,8 +430,8 @@ class ChartRATTLE(HamiltonianSampler):
         psi, W)``, or ``(U, metric, psi, W, grad_V)`` when ``grad`` is set.
 
         U : TemperedAffine
-            Potential U(q) = −log p(q) + log|det B| + β·½‖ψ‖², with p(q) the
-            space's prior. The target is e^{−U}.
+            Potential U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖², the prior read in the
+            space's normal chart. The target is e^{−U}.
 
         metric : TemperedMetric
             Metric G_M(q) = I + β WᵀW on the q-chart: the ambient metric
@@ -427,20 +455,19 @@ class ChartRATTLE(HamiltonianSampler):
         # Detached leaf regardless of ``grad``: W comes from a reverse pass
         # through psi, so the input has to carry a graph either way.
         q = z_free.detach().requires_grad_(True)
-        theta_map = self.space.map_to_constrained_vector(q)
-        G_prior = self.space.prior_metric(self._free_to_full(theta_map.mapped_point))
-        if G_prior is None:
-            raise ValueError(
-                "ChartRATTLE needs the space's prior metric, which is the prior "
-                "block M of G_M = M + beta W^T W. Give the space a "
-                "prior_metric_fn.")
-        A_prior = self.space.push_forward_metric(G_prior, theta_map)
+        # In the chart the prior is exactly N(0, I), so its potential is ½‖q‖²
+        # and the prior block M of G_M is the identity. Both hold for any prior,
+        # which is the whole reason this sampler runs here.
+        A_prior = torch.eye(q.shape[-1], dtype=q.dtype, device=q.device).expand(
+            q.shape[:-1] + (q.shape[-1], q.shape[-1]))
 
         with torch.enable_grad():
-            psi, W, log_abs_det_B = self.constraint.psi_with_jvp(q)
+            psi, W, log_abs_det_B = self._chart.psi_with_jvp(q)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
             lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
-            base = -self.space.prior_log_prob_vector(q) + log_abs_det_B
+            base = (0.5 * (q * q).sum(-1)
+                    + 0.5 * q.shape[-1] * math.log(2.0 * math.pi)
+                    + log_abs_det_B)
             if grad:
                 G = A_prior + broadcast_beta(beta, 2) * gram
                 # Cholesky, not torch.logdet: same factorization the metric uses
@@ -456,6 +483,19 @@ class ChartRATTLE(HamiltonianSampler):
         if grad:
             out = out + (grad_V.detach(),)
         return out
+
+    # ---- the chain's coordinates ------------------------------------------- #
+
+    def to_position(self, theta_free):
+        """The chart coordinate q at the variables theta, so q = T⁻¹(theta).
+        The chain runs in the chart, where the prior block M of G_M is constant,
+        which is the one thing the step needs and the variables cannot give."""
+        return self.space.as_transform.inverse(theta_free).mapped_point
+
+    def to_variables(self, q_free):
+        """The variables theta = T(q) at the chart coordinate q, which is what a
+        run reports."""
+        return self.space.as_transform.forward(q_free).mapped_point
 
     # ---- integrator hooks -------------------------------------------------- #
 
@@ -504,7 +544,7 @@ class ChartRATTLE(HamiltonianSampler):
         if state.dq is not None:
             q_init = state.q + state.dq
         q, iters, residual = _solve_rattle_step(
-            self.constraint, state.q, state.psi, state.W, A_prior, beta_col,
+            self._chart, state.q, state.psi, state.W, A_prior, beta_col,
             beta_mat, state.metric.L, rhs, q_init, self._solver)
 
         U, metric, psi, W, grad_V = self.evaluate_model(q, grad=True)

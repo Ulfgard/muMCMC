@@ -23,7 +23,7 @@ import pytest
 import pyro
 from pyro.distributions import Normal
 
-from muMCMC import NUTS, UnconstrainedSpace, UniformBoxSpace
+from muMCMC import NUTS, LogNormalSpace, NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -48,24 +48,25 @@ def prior_run():
     should reproduce the prior as its stationary distribution."""
     torch.manual_seed(0)
     names = ["a", "b"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    space = NormalSpace(names)
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.zeros(2), num_samples=N_SAMPLES,
+    out = nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=N_SAMPLES,
                         num_warmup_steps=N_WARMUP, num_chains=1,
                         disable_progbar=True)
     return out
 
 
 @pytest.fixture(scope="module")
-def box_run():
-    """Flat likelihood on a box: the tanh transform's Jacobian must turn the
-    flat constrained target into a *uniform* distribution on the box."""
+def chart_run():
+    """Flat likelihood under a log-normal prior, whose support is the positive
+    half line. The chain runs on the variables, so it meets that boundary
+    directly and pays for it in divergences and mixing, which is why this draws
+    more than the unbounded fixtures."""
     torch.manual_seed(0)
-    limits = {"x": (-2.0, 1.0), "y": (0.0, 4.0)}
-    space = UniformBoxSpace(limits, ["x", "y"], device="cpu")
+    space = LogNormalSpace(["x", "y"])
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.tensor([0.0, 2.0]), num_samples=N_SAMPLES,
-                        num_warmup_steps=N_WARMUP, num_chains=1,
+    out = nuts.run_mcmc({n: torch.tensor(1.0) for n in nuts.space.free_names}, num_samples=8 * N_SAMPLES,
+                        num_warmup_steps=4 * N_WARMUP, num_chains=1,
                         disable_progbar=True)
     return space, nuts, out
 
@@ -84,45 +85,40 @@ def test_prior_recovery_marginals(prior_run):
         assert abs(float(x.std()) - 1.0) < 0.15
 
 
-def test_box_samples_stay_in_bounds(box_run):
-    _, _, out = box_run
-    assert torch.all(out["x"] > -2.0) and torch.all(out["x"] < 1.0)
-    assert torch.all(out["y"] > 0.0) and torch.all(out["y"] < 4.0)
+def test_chart_samples_stay_in_the_support(chart_run):
+    _, _, out = chart_run
+    assert torch.all(out["x"] > 0.0) and torch.all(out["y"] > 0.0)
 
 
-def test_box_flat_target_is_uniform(box_run):
-    # This is the Jacobian-correctness anchor.  A flat target in constrained
-    # coordinates becomes Uniform(l, u) only because the -log|det J| term is
-    # included; dropping or mis-signing it would pile mass at the box edges
-    # (tanh saturates), inflating the std and shifting the mean.
-    _, _, out = box_run
-    for name, (lo, hi) in {"x": (-2.0, 1.0), "y": (0.0, 4.0)}.items():
-        x = out[name]
-        midpoint = 0.5 * (lo + hi)
-        uniform_std = (hi - lo) / math.sqrt(12.0)
-        assert abs(float(x.mean()) - midpoint) < 0.2
-        assert abs(float(x.std()) - uniform_std) < 0.15
+def test_chart_flat_target_is_the_prior(chart_run):
+    # With a flat likelihood the prior is the whole target, so a bounded support
+    # must still come back as the prior it was drawn from.
+    _, _, out = chart_run
+    for name in ["x", "y"]:
+        log_x = torch.log(out[name])
+        assert abs(float(log_x.mean())) < 0.15
+        assert abs(float(log_x.std()) - 1.0) < 0.15
 
 
 # --------------------------------------------------------------------------- #
 #  Output schema and free/fixed splicing                                      #
 # --------------------------------------------------------------------------- #
 
-def test_output_keys_and_grouping(box_run):
-    _, _, out = box_run
+def test_output_keys_and_grouping(chart_run):
+    _, _, out = chart_run
     assert set(out) == {"x", "y"}
     # single chain -> (num_chains, num_samples)
-    assert out["x"].shape == (1, N_SAMPLES)
-    assert out["y"].shape == (1, N_SAMPLES)
+    assert out["x"].shape == (1, 8 * N_SAMPLES)
+    assert out["y"].shape == (1, 8 * N_SAMPLES)
 
 
 def test_fixed_parameter_is_spliced_as_constant():
     torch.manual_seed(0)
     names = ["a", "b", "c"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names},
+    space = NormalSpace(names,
                                fixed={"c": 1.5})
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc(torch.zeros(3), num_samples=40, num_warmup_steps=20,
+    out = nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=40, num_warmup_steps=20,
                         num_chains=1, disable_progbar=True)
     assert set(out) == {"a", "b", "c"}
     assert out["a"].shape == (1, 40)
@@ -134,8 +130,8 @@ def test_fixed_parameter_is_spliced_as_constant():
 #  Diagnostics                                                                #
 # --------------------------------------------------------------------------- #
 
-def test_diagnostics_schema(box_run):
-    _, nuts, _ = box_run
+def test_diagnostics_schema(chart_run):
+    _, nuts, _ = chart_run
     d = nuts.diagnostics()
     assert set(d) == COMMON_KEYS
     for k in COMMON_KEYS:
@@ -143,8 +139,8 @@ def test_diagnostics_schema(box_run):
     assert d["num_divergences"].dtype == torch.long
 
 
-def test_diagnostics_values_are_sane(box_run):
-    _, nuts, _ = box_run
+def test_diagnostics_values_are_sane(chart_run):
+    _, nuts, _ = chart_run
     d = nuts.diagnostics()
     assert 0.0 <= float(d["accept_rate"][0]) <= 1.0
     assert float(d["step_size"][0]) > 0.0 and math.isfinite(float(d["step_size"][0]))
@@ -152,7 +148,7 @@ def test_diagnostics_values_are_sane(box_run):
 
 
 def test_diagnostics_empty_before_run():
-    space = UnconstrainedSpace(["a"], priors={"a": Normal(0.0, 1.0)})
+    space = NormalSpace(["a"])
     nuts = NUTS(_flat_likelihood, space)
     assert nuts.diagnostics() == {}
 
@@ -166,9 +162,9 @@ def test_reproducible_with_fixed_seed():
 
     def run():
         pyro.set_rng_seed(123)
-        space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+        space = NormalSpace(names)
         nuts = NUTS(_flat_likelihood, space)
-        return nuts.run_mcmc(torch.zeros(2), num_samples=30, num_warmup_steps=20,
+        return nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=30, num_warmup_steps=20,
                              num_chains=1, disable_progbar=True)
 
     first, second = run(), run()

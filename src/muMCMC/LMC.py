@@ -54,7 +54,7 @@ class LMCState:
     Parameters
     ----------
     q : Tensor, shape (N, d)
-        Position in free unconstrained coordinates.
+        Position in the space's normal chart, free coordinates.
     v : Tensor, shape (N, d), or None
         Velocity. Drawn by ``sample_momentum`` and ``None`` only on the initial
         state before the first step.
@@ -111,14 +111,14 @@ class LMC(HamiltonianSampler):
 
         E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,
 
-    with ``U`` the full unconstrained potential and ``G`` the metric assembled
-    by ``MCMCSampler``. The integrator is explicit (a linear solve per
+    with ``U`` the full chart potential and ``G`` the metric assembled by
+    ``MCMCSampler``. The integrator is explicit (a linear solve per
     half-kick) and acceptance carries the trajectory Jacobian ``det J``.
 
     User contract
     -------------
     ``model_fn(theta_full) -> (U_lik, G_lik)``, the scalar likelihood potential
-    and the ``(d_full, d_full)`` SPD metric, both in constrained coordinates.
+    and the ``(d_full, d_full)`` SPD metric, both on the full variable vector.
 
     Parameters
     ----------

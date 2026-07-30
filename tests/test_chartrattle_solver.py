@@ -13,13 +13,15 @@ states, checking the properties that make it a valid MCMC proposal:
 6. Energy is conserved to second order: halving the step at a fixed trajectory
    length quarters the energy error.
 """
+import math
+
 import torch
 import pytest
 
 from muMCMC.ChartRATTLE import (
     ChartRATTLE, ChartRATTLEState, ChartConstraint, LocationScaleChart)
 from muMCMC.RMHMC import _hamiltonian
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -59,18 +61,11 @@ class AffineChart(ChartConstraint):
         return self.psi(eta), self.W_const.expand(N, *self.W_const.shape), self.log_abs_det_B(eta)
 
 
-def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_metric_fn=None, **kw):
+def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_sd=None, **kw):
     torch.manual_seed(seed)
     c = FunnelChart(sigma, torch.randn(m))
-    space = UnconstrainedSpace(
-        ["v"], prior_metric_fn=prior_metric_fn or _scaled_metric(1.0, 1))
+    space = NormalSpace(["v"], sigma=prior_sd or 1.0)
     return ChartRATTLE(c, space, adapt_step_size=False, **kw)
-
-
-def _scaled_metric(scale, n):
-    """A constant prior metric ``scale * I``, the shape a Gaussian prior has.
-    ChartRATTLE requires the space to supply M."""
-    return lambda th: (scale * torch.eye(n)).expand(th.shape[0], n, n)
 
 
 def _affine_sampler(n=2, m=5, seed=0, **kw):
@@ -79,8 +74,7 @@ def _affine_sampler(n=2, m=5, seed=0, **kw):
     B = torch.eye(m) + 0.15 * torch.randn(m, m)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
-    space = UnconstrainedSpace([f"v{i}" for i in range(n)],
-                               prior_metric_fn=_scaled_metric(1.0, n))
+    space = NormalSpace([f"v{i}" for i in range(n)])
     return ChartRATTLE(c, space, adapt_step_size=False, **kw), n
 
 
@@ -153,11 +147,8 @@ def test_step_is_time_reversible(h):
     assert torch.allclose(back.p, -st.p, atol=1e-9)
 
 
-@pytest.mark.parametrize("prior_metric_fn", [
-    None,
-    lambda th: torch.diag(torch.tensor([4.0, 0.25])).expand(th.shape[0], 2, 2),
-])
-def test_step_preserves_volume_and_symplectic_form(prior_metric_fn):
+@pytest.mark.parametrize("prior_sd", [None, [0.5, 2.0]])
+def test_step_preserves_volume_and_symplectic_form(prior_sd):
     # The step is the variational integrator of the discrete Lagrangian
     #   S_h(q0,q1) = (q1-q0)^T M (q1-q0)/(2h) + beta||psi1-psi0||^2/(2h)
     #                - (h/2)[V0+V1],
@@ -177,9 +168,7 @@ def test_step_preserves_volume_and_symplectic_form(prior_metric_fn):
     chart = LocationScaleChart(lambda q: torch.tanh(q @ A.transpose(-2, -1)),
                                lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
                                torch.randn(m))
-    space = UnconstrainedSpace(
-        [f"v{i}" for i in range(n)],
-        prior_metric_fn=prior_metric_fn or _scaled_metric(1.0, n))
+    space = NormalSpace([f"v{i}" for i in range(n)], sigma=prior_sd or 1.0)
     s = ChartRATTLE(chart, space, step_size=h, num_steps=1,
                     adapt_step_size=False, solver="anderson",
                     fp_tol=1e-14, fp_max_iter=500)
@@ -237,12 +226,13 @@ def test_solvers_match_the_picard_endpoint(solver):
 
 @pytest.mark.parametrize("solver", ["picard", "anderson", "newton"])
 def test_a_prior_metric_keeps_the_step_reversible(solver):
-    # With a constant prior metric M the discrete Lagrangian measures the q
-    # block by M, so F, the momentum line and G_M all carry it. If they had not
-    # moved together the step would stop being self-adjoint.
+    # The prior block M of the discrete Lagrangian measures the q block, so F,
+    # the momentum line and G_M all carry it. If they had not moved together the
+    # step would stop being self-adjoint. M is the identity in the chart, so a
+    # prior of another width is what varies it in the chain's own coordinates.
     h = 0.3
     s = _funnel_sampler(step_size=h, num_steps=1, solver=solver, fp_tol=1e-12,
-                        fp_max_iter=300, prior_metric_fn=_scaled_metric(7.0, 1))
+                        fp_max_iter=300, prior_sd=1.0 / math.sqrt(7.0))
     torch.manual_seed(31)
     st = _seed_state(s, torch.randn(5, 1))
     hh = torch.full((5,), h)

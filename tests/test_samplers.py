@@ -10,7 +10,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import RMHMC, NUTS, UnconstrainedSpace
+from muMCMC import RMHMC, NUTS, NormalSpace, UnnormalizedSpace
 from muMCMC._adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)
@@ -27,7 +27,7 @@ POST_STD = (SIGMA2 / (SIGMA2 + 1.0)) ** 0.5     # ~0.7071
 
 
 def _space():
-    return UnconstrainedSpace(NAMES, priors={n: Normal(0.0, 1.0) for n in NAMES})
+    return NormalSpace(NAMES)
 
 
 def _rmhmc_model(theta):
@@ -46,7 +46,7 @@ def _nuts_model(theta):
 def test_rmhmc_recovers_known_gaussian():
     torch.manual_seed(0)
     s = RMHMC(_rmhmc_model, _space(), step_size=0.3, num_steps=5, fp_max_iter=20)
-    out = s.run_mcmc(torch.zeros(2), num_samples=250, num_warmup_steps=150,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=250, num_warmup_steps=150,
                      num_chains=4, disable_progbar=True)
     for i, n in enumerate(NAMES):
         x = out[n]
@@ -58,7 +58,7 @@ def test_rmhmc_recovers_known_gaussian():
 def test_nuts_recovers_known_gaussian():
     torch.manual_seed(0)
     s = NUTS(_nuts_model, _space())
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=300,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=300,
                      num_chains=1, disable_progbar=True)
     for i, n in enumerate(NAMES):
         x = out[n]
@@ -69,7 +69,7 @@ def test_nuts_recovers_known_gaussian():
 def test_common_diagnostics_schema():
     torch.manual_seed(0)
     r = RMHMC(_rmhmc_model, _space(), step_size=0.3, num_steps=5, fp_max_iter=20)
-    r.run_mcmc(torch.zeros(2), num_samples=40, num_warmup_steps=40,
+    r.run_mcmc({n: torch.tensor(0.0) for n in r.space.free_names}, num_samples=40, num_warmup_steps=40,
                num_chains=3, disable_progbar=True)
     dr = r.diagnostics()
     assert COMMON_KEYS <= set(dr)
@@ -78,7 +78,7 @@ def test_common_diagnostics_schema():
     assert dr["num_divergences"].dtype == torch.long
 
     n = NUTS(_nuts_model, _space())
-    n.run_mcmc(torch.zeros(2), num_samples=40, num_warmup_steps=40,
+    n.run_mcmc({n: torch.tensor(0.0) for n in n.space.free_names}, num_samples=40, num_warmup_steps=40,
                num_chains=1, disable_progbar=True)
     dn = n.diagnostics()
     assert set(dn) == COMMON_KEYS
@@ -91,7 +91,7 @@ def test_rmhmc_divergence_count_is_per_chain():
     # Tiny threshold forces many steps to register as divergences.
     r = RMHMC(_rmhmc_model, _space(), step_size=0.3, num_steps=4,
               fp_max_iter=20, divergence_threshold=1e-6)
-    r.run_mcmc(torch.zeros(2), num_samples=15, num_warmup_steps=5,
+    r.run_mcmc({n: torch.tensor(0.0) for n in r.space.free_names}, num_samples=15, num_warmup_steps=5,
                num_chains=3, disable_progbar=True)
     nd = r.diagnostics()["num_divergences"]
     assert nd.shape == (3,) and nd.dtype == torch.long
@@ -102,7 +102,7 @@ def test_warmup_zero_keeps_constructor_step_size():
     torch.manual_seed(0)
     s = RMHMC(_rmhmc_model, _space(), step_size=0.37, num_steps=4,
               fp_max_iter=20, adapt_step_size=True)
-    s.run_mcmc(torch.zeros(2), num_samples=20, num_warmup_steps=0,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=20, num_warmup_steps=0,
                num_chains=3, disable_progbar=True)
     # adapter never updated -> step_size left at the constructor value.
     assert torch.allclose(s.step_size, torch.full((3,), 0.37))

@@ -29,7 +29,7 @@ from muMCMC.RMHMC import (
     _implicit_midpoint_step,
 )
 from muMCMC._solvers import FixedPointSolver
-from muMCMC.spaces import UnconstrainedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -54,7 +54,7 @@ MU = torch.tensor([1.0, -0.5, 0.3])
 def make_eval(model_fn, fp_tol=1e-12, fp_max_iter=200):
     """evaluate_model for an identity space (no prior): the pulled-back metric
     is exactly G_lik and the potential is exactly U_lik."""
-    space = UnconstrainedSpace([f"x{i}" for i in range(D)])
+    space = UnnormalizedSpace([f"x{i}" for i in range(D)])
     s = RMHMC(model_fn, space, step_size=0.1, fp_tol=fp_tol, fp_max_iter=fp_max_iter)
     return s.evaluate_model
 

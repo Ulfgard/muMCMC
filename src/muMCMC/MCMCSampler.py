@@ -20,18 +20,18 @@ class MCMCSampler(ABC):
     Operator interface (abstract): ``init(q)`` returns the initial state,
     ``step(s)`` performs one transition, ``end_warmup()`` switches from warmup
     to sampling. ``run_mcmc`` is the batched driver that composes them and
-    returns constrained-space samples. Optional hooks ``logging`` (per-step
+    returns samples on the variables. Optional hooks ``logging`` (per-step
     progress-bar stats) and ``diagnostics`` (post-run per-chain summaries)
     default to ``{}``.
 
     Parameters
     ----------
     potential_fn : callable
-        Model potential ``U = -log p`` in constrained coordinates. Signature is
+        Model potential ``U = -log p`` on the variables. Signature is
         method-dependent (see ``evaluate_model``).
     space
-        Parameter space: transforms, free/fixed split, vector<->dict
-        conversions, prior, and prior metric.
+        Parameter space: the prior's normal chart, the free/fixed split, and the
+        vector and dict conversions.
     requires_metric : bool
         Whether the sampler needs a position-dependent metric.
     """
@@ -49,24 +49,25 @@ class MCMCSampler(ABC):
         self.beta = 1.0   # inverse temperature
 
     def evaluate_model(
-        self, z_free: torch.Tensor, beta: Optional[float] = None,
+        self, theta_free: torch.Tensor, beta: Optional[float] = None,
         grad: bool = False,
     ):
-        """``value = beta * U_lik + U_base``, ``U_base = U_prior - log|det dtheta/dz|``.
+        """``value = beta * U_lik + U_base``, ``U_base = -log p(theta)``.
 
-        Posterior evaluation at the unconstrained free vector ``z``. The user's
-        ``potential_fn`` is:
+        Posterior evaluation at the free variable vector ``theta``, which is
+        where the chain runs and where the model is written, so nothing is
+        transformed. The user's ``potential_fn`` is:
 
           requires_metric=False:  potential_fn(theta) -> scalar U_lik
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
-              G_lik a (d_full, d_full) SPD metric in constrained coordinates.
+              G_lik a (d_full, d_full) SPD metric on the same vector.
 
         Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential.
 
         Parameters
         ----------
-        z_free : Tensor
-            Unconstrained free vector.
+        theta_free : Tensor
+            Free variable vector.
         beta : float, optional
             Inverse temperature. Default ``self.beta`` (1.0 = untempered).
         grad : bool
@@ -77,21 +78,19 @@ class MCMCSampler(ABC):
         potential
             ``value = beta * U_lik + U_base``.
         metric
-            ``G_u(beta) = beta * A_lik + A_prior``, likelihood/prior metrics
-            pushed forward to free unconstrained coordinates. ``None`` when
-            ``requires_metric`` is False.
+            ``G(beta) = beta * A_lik + M``, the free block of the likelihood
+            metric plus the prior's own metric on the variables, ``None`` for a
+            space with no prior. ``None`` when ``requires_metric`` is False.
         gradient
-            ``value = ∂U/∂z``. Returned only when ``grad`` is True.
+            ``value = ∂U/∂theta``. Returned only when ``grad`` is True.
         """
         if beta is None:
             beta = self.beta
         if grad:
-            z_free = z_free.detach().requires_grad_(True)
+            theta_free = theta_free.detach().requires_grad_(True)
 
         with torch.enable_grad() if grad else nullcontext():
-            theta_map = self.space.map_to_constrained_vector(z_free)
-            theta_free = theta_map.mapped_point
-            theta_full = self._free_to_full(theta_free)
+            theta_full = self.space.to_full(theta_free)
 
             result = self.potential_fn(theta_full)
             if self.requires_metric:
@@ -99,44 +98,43 @@ class MCMCSampler(ABC):
             else:
                 u_likelihood = result
 
-            U_base = -self.space.prior_log_prob_vector(theta_free) - theta_map.jacobian_log_det
+            U_base = -self.space.prior_log_prob_vector(theta_free)
 
         metric = None
         if self.requires_metric:
-            G_prior = self.space.prior_metric(theta_full)
-            A_lik = self.space.push_forward_metric(G_lik, theta_map)
-            A_prior = None if G_prior is None else self.space.push_forward_metric(G_prior, theta_map)
-            metric = TemperedMetric(A_lik, A_prior, beta)
+            metric = TemperedMetric(self.space.free_block(G_lik),
+                                    self.space.prior_metric(theta_free), beta)
 
         if not grad:
             return TemperedAffine(u_likelihood, U_base, beta), metric
 
         def grad_of(out):
-            # guard backward: U_base has no grad with no prior and
-            # volume-preserving transform
+            # guard backward: U_base has no grad for a space with no prior
             if not out.requires_grad:
-                return torch.zeros_like(z_free)
-            g, = torch.autograd.grad(out.sum(), z_free, retain_graph=True,
+                return torch.zeros_like(theta_free)
+            g, = torch.autograd.grad(out.sum(), theta_free, retain_graph=True,
                                      allow_unused=True)
-            return torch.zeros_like(z_free) if g is None else g
+            return torch.zeros_like(theta_free) if g is None else g
 
         gradient = TemperedAffine(grad_of(u_likelihood).detach(),
                                   grad_of(U_base).detach(), beta)
         potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
 
-    def _free_to_full(self, theta_free: torch.Tensor) -> torch.Tensor:
-        """Free constrained vector -> full constrained vector (with fixed)."""
-        return self.space.to_vector(
-            self.space.add_fixed(self.space.from_vector(theta_free))
-        )
+    def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """The chain's position at the free variables ``theta_free``. The chain
+        runs on the variables, so this is the identity. A sampler running in
+        other coordinates overrides it together with :meth:`to_variables`."""
+        return theta_free
 
-    def _init_z_free(self, initial_params: torch.Tensor) -> torch.Tensor:
-        """Full or free constrained vector -> unconstrained free vector."""
-        theta_free = self.space.to_free_vector(
-            self.space.from_vector(initial_params)
-        )
-        return self.space.map_to_unconstrained_vector(theta_free).mapped_point
+    def to_variables(self, q_free: torch.Tensor) -> torch.Tensor:
+        """The free variables at the chain's position ``q_free``, the inverse of
+        :meth:`to_position`."""
+        return q_free
+
+    def _init_position(self, initial_params: dict) -> torch.Tensor:
+        """Starting point keyed by name to the chain's starting position."""
+        return self.to_position(self.space.to_free_vector(initial_params))
 
     def logging(self) -> dict:
         """Per-step statistics for the progress bar, as a dict of short
@@ -152,9 +150,9 @@ class MCMCSampler(ABC):
     # ---- operator interface (composed by the batched run_mcmc) -------------- #
 
     @abstractmethod
-    def init(self, z_free: torch.Tensor):
-        """Return the initial batched chain state at the unconstrained free
-        positions ``z_free`` (shape ``(num_chains, d)``)."""
+    def init(self, q_free: torch.Tensor):
+        """Return the initial batched chain state at the positions ``q_free``
+        (shape ``(num_chains, d)``)."""
         ...
 
     @abstractmethod
@@ -169,7 +167,7 @@ class MCMCSampler(ABC):
 
     def run_mcmc(
         self,
-        initial_params: torch.Tensor,
+        initial_params: dict,
         num_samples: int,
         num_warmup_steps: int,
         *,
@@ -177,7 +175,7 @@ class MCMCSampler(ABC):
         disable_progbar: bool = False,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """Run MCMC via the batched driver and return constrained samples.
+        """Run MCMC via the batched driver and return samples on the variables.
 
         Holds all ``num_chains`` chains in one batched state: ``init``, then
         repeated ``step``, then ``end_warmup`` once warmup is done. Extra
@@ -185,8 +183,9 @@ class MCMCSampler(ABC):
 
         Parameters
         ----------
-        initial_params : Tensor
-            Full or free constrained flat vector.
+        initial_params : dict[str, Tensor]
+            Starting point keyed by name, in the form a run returns. Fixed names
+            are ignored.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -199,15 +198,15 @@ class MCMCSampler(ABC):
         Returns
         -------
         dict[str, Tensor]
-            Constrained-space samples, keyed by free parameter name, grouped by
+            Samples on the variables, keyed by free parameter name, grouped by
             chain (shape ``(num_chains, num_samples, ...)``).
         """
-        # constrained point -> unconstrained free vector, batched over chains
-        z_free_init = self._init_z_free(initial_params)
-        if z_free_init.dim() == 1:
-            z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
+        # variable point -> the chain's starting position, over chains
+        q_init = self._init_position(initial_params)
+        if q_init.dim() == 1:
+            q_init = q_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
-        s = self.init(z_free_init)
+        s = self.init(q_init)
         collected = []
         total = num_warmup_steps + num_samples
 
@@ -231,9 +230,9 @@ class MCMCSampler(ABC):
                 bar.update()
 
         # (num_samples, K, d) -> (K, num_samples, d) to match group_by_chain.
-        samples_unc = torch.stack(collected, dim=0).transpose(0, 1)
-        theta_free_all = self.space.map_to_constrained_vector(samples_unc).mapped_point
-        return self.space.add_fixed(self.space.from_vector(theta_free_all))
+        positions = torch.stack(collected, dim=0).transpose(0, 1)
+        theta_free_all = self.to_variables(positions)
+        return self.space.add_fixed(self.space.from_free_vector(theta_free_all))
 
 
 class PyroSampler(MCMCSampler):
@@ -258,7 +257,7 @@ class PyroSampler(MCMCSampler):
         "interface (init/step/end_warmup) is not used."
     )
 
-    def init(self, z_free: torch.Tensor):
+    def init(self, q_free: torch.Tensor):
         raise NotImplementedError(self._NO_BATCHED_IFACE)
 
     def step(self, state):
@@ -302,7 +301,7 @@ class PyroSampler(MCMCSampler):
 
     def run_mcmc(
         self,
-        initial_params: torch.Tensor,
+        initial_params: dict,
         num_samples: int,
         num_warmup_steps: int,
         *,
@@ -311,12 +310,14 @@ class PyroSampler(MCMCSampler):
         disable_progbar: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Run MCMC through Pyro's ``MCMC`` driver and return constrained samples.
+        Run MCMC through Pyro's ``MCMC`` driver and return samples on the
+        variables.
 
         Parameters
         ----------
         initial_params : Tensor
-            Full constrained flat vector (including fixed parameters).
+            Starting point keyed by name, in the form a run returns. Fixed
+            names are ignored.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -331,21 +332,21 @@ class PyroSampler(MCMCSampler):
         Returns
         -------
         dict[str, Tensor]
-            Samples in constrained space, keyed by free parameter name,
-            grouped by chain.
+            Samples on the variables, keyed by free parameter name, grouped by
+            chain.
         """
         pyro.clear_param_store()
 
-        # transform constrained point to unconstrained parameters
-        z_free_init = self._init_z_free(initial_params)
+        # variable point -> the chain's starting position
+        q_init = self._init_position(initial_params)
         # Pyro expects initial_params of shape (num_chains, d) for num_chains > 1.
         # replicate the single anchor across chains.
-        if num_chains > 1 and z_free_init.dim() == 1:
-            z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
+        if num_chains > 1 and q_init.dim() == 1:
+            q_init = q_init.unsqueeze(0).expand(num_chains, -1).contiguous()
 
         mcmc = MCMC(
             self.kernel,
-            initial_params={"params": z_free_init},
+            initial_params={"params": q_init},
             num_samples=num_samples,
             warmup_steps=num_warmup_steps,
             num_chains=num_chains,
@@ -356,7 +357,7 @@ class PyroSampler(MCMCSampler):
         # stash MCMC object for per-chain diagnostics via self.mcmc.diagnostics()
         self.mcmc = mcmc
 
-        # Transform back to constrained space.
-        samples_unc = mcmc.get_samples(group_by_chain=True)["params"]
-        theta_free_all = self.space.map_to_constrained_vector(samples_unc).mapped_point
-        return self.space.add_fixed(self.space.from_vector(theta_free_all))
+        # Read the draws back on the variables.
+        theta_free_all = self.to_variables(
+            mcmc.get_samples(group_by_chain=True)["params"])
+        return self.space.add_fixed(self.space.from_free_vector(theta_free_all))

@@ -8,7 +8,7 @@ energy error shrinks with the step size.
 import torch
 from pyro.distributions import Normal
 
-from muMCMC import HMC, UnconstrainedSpace
+from muMCMC import HMC, NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -18,7 +18,7 @@ SIGMA2 = 1.0
 
 
 def _space():
-    return UnconstrainedSpace(NAMES, priors={n: Normal(0.0, 1.0) for n in NAMES})
+    return NormalSpace(NAMES)
 
 
 def _model(theta):

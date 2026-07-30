@@ -25,7 +25,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import UnconstrainedSpace, UniformBoxSpace, transforms
+from muMCMC.spaces import NormalSpace, LogNormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -78,7 +78,7 @@ def _matvec(M, v):
 def test_potential_adds_prior_on_identity_space():
     # Identity transform (Jacobian log-det = 0): U = U_lik - log prior.
     names = ["a", "b"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names})
+    space = NormalSpace(names)
     s = _RecordingSampler(space, potential_fn=lambda th: 0.5 * (th ** 2).sum(-1))
 
     z = torch.randn(5, 2)
@@ -89,28 +89,22 @@ def test_potential_adds_prior_on_identity_space():
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
 
 
-def test_potential_subtracts_jacobian_log_det_on_box_space():
-    # Uniform box: the implicit prior is uniform on the box and normalized, so
-    # U = U_lik(theta) - log_prior(theta) - log|det J|, with log_prior the
-    # constant -log(u_i - l_i) summed over free coords. theta passed to
-    # potential_fn must be the *constrained* (box) value.
-    space = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"],
-                            device="cpu")
+def test_potential_is_the_likelihood_plus_the_prior_on_the_variables():
+    # The chain runs on the variables, so U = U_lik(theta) - log_prior(theta)
+    # with nothing transformed and no Jacobian anywhere.
+    space = LogNormalSpace(["x", "y"])
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
-    z = torch.randn(6, 2)
-    theta_map = space.map_to_constrained_vector(z)
-    theta = theta_map.mapped_point
-    prior_lp = space.prior_log_prob_vector(theta)
-    expected = theta.sum(-1) - prior_lp - theta_map.jacobian_log_det
-    assert torch.allclose(s.evaluate_model(z)[0].value, expected, atol=ATOL)
+    theta = torch.rand(6, 2) + 0.5
+    expected = theta.sum(-1) - space.prior_log_prob_vector(theta)
+    assert torch.allclose(s.evaluate_model(theta)[0].value, expected, atol=ATOL)
 
 
 def test_potential_splices_fixed_coordinate_and_skips_its_prior():
     # c is fixed at 2.0: potential_fn sees the full vector (so its sum includes
     # the +2.0), while the prior sums over the free names a, b only.
     names = ["a", "b", "c"]
-    space = UnconstrainedSpace(names, priors={n: Normal(0.0, 1.0) for n in names},
+    space = NormalSpace(names,
                                fixed={"c": 2.0})
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
@@ -123,7 +117,7 @@ def test_potential_splices_fixed_coordinate_and_skips_its_prior():
 
 def test_potential_fn_receives_full_width_vector_with_fixed():
     names = ["a", "b", "c"]
-    space = UnconstrainedSpace(names, fixed={"c": 2.0})
+    space = UnnormalizedSpace(names, fixed={"c": 2.0})
     seen = {}
 
     def potential_fn(theta_full):
@@ -148,7 +142,7 @@ def _metric_model(scale):
 
 def test_metric_branch_returns_pulled_back_likelihood_metric():
     # No prior metric, identity transform: the pulled-back metric is just G_lik.
-    space = UnconstrainedSpace(["a", "b"])        # no priors, no prior metric
+    space = UnnormalizedSpace(["a", "b"])        # no priors, no prior metric
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
     z = torch.randn(4, 2)
@@ -160,60 +154,54 @@ def test_metric_branch_returns_pulled_back_likelihood_metric():
 
 
 def test_metric_branch_adds_prior_metric():
-    # G_full = G_lik + G_prior = (2 + 3) I, so G^{-1} v == v / 5.
-    def prior_metric_fn(theta_full):
-        n = theta_full.shape[-1]
-        return 3.0 * torch.eye(n, dtype=theta_full.dtype).expand(
-            *theta_full.shape[:-1], n, n)
-
-    space = UnconstrainedSpace(["a", "b"], prior_metric_fn=prior_metric_fn)
+    # A Normal(0, s) prior has precision 1/s^2 on the variables, so with a
+    # likelihood metric of 2 I the total is (2 + 1/4) I.
+    space = NormalSpace(["a", "b"], sigma=2.0)
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
-    z = torch.randn(4, 2)
-    _, metric = s.evaluate_model(z)
+    theta = torch.randn(4, 2)
+    _, metric = s.evaluate_model(theta)
     v = torch.randn(4, 2)
-    assert torch.allclose(metric.inv_metric_times_vec(v), v / 5.0, atol=ATOL)
+    assert torch.allclose(metric.inv_metric_times_vec(v), v / 2.25, atol=ATOL)
 
 
 # ========================================================================== #
 #  vector <-> coordinate helpers                                             #
 # ========================================================================== #
 
-def test_free_to_full_splices_fixed():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 2.0})
+def test_to_full_splices_fixed():
+    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 2.0})
     s = _RecordingSampler(space)
     theta_free = torch.randn(5, 2)
-    full = s._free_to_full(theta_free)
+    full = space.to_full(theta_free)
     assert full.shape == (5, 3)
     assert torch.allclose(full[..., 0], theta_free[..., 0], atol=ATOL)
     assert torch.allclose(full[..., 1], theta_free[..., 1], atol=ATOL)
     assert torch.allclose(full[..., 2], torch.full((5,), 2.0), atol=ATOL)
 
 
-def test_init_z_free_identity_space_is_passthrough():
-    space = UnconstrainedSpace(["a", "b"])
-    s = _RecordingSampler(space)
-    theta = torch.randn(2)
-    assert torch.allclose(s._init_z_free(theta), theta, atol=ATOL)
+def test_init_position_is_the_variables_themselves():
+    # The chain runs on the variables, so the starting position is the caller's
+    # point stacked in free-name order, with no map applied.
+    s = _RecordingSampler(LogNormalSpace(["x", "y"]))
+    point = {"x": torch.tensor(0.3), "y": torch.tensor(2.0)}
+    assert torch.allclose(s._init_position(point),
+                          torch.tensor([0.3, 2.0]), atol=ATOL)
 
 
-def test_init_z_free_box_space_unconstrains():
-    space = UniformBoxSpace({"x": (-1.0, 1.0), "y": (0.0, 4.0)}, ["x", "y"],
-                            device="cpu")
-    s = _RecordingSampler(space)
-    theta = torch.tensor([0.3, 2.0])
-    z = s._init_z_free(theta)
-    expected = transforms.box_inv(theta, space.l, space.u).mapped_point
-    assert torch.allclose(z, expected, atol=ATOL)
+def test_init_position_drops_fixed_names():
+    s = _RecordingSampler(UnnormalizedSpace(["a", "b", "c"], fixed={"c": 9.0}))
+    point = {"a": torch.tensor(1.0), "b": torch.tensor(2.0),
+             "c": torch.tensor(9.0)}
+    q = s._init_position(point)
+    assert q.shape == (2,)                         # only free a, b
+    assert torch.allclose(q, torch.tensor([1.0, 2.0]), atol=ATOL)
 
 
-def test_init_z_free_drops_fixed_coordinates():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 9.0})
-    s = _RecordingSampler(space)
-    theta_full = torch.tensor([1.0, 2.0, 9.0])
-    z = s._init_z_free(theta_full)
-    assert z.shape == (2,)                        # only free a, b
-    assert torch.allclose(z, torch.tensor([1.0, 2.0]), atol=ATOL)
+def test_init_position_rejects_a_missing_name():
+    s = _RecordingSampler(UnnormalizedSpace(["a", "b"]))
+    with pytest.raises(ValueError, match="missing"):
+        s._init_position({"a": torch.tensor(1.0)})
 
 
 # ========================================================================== #
@@ -221,9 +209,9 @@ def test_init_z_free_drops_fixed_coordinates():
 # ========================================================================== #
 
 def test_driver_calls_and_warmup_boundary():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=5, num_warmup_steps=3,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=5, num_warmup_steps=3,
                      num_chains=4, disable_progbar=True)
     assert s.calls["init"] == 1
     assert s.calls["step"] == 3 + 5              # warmup + sampling
@@ -237,10 +225,10 @@ def test_driver_collects_only_post_warmup_states_in_order():
     # step adds delta=1 each call from q0=0, so the j-th collected sample is
     # (num_warmup + 1 + j): a deterministic check of "collect post-warmup,
     # grouped (chain, sample)" plus the identity map-back.
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space, delta=1.0)
     W, S = 4, 6
-    out = s.run_mcmc(torch.zeros(2), num_samples=S, num_warmup_steps=W,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=S, num_warmup_steps=W,
                      num_chains=2, disable_progbar=True)
     expected_row = torch.arange(W + 1, W + S + 1, dtype=torch.get_default_dtype())
     assert torch.allclose(out["a"][0], expected_row, atol=ATOL)
@@ -248,9 +236,9 @@ def test_driver_collects_only_post_warmup_states_in_order():
 
 
 def test_driver_zero_warmup_is_clean():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=0,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=0,
                      num_chains=3, disable_progbar=True)
     assert s.calls["step"] == 4
     assert s.calls["end_warmup"] == 1
@@ -259,17 +247,17 @@ def test_driver_zero_warmup_is_clean():
 
 
 def test_driver_default_single_chain_shape():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=4, num_warmup_steps=2,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=2,
                      disable_progbar=True)
     assert out["a"].shape == (1, 4)
 
 
 def test_driver_splices_fixed_into_output():
-    space = UnconstrainedSpace(["a", "b", "c"], fixed={"c": 7.0})
+    space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 7.0})
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(3), num_samples=4, num_warmup_steps=2,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=4, num_warmup_steps=2,
                      num_chains=2, disable_progbar=True)
     assert set(out) == {"a", "b", "c"}
     assert torch.allclose(out["c"], torch.full((2, 4), 7.0), atol=ATOL)
@@ -277,9 +265,9 @@ def test_driver_splices_fixed_into_output():
 
 def test_driver_accepts_and_ignores_extra_kwargs():
     # The Pyro path takes mp_context; the base driver must tolerate it.
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
-    out = s.run_mcmc(torch.zeros(2), num_samples=3, num_warmup_steps=1,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=3, num_warmup_steps=1,
                      num_chains=2, disable_progbar=True, mp_context="spawn")
     assert out["a"].shape == (2, 3)
 
@@ -289,7 +277,7 @@ def test_driver_accepts_and_ignores_extra_kwargs():
 # ========================================================================== #
 
 def test_logging_and_diagnostics_default_empty():
-    space = UnconstrainedSpace(["a", "b"])
+    space = UnnormalizedSpace(["a", "b"])
     s = _RecordingSampler(space)
     assert s.logging() == {}
     assert s.diagnostics() == {}

@@ -9,7 +9,7 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import HMC, PT, UnconstrainedSpace
+from muMCMC import HMC, PT, NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -25,7 +25,7 @@ POST_STD = (SIGMA2 / (SIGMA2 + 1.0)) ** 0.5     # ~0.7071
 
 
 def _space():
-    return UnconstrainedSpace(NAMES, priors={n: Normal(0.0, 1.0) for n in NAMES})
+    return NormalSpace(NAMES)
 
 
 def _model(theta):
@@ -35,7 +35,7 @@ def _model(theta):
 def test_hmc_recovers_known_gaussian():
     torch.manual_seed(0)
     s = HMC(_model, _space(), step_size=0.2, num_steps=5)
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=500,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=500,
                      num_chains=6, disable_progbar=True)
     for i, n in enumerate(NAMES):
         x = out[n]
@@ -48,7 +48,7 @@ def test_hmc_dense_mass_matrix_recovers_gaussian():
     torch.manual_seed(0)
     s = HMC(_model, _space(), step_size=0.2, num_steps=5,
             mass_matrix=torch.tensor([[2.0, 0.3], [0.3, 0.5]]))
-    out = s.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=500,
+    out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=500,
                      num_chains=6, disable_progbar=True)
     for i, n in enumerate(NAMES):
         x = out[n]
@@ -60,14 +60,14 @@ def test_hmc_mass_matrix_shape_validated():
     # A wrong-shaped user mass matrix is caught in init (d = 2 here).
     s = HMC(_model, _space(), mass_matrix=torch.eye(3))
     with pytest.raises(ValueError):
-        s.run_mcmc(torch.zeros(2), num_samples=1, num_warmup_steps=0,
+        s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=1, num_warmup_steps=0,
                    num_chains=1, disable_progbar=True)
 
 
 def test_hmc_common_diagnostics_schema():
     torch.manual_seed(0)
     s = HMC(_model, _space(), step_size=0.25, num_steps=6)
-    s.run_mcmc(torch.zeros(2), num_samples=40, num_warmup_steps=40,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=40, num_warmup_steps=40,
                num_chains=3, disable_progbar=True)
     d = s.diagnostics()
     assert COMMON_KEYS <= set(d)
@@ -79,7 +79,7 @@ def test_hmc_common_diagnostics_schema():
 def test_hmc_warmup_zero_keeps_constructor_step_size():
     torch.manual_seed(0)
     s = HMC(_model, _space(), step_size=0.37, num_steps=4, adapt_step_size=True)
-    s.run_mcmc(torch.zeros(2), num_samples=20, num_warmup_steps=0,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=20, num_warmup_steps=0,
                num_chains=3, disable_progbar=True)
     # adapter never updated -> step_size left at the constructor value.
     assert torch.allclose(s.step_size, torch.full((3,), 0.37))
@@ -91,7 +91,7 @@ def test_hmc_adaptation_moves_toward_target_accept():
     # the post-warmup acceptance lands near the target.
     s = HMC(_model, _space(), step_size=2.0, num_steps=8,
             target_accept_prob=0.7)
-    s.run_mcmc(torch.zeros(2), num_samples=300, num_warmup_steps=400,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=300, num_warmup_steps=400,
                num_chains=4, disable_progbar=True)
     acc = float(s.diagnostics()["accept_rate"].mean())
     assert abs(acc - 0.7) < 0.15
@@ -103,7 +103,7 @@ def test_hmc_under_pt_recovers_gaussian():
     torch.manual_seed(0)
     base = HMC(_model, _space(), step_size=0.2, num_steps=5)
     pt = PT(base, betas=torch.tensor([0.0, 0.25, 0.5, 1.0]))
-    out = pt.run_mcmc(torch.zeros(2), num_samples=500, num_warmup_steps=300,
+    out = pt.run_mcmc({n: torch.tensor(0.0) for n in pt.space.free_names}, num_samples=500, num_warmup_steps=300,
                       num_chains=3, disable_progbar=True)
     for i, n in enumerate(NAMES):
         assert abs(float(out[n].mean()) - float(POST_MEAN[i])) < 0.12
@@ -128,7 +128,7 @@ def test_hmc_divergence_count_is_per_chain():
     # A tiny threshold forces steps to register as divergences.
     s = HMC(_model, _space(), step_size=0.5, num_steps=4,
             adapt_step_size=False, divergence_threshold=1e-6)
-    s.run_mcmc(torch.zeros(2), num_samples=15, num_warmup_steps=5,
+    s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=15, num_warmup_steps=5,
                num_chains=3, disable_progbar=True)
     nd = s.diagnostics()["num_divergences"]
     assert nd.shape == (3,) and nd.dtype == torch.long

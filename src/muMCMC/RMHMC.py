@@ -212,9 +212,9 @@ class RMHMCState:
 #  energy through the build_initial_state / sample_momentum / integrate /     #
 #  acceptance_delta / adapt hooks. All chains run in one batched state.       #
 #                                                                             #
-#  model_fn is specified in constrained space. MCMCSampler adds the           #
-#  prior log-prob and prior metric and pushes the metric forward to free      #
-#  unconstrained coordinates (spaces.push_forward_metric).                    #
+#  model_fn is specified on the variables, which is where the chain runs, so  #
+#  MCMCSampler adds the prior's potential and its metric and takes the free   #
+#  block of the likelihood metric. Nothing is transformed.                    #
 #                                                                             #
 # =========================================================================== #
 
@@ -224,17 +224,17 @@ class RMHMC(HamiltonianSampler):
     q ~ exp(−U(q)) under the position-dependent metric G(q) with Hamiltonian
     H(q, p) = U(q) + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
 
-    Runs in unconstrained space. The model is specified in constrained space
-    and pulled back by :meth:`MCMCSampler.evaluate_model`.
+    Runs in the space's normal chart. The model is specified on the variables
+    and read there by :meth:`MCMCSampler.evaluate_model`.
 
     Parameters
     ----------
     model_fn : callable
-        ``model_fn(theta_full) -> (U_lik, G_lik)``: full constrained vector
-        to scalar likelihood potential ``-log p(data | theta)`` and
-        (d_full, d_full) SPD likelihood metric in constrained coordinates.
+        ``model_fn(theta_full) -> (U_lik, G_lik)``: full variable vector to
+        scalar likelihood potential ``-log p(data | theta)`` and (d_full,
+        d_full) SPD likelihood metric on the same vector.
     space
-        Parameter space object (priors, transform, free/fixed split).
+        Parameter space: the prior's normal chart and the free/fixed split.
     step_size : float
         Integration step size. Adapted during warmup when adapting.
     num_steps : int

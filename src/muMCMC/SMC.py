@@ -154,7 +154,7 @@ class SMC:
         """
         Transport ``num_chains`` independent populations of ``num_particles`` each
         from the prior to the posterior (beta = 1). Returns the final populations
-        in constrained space, keyed by parameter name, each ``(num_chains,
+        on the variables, keyed by parameter name, each ``(num_chains,
         num_particles)``. Schedule, ESS, evidence, and R-hat are available via
         :meth:`diagnostics`.
 
@@ -170,21 +170,20 @@ class SMC:
         sampler, space = self.sampler, self.space
         C, M, N = num_chains, num_particles, num_chains * num_particles
 
-        # initial populations ~ prior, in unconstrained free coordinates
-        theta0 = space.to_vector(space.sample(N))                 # (N, d_full)
-        z = sampler._init_z_free(theta0)                          # (N, d)
-        d = z.shape[-1]
+        # initial populations ~ prior
+        q = sampler._init_position(space.sample(N))               # (N, d)
+        d = q.shape[-1]
 
-        beta = torch.zeros(C, dtype=z.dtype, device=z.device)     # per-chain
+        beta = torch.zeros(C, dtype=q.dtype, device=q.device)     # per-chain
         self._betas = [beta.clone()]
         self._ess = []
         self._accept = []
-        self._log_evidence = torch.zeros(C, dtype=z.dtype, device=z.device)
+        self._log_evidence = torch.zeros(C, dtype=q.dtype, device=q.device)
 
         # Evaluate the prior population once. The kernel state carries U_lik,
         # so reweighting reads it (grad-free) instead of recomputing.
         sampler.beta = beta.unsqueeze(-1).expand(C, M).reshape(N)
-        s = sampler.init(z)
+        s = sampler.init(q)
 
         bar_format = "{l_bar}{bar}| {n:.3f}/{total:.3f} [{elapsed}{postfix}]"
         with tqdm(total=1.0, file=sys.stderr, disable=disable_progbar,
@@ -201,13 +200,13 @@ class SMC:
                 W = torch.softmax(log_w, dim=-1)                  # (C, M)
                 ess = 1.0 / (W * W).sum(dim=-1)                   # (C,)
                 idx = _systematic_resample(W)                     # (C, M)
-                z = s.q.reshape(C, M, d).gather(
+                q = s.q.reshape(C, M, d).gather(
                     1, idx.unsqueeze(-1).expand(C, M, d)).reshape(N, d)
                 beta = beta + dbeta
 
                 # mutate: fixed kernel at each chain's temperature, adaptation frozen
                 sampler.beta = beta.unsqueeze(-1).expand(C, M).reshape(N)
-                s = sampler.init(z)
+                s = sampler.init(q)
                 sampler.end_warmup()
                 for _ in range(self.num_mcmc_steps):
                     s = sampler.step(s)
@@ -224,10 +223,8 @@ class SMC:
                                 refresh=False)
 
         sampler.beta = 1.0                                        # restore kernel default
-        z = s.q                                                   # final mutated population
-
-        theta_free = space.map_to_constrained_vector(z).mapped_point
-        free = space.from_vector(theta_free)
+        theta_free = sampler.to_variables(s.q)                    # final population
+        free = space.from_free_vector(theta_free)
         if C >= 2:
             self._r_hat = {name: _rhat(v.reshape(C, M)) for name, v in free.items()}
         return {k: v.reshape(C, M) for k, v in space.add_fixed(free).items()}

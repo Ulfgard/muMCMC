@@ -42,14 +42,14 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
  
 class NUTS(PyroSampler):
     """
-    No-U-Turn Sampler with automatic constrained-space reparameterization.
+    No-U-Turn Sampler running in the space's normal chart.
 
-    Wraps Pyro's NUTS kernel with the transformed potential.
+    Wraps Pyro's NUTS kernel with the potential ``MCMCSampler`` assembles.
 
     Parameters
     ----------
     potential_fn : callable
-        Likelihood-only potential over a vector in coordinates defined by space.
+        Likelihood-only potential on the full variable vector.
     space
         Parameter space object.
     adapt_step_size, adapt_mass_matrix, full_mass, target_accept_prob,
