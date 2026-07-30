@@ -143,9 +143,9 @@ having no test at all.
 
 Documentation competes with the code for the reader's attention, so its size is
 part of the design. A useful check is the ratio of documentation lines to code
-lines, per file. Across this library the ordinary range is 0.9 to 1.5 to 1. A
-file well outside it is making a claim about being unusually subtle, and that
-claim is usually wrong.
+lines, per file. It is a ceiling, not a target: most files here sit between 0.5
+and 1.5 to 1, and a low ratio is not a defect. Much above 1.5 is a file claiming
+to be unusually subtle, and that claim is usually wrong.
 
 The same applies to a design note. Two hundred lines of note above two hundred
 lines of code means the note is arguing rather than stating. Keep the

@@ -154,9 +154,9 @@ class HamiltonianSampler(MCMCSampler):
         adapting, updates the step size. Returns the chosen state."""
         delta_raw = self.acceptance_delta(new, old)             # (N,)
 
-        # Divergence: non-finite or |delta_H| over threshold (a non-finite
-        # delta also carries a failed-proposal signal, e.g. RMHMC's unconverged
-        # solve). The clamp below is Metropolis-ratio safety only.
+        # Divergence: non-finite or |delta_H| over threshold. A subclass also
+        # uses non-finite to signal a proposal it could not build at all. The
+        # clamp below is Metropolis-ratio safety only.
         is_divergent = (~torch.isfinite(delta_raw)) \
             | (delta_raw.abs() > self._divergence_threshold)
         delta = torch.where(torch.isfinite(delta_raw), delta_raw,

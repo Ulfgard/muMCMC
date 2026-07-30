@@ -4,25 +4,26 @@ import torch
 
 # =========================================================================== #
 #                                                                             #
-#  Batched root finding for r(z) = 0, one problem per row of z                 #
+#  Batched root finding for r(z) = 0, one problem per row of z                #
 #                                                                             #
-#  Internal. A caller picks the update rule by name and the solver builds it,  #
+#  Internal. A caller picks the update rule by name and the solver builds it, #
 #  so nothing here is part of the package surface.                            #
 #                                                                             #
-#  A rule reporting needs_jacobian expects residual_fn(z) -> (r, J), with r    #
-#  shaped (N, d) and J shaped (N, d, d). The others expect residual_fn(z) -> r #
-#  so the contract follows from the rule rather than from a flag on the call.  #
-#  Either way only the root matters, and the result comes back detached.       #
+#  A rule reporting needs_jacobian expects residual_fn(z) -> (r, J), with r   #
+#  shaped (N, d) and J shaped (N, d, d). The others expect residual_fn(z) ->  #
+#  r so the contract follows from the rule rather than from a flag on the     #
+#  call. Either way only the root matters, and the result comes back          #
+#  detached.                                                                  #
 #                                                                             #
 #      picard     z_{k+1} = z_k − β P r_k                                     #
 #      anderson   Picard plus Type-II Anderson acceleration                   #
 #      newton     z_{k+1} = z_k − β J(z_k)⁻¹ r_k                              #
 #                                                                             #
-#  β ∈ (0, 1] under-relaxes every rule without moving the root, so a fallback  #
-#  ladder can re-solve a stuck row rather than reject it. P preconditions the  #
-#  residual, and is meaningless for newton, whose solve is already exact. J is #
-#  not assumed symmetric, and a singular one gives non-finite entries rather   #
-#  than raising, which the divergence test catches for that row alone.         #
+#  β ∈ (0, 1] under-relaxes every rule without moving the root, so a fallback #
+#  ladder can re-solve a stuck row rather than reject it. P preconditions the #
+#  residual, and is meaningless for newton, whose solve is already exact. J   #
+#  is not assumed symmetric, and a singular one gives non-finite entries      #
+#  rather than raising, which the divergence test catches for that row alone. #
 #                                                                             #
 # =========================================================================== #
 

@@ -212,32 +212,15 @@ def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
                        chol_G, rhs, q_init, solver):
     """Solve the RATTLE position equation for the step endpoint q1,
 
-        F(q1) = A_prior (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − rhs = 0,
+        F(q1) = A_prior (q1 - q0) - beta W0^T(psi(q1) - psi0) - rhs = 0,
 
-    preconditioned by G_M(q0) = A_prior + β W0ᵀW0.
+    preconditioned by G_M(q0) = A_prior + beta W0^T W0, whose Cholesky factor is
+    ``chol_G``. ``q, psi, W`` are the q0 quantities and ``rhs`` is
+    ``h p0 - (h^2/2) grad V(q0)``. Returns a SolveResult.
 
-    Parameters
-    ----------
-    constraint : ChartConstraint
-        Supplies ψ, and W too when the solver wants a Jacobian.
-    q, psi, W : (N, n), (N, m), (N, m, n)
-        The q0 position and its inverse map and tangent data.
-    A_prior : (n, n)
-        Constant prior block of the metric.
-    beta_col, beta_mat : broadcastable β
-        Shaped for an ``(N, n)`` vector and an ``(N, n, n)`` matrix.
-    chol_G : (N, n, n)
-        Cholesky factor of G_M(q0), the frozen-Jacobian preconditioner.
-    rhs : (N, n)
-        ``h p0 − (h²/2) ∇V(q0)``.
-    q_init : (N, n)
-        Warm start.
-    solver : FixedPointSolver
-        Whose ``needs_jacobian`` picks the residual contract below.
-
-    Returns
-    -------
-    SolveResult
+    The solver's ``needs_jacobian`` picks which residual it gets: the value alone,
+    or the value with DF(q1) = A_prior + beta W0^T W(q1), which costs a tangent
+    pass per iteration.
     """
     Wt = W.transpose(-2, -1)                               # (N, n, m)
 
