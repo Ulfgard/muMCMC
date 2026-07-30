@@ -9,149 +9,151 @@ from .spaces import TemperedAffine, TemperedMetric, broadcast_beta
 from .RMHMC import _PicardUpdate, _AndersonUpdate, _hamiltonian, _fixed_point_solve
 
 # =========================================================================== #
-#                                                                              #
-#  ChartRATTLE: constrained HMC for hierarchical posteriors                    #
-#                                                                              #
-#  q is the library's name for the sampled position. Here it is the            #
-#  hyperparameter (q = θ), which doubles as the chart coordinate of the         #
-#  manifold below. ε is the inner latent and x the observation.                #
-#                                                                              #
-#  Latent (q, ε) ~ N(0, I_{n+m}) and a diffeomorphism φ_q with                 #
-#                                                                              #
-#      φ_q(ε) = x,      θ = q,                                                 #
-#                                                                              #
-#  the non-centered reparameterization of x | q. Conditioning on the data x     #
-#  is the constraint g(q, ε) = φ_q(ε) − x = 0 defining the manifold            #
-#                                                                              #
-#      M = { (q, ε) : φ_q(ε) = x },                                            #
-#                                                                              #
-#  whose q-marginal, sampled as a constrained chain, is p(θ | x).              #
-#                                                                              #
+#                                                                             #
+#  ChartRATTLE: constrained HMC for hierarchical posteriors                   #
+#                                                                             #
+#  q is the library's name for the sampled position. Here it is the           #
+#  hyperparameter (q = θ), which doubles as the chart coordinate of the       #
+#  manifold below. ε is the inner latent and x the observation.               #
+#                                                                             #
+#  Latent (q, ε) ~ N(0, I_{n+m}) and a diffeomorphism φ_q with                #
+#                                                                             #
+#      φ_q(ε) = x,      θ = q,                                                #
+#                                                                             #
+#  the non-centered reparameterization of x | q. Conditioning on the data x   #
+#  is the constraint g(q, ε) = φ_q(ε) − x = 0 defining the manifold           #
+#                                                                             #
+#      M = { (q, ε) : φ_q(ε) = x },                                           #
+#                                                                             #
+#  whose q-marginal, sampled as a constrained chain, is p(θ | x).             #
+#                                                                             #
 # =========================================================================== #
-#                                                                              #
-#  Jacobians of the layer, at the point (q, ψ(q)) on M                         #
-#                                                                              #
-#      A = ∂φ_q/∂q     (m, n)        B = ∂_ε φ_q     (m, m), invertible        #
-#                                                                              #
-#  ψ(q) = φ_q⁻¹(x) solves φ_q(ψ(q)) = x, so A + B ∂ψ/∂q = 0 and                #
-#                                                                              #
-#      W = −∂ψ/∂q = B⁻¹A.                                                      #
-#                                                                              #
+#                                                                             #
+#  Jacobians of the layer, at the point (q, ψ(q)) on M                        #
+#                                                                             #
+#      A = ∂φ_q/∂q     (m, n)        B = ∂_ε φ_q     (m, m), invertible       #
+#                                                                             #
+#  ψ(q) = φ_q⁻¹(x) solves φ_q(ψ(q)) = x, so A + B ∂ψ/∂q = 0 and               #
+#                                                                             #
+#      W = −∂ψ/∂q = B⁻¹A.                                                     #
+#                                                                             #
 # =========================================================================== #
-#                                                                              #
-#  Energy                                                                       #
-#                                                                              #
-#  Change of variables gives x | q the density N(ψ(q); 0, I) / |det B(q)|, so   #
-#  against the N(0, I) prior on q the target is e^{−U} with                     #
-#                                                                              #
-#      U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖²,      G_M(q) = I + β Wᵀ W.          #
-#                                                                              #
-#  No co-area factor survives into U, and that is not an omission. In the        #
-#  Hausdorff-measure form the density on M is e^{−½‖(q,ε)‖²}/√(det Λ) with      #
-#  Λ = Dg Dgᵀ, and reading it in the q chart multiplies by the chart Jacobian    #
-#  √(det G_M). The two collapse exactly: with Dg = [A, B] and A = B W,          #
-#                                                                              #
-#      Λ = A Aᵀ + B Bᵀ = B (I + W Wᵀ) Bᵀ,                                      #
-#      det Λ = (det B)² det(I + Wᵀ W) = (det B)² det G_M       (Sylvester)      #
-#                                                                              #
-#  so √(det G_M / det Λ) = 1/|det B|, which is the log|det B| term above. The    #
-#  user supplies log|det B|. The measure bookkeeping is ours.                    #
-#                                                                              #
-#  U is affine in β (lik = ½‖ψ‖², base = ½‖q‖² + log|det B|) and G_M is affine  #
-#  in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as a        #
-#  TemperedAffine and a TemperedMetric. The Hamiltonian                         #
-#                                                                              #
-#      H = U + ½ pᵀ G_M⁻¹ p + ½ log det G_M                                    #
-#                                                                              #
-#  keeps e^{−U} invariant: marginalizing p ~ N(0, G_M(q)) out of e^{−H} cancels  #
-#  ½ log det G_M against the Gaussian normalizer and leaves e^{−U} dq, for any   #
-#  SPD G_M. β enters only through U and G_M, so evaluate_model gives the         #
-#  tempered target at any temperature and a parallel-tempering swap reads the    #
-#  temperature-free U_lik = ½‖ψ‖² off U.lik.                                    #
-#                                                                              #
+#                                                                             #
+#  Energy                                                                     #
+#                                                                             #
+#  Change of variables gives x | q the density N(ψ(q); 0, I) / |det B(q)|, so #
+#  against the N(0, I) prior on q the target is e^{−U} with                   #
+#                                                                             #
+#      U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖²,      G_M(q) = I + β Wᵀ W.         #
+#                                                                             #
+#  No co-area factor survives into U, and that is not an omission. In the     #
+#  Hausdorff-measure form the density on M is e^{−½‖(q,ε)‖²}/√(det Λ) with    #
+#  Λ = Dg Dgᵀ, and reading it in the q chart multiplies by the chart Jacobian #
+#  √(det G_M). The two collapse exactly: with Dg = [A, B] and A = B W,        #
+#                                                                             #
+#      Λ = A Aᵀ + B Bᵀ = B (I + W Wᵀ) Bᵀ,                                     #
+#      det Λ = (det B)² det(I + Wᵀ W) = (det B)² det G_M       (Sylvester)    #
+#                                                                             #
+#  so √(det G_M / det Λ) = 1/|det B|, which is the log|det B| term above. The #
+#  user supplies log|det B|. The measure bookkeeping is ours.                 #
+#                                                                             #
+#  U is affine in β (lik = ½‖ψ‖², base = ½‖q‖² + log|det B|) and G_M is       #
+#  affine in β (A_lik = Wᵀ W, A_prior = I), so evaluate_model returns them as #
+#  a TemperedAffine and a TemperedMetric. The Hamiltonian                     #
+#                                                                             #
+#      H = U + ½ pᵀ G_M⁻¹ p + ½ log det G_M                                   #
+#                                                                             #
+#  keeps e^{−U} invariant: marginalizing p ~ N(0, G_M(q)) out of e^{−H}       #
+#  cancels ½ log det G_M against the Gaussian normalizer and leaves e^{−U}    #
+#  dq, for any SPD G_M. β enters only through U and G_M, so evaluate_model    #
+#  gives the tempered target at any temperature and a parallel-tempering swap #
+#  reads the temperature-free U_lik = ½‖ψ‖² off U.lik.                        #
+#                                                                             #
 # =========================================================================== #
-#                                                                              #
-#  Step  (q0, p0) -> (q1, p1)                                                  #
-#                                                                              #
-#      F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0,       #
-#      DF(q0) = I + β W0ᵀ W0 = G_M(q0),                                        #
-#      q^{k+1} = q^k − G_M(q0)⁻¹ F(q^k),                                       #
-#      p1 = (1/h)[(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),                  #
-#                                                                              #
-#  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), q).     #
-#  Only ψ(q^k) is evaluated in the loop, preconditioned by one Cholesky of      #
-#  G_M(q0) (the metric's own factor).                                           #
-#                                                                              #
-#  Why this is a valid proposal. The step is the variational integrator of the   #
-#  discrete Lagrangian                                                          #
-#                                                                              #
-#      S_h(q0, q1) = ‖q1 − q0‖²/(2h) + β‖ψ1 − ψ0‖²/(2h)                        #
-#                    − (h/2)[V(q0) + V(q1)],                                    #
-#                                                                              #
-#  in the sense that p0 = −∂S_h/∂q0 is the position equation F = 0 and          #
-#  p1 = +∂S_h/∂q1 is the momentum line. Two properties follow for free:         #
-#                                                                              #
-#    * the map is symplectic, hence volume-preserving on (q, p). This is the    #
-#      half of Metropolis exactness that self-adjointness alone leaves open.     #
-#    * S_h(q0, q1) = S_h(q1, q0), so the map is self-adjoint: applied to        #
-#      (q1, −p1) it returns (q0, −p0).                                          #
-#                                                                              #
-#  S_h also explains the pieces. Its kinetic term is the squared ambient chord  #
-#  ‖(q1, ε1) − (q0, ε0)‖² with the ε block scaled by β, and its Hessian as      #
-#  q1 -> q0 is G_M(q0)/h. So the metric is not a free choice but the discrete   #
-#  kinetic form, and the W0 / W1 asymmetry between the two equations is forced  #
-#  (differentiate at the left endpoint, then at the right).                     #
-#                                                                              #
-#  Both properties hold up to the position solve. Where F has several roots the  #
-#  forward and reverse solves can pick different ones, and self-adjointness      #
-#  holds only up to that. The roots merge as h shrinks, so it is a large-step    #
-#  effect.                                                                      #
-#                                                                              #
-#  A failed solve is rejected with +inf energy, but no reverse-projection check  #
-#  is run, and that is a deliberate trade rather than an omission. Discarding a  #
-#  step whose reverse solve lands elsewhere buys back exact reversibility at the #
-#  cost of irreducibility: the discarded set is a hard barrier, and the steps in #
-#  it are exactly the ones crossing a region of strong nonlinearity. Under a     #
-#  metric that already encodes that nonlinearity, those are the steps the        #
-#  method exists to take. The checked variant is π-reversible but can be         #
-#  reducible, and its failure is silent: acceptance stays high while a whole     #
-#  basin goes unvisited. Unchecked, the error is instead bounded, visible in the  #
-#  energy and residual diagnostics, and shrinks with h. Ergodicity is the        #
-#  property worth testing here, not reversibility.                              #
-#                                                                              #
+#                                                                             #
+#  Step  (q0, p0) -> (q1, p1)                                                 #
+#                                                                             #
+#      F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0,      #
+#      DF(q0) = I + β W0ᵀ W0 = G_M(q0),                                       #
+#      q^{k+1} = q^k − G_M(q0)⁻¹ F(q^k),                                      #
+#      p1 = (1/h)[(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),                 #
+#                                                                             #
+#  V = U + ½ log det G_M, so the force ∇V is one autograd.grad(V.sum(), q).   #
+#  Only ψ(q^k) is evaluated in the loop, preconditioned by one Cholesky of    #
+#  G_M(q0) (the metric's own factor).                                         #
+#                                                                             #
+#  Why this is a valid proposal. The step is the variational integrator of    #
+#  the discrete Lagrangian                                                    #
+#                                                                             #
+#      S_h(q0, q1) = ‖q1 − q0‖²/(2h) + β‖ψ1 − ψ0‖²/(2h)                       #
+#                    − (h/2)[V(q0) + V(q1)],                                  #
+#                                                                             #
+#  in the sense that p0 = −∂S_h/∂q0 is the position equation F = 0 and        #
+#  p1 = +∂S_h/∂q1 is the momentum line. Two properties follow for free:       #
+#                                                                             #
+#    * the map is symplectic, hence volume-preserving on (q, p). This is the  #
+#      half of Metropolis exactness that self-adjointness alone leaves open.  #
+#    * S_h(q0, q1) = S_h(q1, q0), so the map is self-adjoint: applied to      #
+#      (q1, −p1) it returns (q0, −p0).                                        #
+#                                                                             #
+#  S_h also explains the pieces. Its kinetic term is the squared ambient      #
+#  chord ‖(q1, ε1) − (q0, ε0)‖² with the ε block scaled by β, and its Hessian #
+#  as q1 -> q0 is G_M(q0)/h. So the metric is not a free choice but the       #
+#  discrete kinetic form, and the W0 / W1 asymmetry between the two equations #
+#  is forced (differentiate at the left endpoint, then at the right).         #
+#                                                                             #
+#  Both properties hold up to the position solve. Where F has several roots   #
+#  the forward and reverse solves can pick different ones, and self-          #
+#  adjointness holds only up to that. The roots merge as h shrinks, so it is  #
+#  a large-step effect.                                                       #
+#                                                                             #
+#  A failed solve is rejected with +inf energy, but no reverse-projection     #
+#  check is run, and that is a deliberate trade rather than an omission.      #
+#  Discarding a step whose reverse solve lands elsewhere buys back exact      #
+#  reversibility at the cost of irreducibility: the discarded set is a hard   #
+#  barrier, and the steps in it are exactly the ones crossing a region of     #
+#  strong nonlinearity. Under a metric that already encodes that              #
+#  nonlinearity, those are the steps the method exists to take. The checked   #
+#  variant is π-reversible but can be reducible, and its failure is silent:   #
+#  acceptance stays high while a whole basin goes unvisited. Unchecked, the   #
+#  error is instead bounded, visible in the energy and residual diagnostics,  #
+#  and shrinks with h. Ergodicity is the property worth testing here, not     #
+#  reversibility.                                                             #
+#                                                                             #
 # =========================================================================== #
-#                                                                              #
-#  Constraint interface (untempered)                                           #
-#                                                                              #
-#      psi(q)           -> ψ = φ_q⁻¹(x)         the inverse map                #
-#      log_abs_det_B(q) -> log|det B|           = ½ log det Σ for a scale       #
-#                                                                              #
-#  W = −∂ψ/∂q follows from one reverse pass per latent (classic autograd, no   #
-#  vmap); override psi_with_jvp with explicit Jacobians to skip it. The         #
-#  constraint is temperature-free: β enters only in evaluate_model.            #
-#                                                                              #
+#                                                                             #
+#  Constraint interface (untempered)                                          #
+#                                                                             #
+#      psi(q)           -> ψ = φ_q⁻¹(x)         the inverse map               #
+#      log_abs_det_B(q) -> log|det B|           = ½ log det Σ for a scale     #
+#                                                                             #
+#  W = −∂ψ/∂q follows from one reverse pass per latent (classic autograd, no  #
+#  vmap). Override psi_with_jvp with explicit Jacobians to skip it. The       #
+#  constraint is temperature-free: β enters only in evaluate_model.           #
+#                                                                             #
 # =========================================================================== #
-#                                                                              #
-#  Tempering                                                                   #
-#                                                                              #
-#  β softens the observation in the scale family, Σ -> Σ/β, which scales the    #
-#  data-fit ½‖ψ‖² by β. So β multiplies the likelihood wherever it appears: in  #
-#  the potential U (β·½‖ψ‖²), in the metric G_M = I + β WᵀW, and hence in the    #
-#  position equation F and its Jacobian above. The prior ½‖q‖² and the volume   #
-#  log|det B| stay untempered. That drops the β^{m/2} normalizer the exact       #
-#  scale family carries, deliberately: it keeps U finite as β -> 0, where the    #
-#  scale family itself degenerates. A parallel-tempering swap reads the β-free   #
-#  ½‖ψ‖² off U.lik.                                                             #
-#                                                                              #
-#  What the drop costs. The β = 0 rung is e^{−½‖q‖²}/|det B(q)|, not the prior,  #
-#  and its normalizer Z_0 is not 1. Thermodynamic integration along the ladder    #
-#  therefore yields log p(x) − log Z_0, so PT's ``log_evidence`` is an evidence  #
-#  against an unnormalized reference here rather than an absolute one.           #
-#                                                                              #
+#                                                                             #
+#  Tempering                                                                  #
+#                                                                             #
+#  β softens the observation in the scale family, Σ -> Σ/β, which scales the  #
+#  data-fit ½‖ψ‖² by β. So β multiplies the likelihood wherever it appears:   #
+#  in the potential U (β·½‖ψ‖²), in the metric G_M = I + β WᵀW, and hence in  #
+#  the position equation F and its Jacobian above. The prior ½‖q‖² and the    #
+#  volume log|det B| stay untempered. That drops the β^{m/2} normalizer the   #
+#  exact scale family carries, deliberately: it keeps U finite as β -> 0,     #
+#  where the scale family itself degenerates. A parallel-tempering swap reads #
+#  the β-free ½‖ψ‖² off U.lik.                                                #
+#                                                                             #
+#  What the drop costs. The β = 0 rung is e^{−½‖q‖²}/|det B(q)|, not the      #
+#  prior, and its normalizer Z_0 is not 1. Thermodynamic integration along    #
+#  the ladder therefore yields log p(x) − log Z_0, so PT's ``log_evidence``   #
+#  is an evidence against an unnormalized reference here rather than an       #
+#  absolute one.                                                              #
+#                                                                             #
 # =========================================================================== #
 
 
-# ---- Constraint ---------------------------------------------------------- #
+#  ---- Constraint ---------------------------------------------------------- #
 
 class ChartConstraint:
     """Constraint M = {(q, ε) : φ_q(ε) = x} exposed through the inverse map.
@@ -231,7 +233,7 @@ class LocationScaleChart(ChartConstraint):
         return torch.log(L.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
 
 
-# ---- Position solve ------------------------------------------------------ #
+#  ---- Position solve ------------------------------------------------------ #
 
 def _solve_rattle_step(constraint, q, psi, W, beta_col, chol_G, rhs, q_init,
                        solver, max_iter, tol):
@@ -254,7 +256,7 @@ def _solve_rattle_step(constraint, q, psi, W, beta_col, chol_G, rhs, q_init,
     return _fixed_point_solve(residual_fn, q_init, updater, max_iter, tol)
 
 
-# ---- Chain state --------------------------------------------------------- #
+#  ---- Chain state --------------------------------------------------------- #
 
 class ChartRATTLEState:
     """Working state of one ChartRATTLE trajectory, batched over ``(N,)`` chains.
@@ -269,7 +271,8 @@ class ChartRATTLEState:
         Position (the chart coordinate, ``q`` = θ) and momentum. ``q`` is read
         as the sample.
     U : TemperedAffine
-        Potential; ``U.value`` is the ``(N,)`` energy, ``U.lik`` the swap statistic.
+        Potential. ``U.value`` is the ``(N,)`` energy and ``U.lik`` the swap
+        statistic.
     metric : TemperedMetric
         Chart metric G_M(q).
     psi, W : (N, m), (N, m, n)
@@ -292,7 +295,7 @@ class ChartRATTLEState:
         self.dq = dq
 
     def reorder(self, perm):
-        """Relabel the configuration to a new temperature slot; its potential,
+        """Relabel the configuration to a new temperature slot. Its potential,
         metric, geometry and force are re-evaluated at the next step."""
         return ChartRATTLEState(self.q[perm],
                                 None if self.p is None else self.p[perm])
@@ -311,14 +314,14 @@ class ChartRATTLEState:
 
 
 # =========================================================================== #
-#                                                                              #
-#  ChartRATTLE sampler                                                         #
-#                                                                              #
-#  Runs in the q chart. The N(0, I) top-level prior is baked into U, so the     #
-#  space is the identity UnconstrainedSpace over the θ names and the driver     #
-#  reads the position q off as θ. evaluate_model builds U (TemperedAffine) and   #
-#  G_M (TemperedMetric) from the constraint. integrate performs the step.        #
-#                                                                              #
+#                                                                             #
+#  ChartRATTLE sampler                                                        #
+#                                                                             #
+#  Runs in the q chart. The N(0, I) top-level prior is baked into U, so the   #
+#  space is the identity UnconstrainedSpace over the θ names and the driver   #
+#  reads the position q off as θ. evaluate_model builds U (TemperedAffine)    #
+#  and G_M (TemperedMetric) from the constraint. integrate performs the step. #
+#                                                                             #
 # =========================================================================== #
 
 class ChartRATTLE(HamiltonianSampler):

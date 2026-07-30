@@ -1,11 +1,3 @@
-"""Full-covariance Gaussian mixture: fit, density, sampling, and conditioning.
-
-Fitted to a point cloud by EM (fixed number of components), it serves as the
-BAR reference ``q̂`` and, through :meth:`GaussianMixture.conditional`, supplies
-the proposal ``q(z_b | z_a)`` for marginalization. The conditional of a Gaussian
-mixture is again a mixture, with the same per-component conditional Gaussians and
-component weights reweighted by each component's responsibility for ``z_a``.
-"""
 from __future__ import annotations
 
 from typing import Optional
@@ -13,6 +5,22 @@ from typing import Optional
 import torch
 
 MVN = torch.distributions.MultivariateNormal
+
+# =========================================================================== #
+#                                                                             #
+#  Gaussian mixture as a reference density                                    #
+#                                                                             #
+#  Fitted to a point cloud by EM at a fixed number of components, the mixture #
+#  serves two roles. It is the BAR reference q-hat in evaluation, and through #
+#  GaussianMixture.conditional it supplies the proposal q(z_b | z_a) used for #
+#  marginalization.                                                           #
+#                                                                             #
+#  Conditioning is closed form because the conditional of a Gaussian mixture  #
+#  is again a mixture. The per-component conditional Gaussians are unchanged  #
+#  and the component weights are reweighted by each component's               #
+#  responsibility for z_a.                                                    #
+#                                                                             #
+# =========================================================================== #
 
 
 def _kmeanspp_init(z: torch.Tensor, k: int,

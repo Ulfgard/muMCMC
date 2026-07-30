@@ -1,27 +1,29 @@
-"""Value adapters, vectorised over a leading axis so N independent problems are
-adapted elementwise in parallel.
-
-Each adapter carries a value and exposes the interface a caller drives:
-
-    reset(N, dtype, device)   size the state to ``(N,)`` at the initial value
-    update(signal)            fold one signal, move the estimate
-    finalize()                freeze the estimate
-    get_state() -> (x, x_avg) current value and its running average; after
-                              finalize (or with no adaptation) both are x_avg
-
-They have no notion of what the value means; the caller owns that.
-
-``NoAdaptation`` holds the value fixed.  ``DualAveraging`` moves it toward a
-target via Nesterov dual averaging from a stream of subgradients; it is also a
-standalone convex minimiser.  ``Reinforce`` minimises a Gaussian-smoothed
-objective from noisy evaluations alone, via a score-function estimate driving a
-``DualAveraging``.
-"""
-
-# Nesterov dual averaging (Nesterov, "Primal-dual subgradient methods for
-# convex problems". Hoffman & Gelman, "The No-U-Turn Sampler").
-
 import torch
+
+# =========================================================================== #
+#                                                                             #
+#  Value adapters                                                             #
+#                                                                             #
+#  Every adapter carries one value, vectorised over a leading axis so that N  #
+#  independent problems are adapted elementwise in parallel, and exposes the  #
+#  interface a caller drives:                                                 #
+#                                                                             #
+#      reset(N, dtype, device)   size the state to (N,) at the initial value  #
+#      update(signal)            fold one signal, move the estimate           #
+#      finalize()                freeze the estimate                          #
+#      get_state() -> (x, x_avg) current value and its running average.       #
+#                                After finalize, and with no adaptation at    #
+#                                all, both entries are x_avg                  #
+#                                                                             #
+#  An adapter has no notion of what its value means. The caller owns that, so #
+#  the same three classes serve a step size, a mass scale or a temperature.   #
+#                                                                             #
+#  References                                                                 #
+#                                                                             #
+#  Nesterov, Primal-dual subgradient methods for convex problems.             #
+#  Hoffman and Gelman, The No-U-Turn Sampler.                                 #
+#                                                                             #
+# =========================================================================== #
 
 
 class NoAdaptation:
@@ -54,7 +56,7 @@ class NoAdaptation:
         pass
 
     def get_state(self):
-        """Return ``(value, value)`` -- constant for both entries."""
+        """Return ``(value, value)``, constant in both entries."""
         return self._value, self._value
 
 
@@ -71,8 +73,9 @@ class DualAveraging:
     tensors, updated elementwise.
 
     As an adapter, :meth:`reset` with a batch size seeds ``prox_center`` at
-    ``init`` over ``(N,)``; :meth:`update` folds one subgradient; :meth:`finalize`
-    freezes it, after which :meth:`get_state` reports ``(x_avg, x_avg)``.
+    ``init`` over ``(N,)``, :meth:`update` folds one subgradient, and
+    :meth:`finalize` freezes the estimate, after which :meth:`get_state` reports
+    ``(x_avg, x_avg)``.
 
     Parameters
     ----------
@@ -86,8 +89,8 @@ class DualAveraging:
     gamma : float
         Step scale.  Default 0.05.
     init : float
-        Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role;
-        ignored by the minimiser, which uses ``prox_center``.  Default 0.
+        Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role.
+        Ignored by the minimiser, which uses ``prox_center`` instead. Default 0.
     """
 
     def __init__(self, prox_center=0.0, t0=10, kappa=0.75, gamma=0.05, init=0.0):
@@ -131,8 +134,8 @@ class DualAveraging:
         self._x_avg = (1 - weight_t) * self._x_avg + weight_t * self._x_t
 
     def get_state(self):
-        """Return ``(x_t, x_avg)`` -- the latest primal point and its average,
-        or ``(x_avg, x_avg)`` once frozen."""
+        """Return ``(x_t, x_avg)``, the latest primal point and its average, or
+        ``(x_avg, x_avg)`` once frozen."""
         if self._frozen:
             return self._x_avg, self._x_avg
         return self._x_t, self._x_avg
@@ -167,13 +170,14 @@ class Reinforce:
     ``mu``. ``f_t`` and the state are ``(N,)``, one entry per problem.
 
     As an adapter, :meth:`get_state` reports the perturbed point
-    ``mu + sigma*eps`` (the next value to try) and ``mu``; once frozen it reports
+    ``mu + sigma*eps`` (the next value to try) and ``mu``. Once frozen it reports
     ``(mu, mu)``.
 
     Parameters
     ----------
     n : int or None
-        Number of problems (minimiser use); ``None`` when seeded via :meth:`reset`.
+        Number of problems in the minimiser role, or ``None`` when the batch size
+        is instead seeded through :meth:`reset`.
     sigma : float
         Smoothing radius and gradient-estimate denominator.  Default 0.1.
     ema_decay : float
@@ -181,8 +185,8 @@ class Reinforce:
     gamma : float
         Step scale of the underlying dual averaging.  Default 0.05.
     init : float
-        Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role;
-        ignored by the minimiser, which uses ``prox_center``.  Default 0.
+        Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role.
+        Ignored by the minimiser, which uses ``prox_center`` instead. Default 0.
     """
 
     def __init__(self, n: int = None, sigma: float = 0.1, ema_decay: float = 0.2,
@@ -232,8 +236,8 @@ class Reinforce:
         self._eps = self._draw_eps()
 
     def get_state(self):
-        """Return ``(proposal, mu)`` -- the perturbed point ``x_t + sigma*eps``
-        to evaluate next and the dual-averaged estimate ``x_avg`` -- or
+        """Return ``(proposal, mu)``, the perturbed point ``x_t + sigma*eps`` to
+        evaluate next and the dual-averaged estimate ``x_avg``, or
         ``(x_avg, x_avg)`` once frozen."""
         x_t, x_avg = self._dual.get_state()
         if self._frozen:

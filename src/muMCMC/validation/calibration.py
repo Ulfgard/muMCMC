@@ -1,16 +1,29 @@
-"""Simulation-based calibration across many inference problems (Talts et al. 2018).
+# =========================================================================== #
+#                                                                             #
+#  Simulation-based calibration                                               #
+#                                                                             #
+#  Each object contributes posterior draws and a known truth. The SBC rank of #
+#  a scalar statistic T is                                                    #
+#                                                                             #
+#      r = #{draws : T(draw) < T(truth)},                                     #
+#                                                                             #
+#  an integer in {0, ..., L} that is discrete-uniform when the sampler is     #
+#  correctly calibrated. Objects are fed one at a time to a Calibration, and  #
+#  the accumulated ranks per statistic give the rank histogram together with  #
+#  its discrete-uniform confidence band.                                      #
+#                                                                             #
+#  T is any user mapping from a point to a scalar. A coordinate T(y) = y_k    #
+#  recovers the per-parameter rank and a likelihood T(y) = loglik(y) the      #
+#  likelihood rank. Any other statistic behaves the same way.                 #
+#                                                                             #
+#  Reference                                                                  #
+#                                                                             #
+#  Talts, Betancourt, Simpson, Vehtari and Gelman, Validating Bayesian        #
+#  inference algorithms with simulation-based calibration, 2018. The          #
+#  uniformity result is their Theorem 1.                                      #
+#                                                                             #
+# =========================================================================== #
 
-For each object there are posterior draws and a known truth. The SBC rank of a
-scalar statistic ``T`` is ``r = #{draws : T(draw) < T(truth)}``, an integer in
-``{0, ..., L}`` that is discrete-uniform under correct calibration (their
-Theorem 1). Feed objects one at a time to a :class:`Calibration`; the accumulated
-ranks per statistic give the SBC rank histogram with its discrete-uniform
-confidence band (:meth:`Calibration.sbc_histogram`).
-
-``T`` is any user mapping from points to a scalar. A coordinate ``T(y) = y_k``
-recovers the per-parameter rank, a likelihood ``T(y) = loglik(y)`` the likelihood
-rank, and any other statistic works the same way.
-"""
 from collections import namedtuple
 
 import numpy as np
@@ -121,7 +134,7 @@ class Calibration:
         """Rank one object and accumulate, or discard it if under-resolved.
 
         ``weight`` is a per-object weight carried into :meth:`coverage` (e.g. an
-        importance weight for reweighting the test set); discarded objects drop
+        importance weight for reweighting the test set). Discarded objects drop
         their weight with them. Equal weights give the unweighted result.
         """
         traces = {n: _as_numpy(f(samples)) for n, f in self.statistics.items()}
@@ -170,7 +183,7 @@ class Calibration:
         interval over the objects. ``target`` is the discrete-uniform reference
         ``p_L``: the coverage a calibrated sampler produces at this finite ``L``
         (it tends to ``level`` as ``L`` grows). Compare the coverage to ``target``,
-        not to ``level`` -- that is how the finite-draw (ESS) uncertainty of the
+        not to ``level``. That is how the finite-draw (ESS) uncertainty of the
         ranks enters, as a shift of the reference rather than a wider interval.
 
         The per-object weights from :meth:`add` reweight the coverage, and the
@@ -214,10 +227,10 @@ class Calibration:
         """SBC rank histogram + band for statistic ``name``, as an
         ``SBCHistogram(counts, bin_edges, expected, low, high, n_objects)``.
 
-        Bins the accumulated ranks over ``{0, ..., L}``; under the discrete-
+        Bins the accumulated ranks over ``{0, ..., L}``. Under the discrete-
         uniform null each bin count is ``Binomial(N, 1/n_bins)`` and
         ``[low, high]`` are its central-``confidence`` quantiles (the band).
-        ``n_bins`` defaults to ``L + 1``; rebin to keep ``N / n_bins`` around 20.
+        ``n_bins`` defaults to ``L + 1``. Rebin to keep ``N / n_bins`` around 20.
         """
         return _sbc_histogram(self.ranks(name), self.L,
                               n_bins=n_bins, confidence=confidence)

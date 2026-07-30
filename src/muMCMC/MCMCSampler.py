@@ -251,11 +251,10 @@ class PyroSampler(MCMCSampler):
         ...
 
     # Sampling runs through Pyro's ``MCMC`` (see ``run_mcmc``), not the batched
-    # ``init``/``step``/``end_warmup`` interface, so these satisfy the abstract
-    # contract only to keep the Pyro-backed samplers instantiable. Transitional:
-    # they go away when the Pyro tether is cut for a native kernel.
+    # init/step/end_warmup interface, so these satisfy the abstract contract only
+    # to keep the Pyro-backed samplers instantiable.
     _NO_BATCHED_IFACE = (
-        "PyroSampler samples through Pyro's MCMC driver; the batched operator "
+        "PyroSampler samples through Pyro's MCMC driver. The batched operator "
         "interface (init/step/end_warmup) is not used."
     )
 

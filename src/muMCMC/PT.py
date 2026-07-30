@@ -5,13 +5,13 @@ import torch
 from .MCMCSampler import MCMCSampler
 
 
-# ===================================================================== #
+# =========================================================================== #
 # Each replica keeps its temperature for the whole run, so the kernel's
 # per-temperature step size adapts during warmup. A swap only relabels
 # configurations across temperature slots: reorder permutes the kept kernel
 # state and retempers each moved configuration to its new slot temperature,
 # avoiding any model re-evaluation.
-# ===================================================================== #
+# =========================================================================== #
 
 
 class _PTState:

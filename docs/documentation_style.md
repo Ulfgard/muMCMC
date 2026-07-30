@@ -25,9 +25,14 @@ Numpy style, with these sections and no others.
 Parameters
 Returns
 Raises
+Attributes
 References
 Notes
 ```
+
+`Raises` and `Attributes` earn their place. Error behaviour is part of the
+contract, and a state object whose fields are its interface is better documented
+by naming them than by prose. Nothing else gets a section heading.
 
 Give shape and dtype for every tensor, in the batched form the function actually
 takes, such as `(N, n)` or `(N, m, m)`. State which entries may be `None` and
