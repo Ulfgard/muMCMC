@@ -3,10 +3,6 @@ from functools import cached_property
 import torch
 
 
-# =========================================================================== #
-#  Tempered evaluation objects: metric and potential, affine in beta          #
-# =========================================================================== #
-
 def _solve_triangular_vec(triag_mat: torch.Tensor, vec: torch.Tensor, upper: bool):
     # triag_mat is (..., d, d) and vec is (..., d).
     return torch.linalg.solve_triangular(triag_mat, vec[..., None], upper=upper)[..., 0]

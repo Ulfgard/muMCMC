@@ -4,8 +4,25 @@ from ._transform import NormalTransform, _std_normal_log_pdf
 
 
 # =========================================================================== #
-#  Spaces                                                                     #
+#  The two identities of the normal chart                                     #
+#                                                                             #
+#  A prior held as theta = T(z) with z ~ N(0, I) makes both of the quantities #
+#  below closed forms in z, which is what prior_log_prob_normal and           #
+#  prior_metric_normal return.                                                #
+#                                                                             #
+#  With log p(theta) = log phi(z) - log|det J| and J = dtheta/dz, the         #
+#  temperature-free potential collapses,                                      #
+#                                                                             #
+#      U_base = -log p(theta) - log|det J| = -log phi(z),                     #
+#                                                                             #
+#  so a sampler needs neither the prior nor the Jacobian in its inner loop.   #
+#  And the prior's metric in theta is M_theta = J^-T J^-1, whose pushforward  #
+#  J^T M_theta J is the identity. That identity is also the exact Hessian of  #
+#  U_base, since the prior read in its own chart is N(0, I) rather than       #
+#  something approximated by it, so a scheme needing a constant prior metric  #
+#  puts no condition on the prior.                                            #
 # =========================================================================== #
+
 
 class Space:
     """Named variables with a prior, read in the prior's normal chart.
