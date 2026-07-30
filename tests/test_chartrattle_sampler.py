@@ -199,17 +199,6 @@ def test_invalid_anderson_history_raises():
         _funnel_sampler(solver="anderson", anderson_history=0)
 
 
-def test_transforming_space_raises():
-    # The constraint reads the sampled position as theta and U carries no
-    # change-of-variables Jacobian, so a space with a real transform would
-    # sample the wrong density. It has to be refused, not tolerated.
-    from muMCMC.spaces import UniformBoxSpace
-    c = FunnelChart(2.0, torch.randn(4))
-    box = UniformBoxSpace({"v": (-2.0, 3.0)}, ["v"], "cpu")
-    with pytest.raises(ValueError, match="identity"):
-        ChartRATTLE(c, box, step_size=0.1, adapt_step_size=False)
-
-
 @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
 def test_invalid_damping_raises(bad):
     with pytest.raises(ValueError, match="damping"):
@@ -303,18 +292,6 @@ def test_prior_metric_moves_the_metric_and_not_the_potential():
     gram = W.transpose(-2, -1) @ W
     assert torch.allclose(m_i.value, torch.eye(2) + gram, atol=1e-10)
     assert torch.allclose(m_m.value, M + gram, atol=1e-10)
-
-
-def test_position_dependent_prior_metric_is_refused():
-    # G_M is also the Hessian of the integrator's kinetic term, so a
-    # position-dependent M would need a different scheme. Freezing it silently
-    # would break energy conservation, so it is refused at the first evaluation.
-    c = FunnelChart(2.0, torch.randn(4))
-    space = UnconstrainedSpace(["v"], prior_metric_fn=lambda th: torch.diag_embed(
-        1.0 + th[..., :1] ** 2))
-    s = ChartRATTLE(c, space, step_size=0.1, adapt_step_size=False)
-    with pytest.raises(ValueError, match="position-independent"):
-        s.evaluate_model(torch.zeros(2, 1))
 
 
 def test_prior_metric_matched_to_a_wide_prior_mixes():

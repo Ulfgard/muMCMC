@@ -20,7 +20,7 @@ import math
 import torch
 import pytest
 
-from muMCMC.adapters import DualAveraging, Reinforce
+from muMCMC._adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)
 

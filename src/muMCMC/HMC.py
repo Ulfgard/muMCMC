@@ -4,7 +4,7 @@ import math
 import torch
 
 from .HamiltonianSampler import HamiltonianSampler
-from .adapters import DualAveraging, NoAdaptation
+from ._adapters import DualAveraging, NoAdaptation
 
 # =========================================================================== #
 #                                                                             #

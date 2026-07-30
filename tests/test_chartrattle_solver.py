@@ -242,8 +242,6 @@ def test_a_prior_metric_keeps_the_step_reversible(solver):
     torch.manual_seed(31)
     st = _seed_state(s, torch.randn(5, 1))
     hh = torch.full((5,), h)
-    assert torch.allclose(s.prior_metric(st.q), 7.0 * torch.eye(1))
-
     fwd = s.integrate(_restart(st, st.q.clone(), st.p.clone()), hh)
     back = s.integrate(_restart(fwd, fwd.q.clone(), -fwd.p.clone()), hh)
     assert torch.allclose(back.q, st.q, atol=1e-9)

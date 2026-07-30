@@ -18,6 +18,9 @@ import torch
 #  An adapter has no notion of what its value means. The caller owns that, so #
 #  the same three classes serve a step size, a mass scale or a temperature.   #
 #                                                                             #
+#  Internal. A sampler builds its own adapter from its own arguments, so      #
+#  nothing here is part of the package surface.                               #
+#                                                                             #
 #  References                                                                 #
 #                                                                             #
 #  Nesterov, Primal-dual subgradient methods for convex problems.             #

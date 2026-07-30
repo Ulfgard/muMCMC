@@ -48,9 +48,10 @@ class HamiltonianSampler(MCMCSampler):
         Whether the sampler needs a position-dependent metric.
     num_steps : int
         Integrator substeps per transition.
-    adapter : NoAdaptation | DualAveraging | Reinforce
-        Step-size adapter: owns the per-chain step size and its warmup
-        adaptation.
+    adapter
+        Step-size adapter, owning the per-chain step size and its warmup
+        adaptation. Built by the subclass from its own arguments, so it is not
+        something a caller supplies.
     divergence_threshold : float
         Value of ``|delta_H|`` above which, or non-finite for which, a step is
         a divergence.

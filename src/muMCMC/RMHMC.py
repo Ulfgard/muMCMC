@@ -5,7 +5,7 @@ import math
 
 from .HamiltonianSampler import HamiltonianSampler
 from .spaces import TemperedMetric
-from .adapters import Reinforce, NoAdaptation
+from ._adapters import Reinforce, NoAdaptation
 from ._solvers import FixedPointSolver
 
 # =========================================================================== #
