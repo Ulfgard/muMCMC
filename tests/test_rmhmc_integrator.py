@@ -28,7 +28,7 @@ from muMCMC.RMHMC import (
     _midpoint_map,
     _implicit_midpoint_step,
 )
-from muMCMC.solvers import FixedPointSolver, _PicardUpdate, _AndersonUpdate
+from muMCMC._solvers import FixedPointSolver, _PicardUpdate, _AndersonUpdate
 from muMCMC.spaces import UnconstrainedSpace
 
 torch.set_default_dtype(torch.float64)

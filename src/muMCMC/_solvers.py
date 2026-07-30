@@ -10,6 +10,9 @@ import torch
 #  integrator in the library reaches for this: RMHMC's midpoint equation and  #
 #  ChartRATTLE's position equation are both a root find in the step endpoint. #
 #                                                                             #
+#  Internal. A sampler exposes the choice as a string and builds the solver   #
+#  itself, so nothing here is part of the package surface.                    #
+#                                                                             #
 #  An update rule turns the current iterate and its residual into the next    #
 #  iterate. Three are available, chosen by name.                              #
 #                                                                             #

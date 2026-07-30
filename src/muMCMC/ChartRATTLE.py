@@ -7,7 +7,7 @@ from .HamiltonianSampler import HamiltonianSampler
 from .adapters import Reinforce, NoAdaptation
 from .spaces import TemperedAffine, TemperedMetric, broadcast_beta
 from .RMHMC import _hamiltonian
-from .solvers import FixedPointSolver
+from ._solvers import FixedPointSolver
 
 # =========================================================================== #
 #                                                                             #

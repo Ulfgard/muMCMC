@@ -14,7 +14,7 @@ The three update rules solve the same equation, so the checks are:
 import torch
 import pytest
 
-from muMCMC.solvers import FixedPointSolver, SolveResult
+from muMCMC._solvers import FixedPointSolver, SolveResult
 
 torch.set_default_dtype(torch.float64)
 
