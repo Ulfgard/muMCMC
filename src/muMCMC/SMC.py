@@ -154,7 +154,7 @@ class SMC:
         """
         Transport ``num_chains`` independent populations of ``num_particles`` each
         from the prior to the posterior (beta = 1). Returns the final populations
-        in constrained space, keyed by parameter name, each ``(num_chains,
+        on the variables, keyed by parameter name, each ``(num_chains,
         num_particles)``. Schedule, ESS, evidence, and R-hat are available via
         :meth:`diagnostics`.
 

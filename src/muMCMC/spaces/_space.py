@@ -184,7 +184,7 @@ class Space:
 
     def prior_log_prob(self, y: dict) -> torch.Tensor:
         """Factorized log-prior over the free names present in ``y``, a dict of
-        constrained points of shape ``(...)``, giving ``(...)``.
+        points on the variables of shape ``(...)``, giving ``(...)``.
 
         The prior factorizes over the coordinate axis, so a subset of the free
         names gives the marginal over that subset. A name left out by accident
@@ -234,7 +234,7 @@ class Space:
 
     def push_forward_metric(self, G: torch.Tensor,
                             jacobian_diag: torch.Tensor) -> torch.Tensor:
-        """The constrained-space metric ``G`` of shape ``(..., d_full, d_full)``
+        """The metric ``G`` on the variables, of shape ``(..., d_full, d_full)``,
         read in the normal chart, giving ``(..., d, d)``,
 
             G_z = diag(J) G_ff diag(J),   J = dtheta/dz,

@@ -30,7 +30,7 @@ class HMCState:
     Parameters
     ----------
     q : Tensor, shape (N, d)
-        Position in free unconstrained coordinates.
+        Position in the space's normal chart, free coordinates.
     U : TemperedAffine
         Potential at ``q``.
     grad : TemperedAffine
@@ -76,10 +76,9 @@ class HMC(HamiltonianSampler):
 
         H(q, p) = U(q) + 1/2 pT M^-1 p,
 
-    with ``U`` the full unconstrained potential assembled by ``MCMCSampler``
-    and ``M`` a constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The
-    model is given in constrained coordinates and evaluated through the space
-    pull-back.
+    with ``U`` the full chart potential assembled by ``MCMCSampler`` and ``M`` a
+    constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The model is
+    given on the variables and read at ``theta = T(q)``.
 
     The leapfrog is explicit and symplectic, so acceptance is the plain energy
     difference ``H(new) - H(old)`` with no Jacobian correction.
@@ -88,9 +87,9 @@ class HMC(HamiltonianSampler):
     ----------
     model_fn : callable
         ``model_fn(theta_full) -> U_lik``, the scalar likelihood potential
-        ``-log p(data | theta)`` in constrained coordinates.
+        ``-log p(data | theta)`` on the full variable vector.
     space : object
-        Parameter space (priors, transform, free/fixed split).
+        Parameter space: the prior's normal chart and the free/fixed split.
     step_size : float
         Initial leapfrog step size.
     num_steps : int

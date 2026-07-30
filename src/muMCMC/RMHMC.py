@@ -212,8 +212,8 @@ class RMHMCState:
 #  energy through the build_initial_state / sample_momentum / integrate /     #
 #  acceptance_delta / adapt hooks. All chains run in one batched state.       #
 #                                                                             #
-#  model_fn is specified in constrained coordinates. MCMCSampler adds the     #
-#  prior and pushes the metric forward to the space's normal chart            #
+#  model_fn is specified on the variables. MCMCSampler adds the prior and     #
+#  pushes the metric forward to the space's normal chart                      #
 #  (Space.push_forward_metric).                                               #
 #                                                                             #
 # =========================================================================== #
@@ -224,15 +224,15 @@ class RMHMC(HamiltonianSampler):
     q ~ exp(−U(q)) under the position-dependent metric G(q) with Hamiltonian
     H(q, p) = U(q) + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
 
-    Runs in the space's normal chart. The model is specified in constrained
-    coordinates and pulled back by :meth:`MCMCSampler.evaluate_model`.
+    Runs in the space's normal chart. The model is specified on the variables
+    and read there by :meth:`MCMCSampler.evaluate_model`.
 
     Parameters
     ----------
     model_fn : callable
-        ``model_fn(theta_full) -> (U_lik, G_lik)``: full constrained vector
-        to scalar likelihood potential ``-log p(data | theta)`` and
-        (d_full, d_full) SPD likelihood metric in constrained coordinates.
+        ``model_fn(theta_full) -> (U_lik, G_lik)``: full variable vector to
+        scalar likelihood potential ``-log p(data | theta)`` and (d_full,
+        d_full) SPD likelihood metric on the same vector.
     space
         Parameter space: the prior's normal chart and the free/fixed split.
     step_size : float

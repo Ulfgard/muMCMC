@@ -11,7 +11,7 @@
 #  Derivation of the evidence estimator (BAR, the Bennett acceptance ratio in #
 #  its reverse-logistic-regression form).                                     #
 #                                                                             #
-#  Work happens in the sampler's unconstrained coordinates z, where           #
+#  Work happens in the sampler's chart coordinates z, where                   #
 #  sampler.evaluate_model(z).value is exactly -log f(z) for the unnormalized  #
 #  posterior density                                                          #
 #                                                                             #
@@ -160,7 +160,7 @@ class PosteriorEvaluation:
 
     The estimator is BAR (Bennett acceptance ratio, Bennett 1976), cast as
     reverse logistic regression (Geyer 1994). A reference ``q̂`` is fitted to the
-    draws as a Gaussian mixture in the sampler's unconstrained coordinates, and
+    draws as a Gaussian mixture in the sampler's chart coordinates, and
     ``log Z`` is the intercept discriminating the draws from samples of ``q̂``.
     Fitting ``q̂`` on the same draws leaves the estimator consistent. The quality
     of the mixture fit sets the variance, not the limit.
@@ -232,7 +232,7 @@ class PosteriorEvaluation:
         if self._jackknife and K < 2:
             raise ValueError("jackknife needs at least two chains")
 
-        # Unconstrained draws grouped by chain. Detached so the cached draws (and
+        # Chart draws grouped by chain. Detached so the cached draws (and
         # everything derived from them: log f, q̂) never carry an autograd graph.
         self._z = self.space.as_transform.inverse(theta_free).mapped_point.detach()
         self._n1 = K * n
@@ -279,7 +279,7 @@ class PosteriorEvaluation:
                          max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                          generator: Optional[torch.Generator] = None,
                          return_ess: bool = False):
-        """``log[ p(y*|x) / p(y*) ]`` at constrained points ``y*``.
+        """``log[ p(y*|x) / p(y*) ]`` at variable points ``y*``.
 
         With every free name present this is ``loglik(y*) − logZ`` (the prior
         cancels). With a subset present the rest is marginalized out, giving the
@@ -302,7 +302,7 @@ class PosteriorEvaluation:
                       max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                       generator: Optional[torch.Generator] = None,
                       return_ess: bool = False):
-        """``log p(y|x)`` at constrained points ``y``, a density w.r.t. ``dy``.
+        """``log p(y|x)`` at variable points ``y``, a density w.r.t. ``dy``.
 
         The free names present in ``y`` select the marginal. All names gives the
         exact full density ``loglik(y) + log_prior(y) − logZ``. A subset gives the
@@ -315,7 +315,7 @@ class PosteriorEvaluation:
         Parameters
         ----------
         y : dict[str, Tensor]
-            Constrained query points keyed by free name. All free names gives the
+            Query points on the variables keyed by free name. All free names give the
             full density, a subset the marginal over those names.
         target_ess : float, optional
             Per-query-point weight ESS to reach before stopping. Default draws
@@ -399,10 +399,10 @@ class PosteriorEvaluation:
             z_full[..., a_t] = z_a[:, None, :].expand(M, n, na)
             z_full[..., b_t] = z_b
             z_flat = z_full.reshape(M * n, d)
-            tmap = self.space.as_transform.forward(z_flat)
-            jac_b = torch.log(tmap.jacobian_diag[:, b_t]).sum(-1).reshape(M, n)
+            chart = self.space.as_transform.forward(z_flat)
+            jac_b = torch.log(chart.jacobian_diag[:, b_t]).sum(-1).reshape(M, n)
             prior_b = self.space.prior_log_prob(
-                {name: tmap.mapped_point[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
+                {name: chart.mapped_point[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
             loglik = self._tempered_loglik(z_flat).reshape(M, n)
             return loglik, prior_b + jac_b, q_b.log_prob(z_b)
 

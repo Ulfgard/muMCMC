@@ -41,7 +41,7 @@ class HamiltonianSampler(MCMCSampler):
     Parameters
     ----------
     model_fn : callable
-        Model potential in constrained coordinates (see ``MCMCSampler``).
+        Model potential on the full variable vector (see ``MCMCSampler``).
     space : object
         Parameter space: the prior's normal chart and the free/fixed split.
     requires_metric : bool

@@ -20,14 +20,14 @@ class MCMCSampler(ABC):
     Operator interface (abstract): ``init(q)`` returns the initial state,
     ``step(s)`` performs one transition, ``end_warmup()`` switches from warmup
     to sampling. ``run_mcmc`` is the batched driver that composes them and
-    returns constrained-space samples. Optional hooks ``logging`` (per-step
+    returns samples on the variables. Optional hooks ``logging`` (per-step
     progress-bar stats) and ``diagnostics`` (post-run per-chain summaries)
     default to ``{}``.
 
     Parameters
     ----------
     potential_fn : callable
-        Model potential ``U = -log p`` in constrained coordinates. Signature is
+        Model potential ``U = -log p`` on the variables. Signature is
         method-dependent (see ``evaluate_model``).
     space
         Parameter space: the prior's normal chart, the free/fixed split, and the
@@ -61,7 +61,7 @@ class MCMCSampler(ABC):
 
           requires_metric=False:  potential_fn(theta) -> scalar U_lik
           requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
-              G_lik a (d_full, d_full) SPD metric in constrained coordinates.
+              G_lik a (d_full, d_full) SPD metric on the same vector.
 
         Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential.
 
@@ -92,8 +92,8 @@ class MCMCSampler(ABC):
             z_free = z_free.detach().requires_grad_(True)
 
         with torch.enable_grad() if grad else nullcontext():
-            theta_map = self.space.as_transform.forward(z_free)
-            theta_full = self.space.to_full(theta_map.mapped_point)
+            chart = self.space.as_transform.forward(z_free)
+            theta_full = self.space.to_full(chart.mapped_point)
 
             result = self.potential_fn(theta_full)
             if self.requires_metric:
@@ -105,7 +105,7 @@ class MCMCSampler(ABC):
 
         metric = None
         if self.requires_metric:
-            A_lik = self.space.push_forward_metric(G_lik, theta_map.jacobian_diag)
+            A_lik = self.space.push_forward_metric(G_lik, chart.jacobian_diag)
             metric = TemperedMetric(A_lik, self.space.prior_metric_normal(z_free),
                                     beta)
 
@@ -126,7 +126,7 @@ class MCMCSampler(ABC):
         return potential, metric, gradient
 
     def _init_z_free(self, initial_params: torch.Tensor) -> torch.Tensor:
-        """Constrained vector, full or free, to the free vector in the normal
+        """Variable vector, full or free, to the free vector in the normal
         chart. The two layouts coincide when nothing is fixed."""
         width = initial_params.shape[-1]
         if width == self.space.d_full:
@@ -154,8 +154,8 @@ class MCMCSampler(ABC):
 
     @abstractmethod
     def init(self, z_free: torch.Tensor):
-        """Return the initial batched chain state at the unconstrained free
-        positions ``z_free`` (shape ``(num_chains, d)``)."""
+        """Return the initial batched chain state at the chart positions
+        ``z_free`` (shape ``(num_chains, d)``)."""
         ...
 
     @abstractmethod
@@ -178,7 +178,7 @@ class MCMCSampler(ABC):
         disable_progbar: bool = False,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        """Run MCMC via the batched driver and return constrained samples.
+        """Run MCMC via the batched driver and return samples on the variables.
 
         Holds all ``num_chains`` chains in one batched state: ``init``, then
         repeated ``step``, then ``end_warmup`` once warmup is done. Extra
@@ -187,7 +187,7 @@ class MCMCSampler(ABC):
         Parameters
         ----------
         initial_params : Tensor
-            Constrained flat vector, full or free.
+            Flat variable vector, full or free.
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -200,10 +200,10 @@ class MCMCSampler(ABC):
         Returns
         -------
         dict[str, Tensor]
-            Constrained-space samples, keyed by free parameter name, grouped by
+            Samples on the variables, keyed by free parameter name, grouped by
             chain (shape ``(num_chains, num_samples, ...)``).
         """
-        # constrained point -> free vector in the normal chart, over chains
+        # variable point -> free vector in the normal chart, over chains
         z_free_init = self._init_z_free(initial_params)
         if z_free_init.dim() == 1:
             z_free_init = z_free_init.unsqueeze(0).expand(num_chains, -1).contiguous()
@@ -312,12 +312,13 @@ class PyroSampler(MCMCSampler):
         disable_progbar: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Run MCMC through Pyro's ``MCMC`` driver and return constrained samples.
+        Run MCMC through Pyro's ``MCMC`` driver and return samples on the
+        variables.
 
         Parameters
         ----------
         initial_params : Tensor
-            Full constrained flat vector (including fixed parameters).
+            Full flat variable vector (including fixed parameters).
         num_samples : int
             Number of post-warmup samples.
         num_warmup_steps : int
@@ -332,12 +333,12 @@ class PyroSampler(MCMCSampler):
         Returns
         -------
         dict[str, Tensor]
-            Samples in constrained space, keyed by free parameter name,
-            grouped by chain.
+            Samples on the variables, keyed by free parameter name, grouped by
+            chain.
         """
         pyro.clear_param_store()
 
-        # constrained point -> free vector in the normal chart
+        # variable point -> free vector in the normal chart
         z_free_init = self._init_z_free(initial_params)
         # Pyro expects initial_params of shape (num_chains, d) for num_chains > 1.
         # replicate the single anchor across chains.
@@ -357,7 +358,7 @@ class PyroSampler(MCMCSampler):
         # stash MCMC object for per-chain diagnostics via self.mcmc.diagnostics()
         self.mcmc = mcmc
 
-        # Read the draws back in constrained coordinates.
+        # Read the draws back on the variables.
         samples_unc = mcmc.get_samples(group_by_chain=True)["params"]
         theta_free_all = self.space.as_transform.forward(samples_unc).mapped_point
         return self.space.add_fixed(self.space.from_free_vector(theta_free_all))
