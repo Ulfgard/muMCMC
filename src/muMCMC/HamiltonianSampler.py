@@ -48,9 +48,10 @@ class HamiltonianSampler(MCMCSampler):
         Whether the sampler needs a position-dependent metric.
     num_steps : int
         Integrator substeps per transition.
-    adapter : NoAdaptation | DualAveraging | Reinforce
-        Step-size adapter: owns the per-chain step size and its warmup
-        adaptation.
+    adapter
+        Step-size adapter, owning the per-chain step size and its warmup
+        adaptation. Built by the subclass from its own arguments, so it is not
+        something a caller supplies.
     divergence_threshold : float
         Value of ``|delta_H|`` above which, or non-finite for which, a step is
         a divergence.
@@ -153,9 +154,9 @@ class HamiltonianSampler(MCMCSampler):
         adapting, updates the step size. Returns the chosen state."""
         delta_raw = self.acceptance_delta(new, old)             # (N,)
 
-        # Divergence: non-finite or |delta_H| over threshold (a non-finite
-        # delta also carries a failed-proposal signal, e.g. RMHMC's unconverged
-        # solve). The clamp below is Metropolis-ratio safety only.
+        # Divergence: non-finite or |delta_H| over threshold. A subclass also
+        # uses non-finite to signal a proposal it could not build at all. The
+        # clamp below is Metropolis-ratio safety only.
         is_divergent = (~torch.isfinite(delta_raw)) \
             | (delta_raw.abs() > self._divergence_threshold)
         delta = torch.where(torch.isfinite(delta_raw), delta_raw,

@@ -9,7 +9,8 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import LMC, HMC, LMCState, UnconstrainedSpace
+from muMCMC import LMC, HMC, UnconstrainedSpace
+from muMCMC.LMC import LMCState
 
 torch.set_default_dtype(torch.float64)
 

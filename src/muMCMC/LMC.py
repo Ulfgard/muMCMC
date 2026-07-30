@@ -4,21 +4,21 @@ import math
 import torch
 
 from .HamiltonianSampler import HamiltonianSampler
-from .adapters import DualAveraging, NoAdaptation
+from ._adapters import DualAveraging, NoAdaptation
 
 # =========================================================================== #
 #  Lagrangian Monte Carlo  (explicit geodesic integrator)                     #
 # =========================================================================== #
 #  Riemannian sampling in the velocity v = G(q)^-1 p (Lan, Stathopoulos,      #
-#  Shahbaba & Girolami 2015).  The substitution p -> v turns RMHMC's implicit #
-#  generalized leapfrog into a fully explicit integrator (no fixed-point      #
-#  solve), at the price of a non-unit Jacobian in the Metropolis test.        #
+#  Shahbaba & Girolami 2015).  Working in v rather than p makes the           #
+#  integrator fully explicit, with no fixed-point solve, at the price of a    #
+#  non-unit Jacobian in the Metropolis test.                                  #
 #                                                                             #
 #  Energy.  p ~ N(0, G) and p = G v give v | q ~ N(0, G^-1) and               #
 #                                                                             #
 #      E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,                    #
 #                                                                             #
-#  the log-det sign opposite RMHMC's Hamiltonian (p -> v contributes +det G). #
+#  where the log-det enters negatively, since p -> v contributes +det G.      #
 #                                                                             #
 #  Explicit integrator (Lan et al. Algorithm 2, e-RMLMC).  With the matrix    #
 #  Omega(q, v)_ij = sum_k v_k Gamma^i_kj and phi = U + 1/2 log det G, one     #
@@ -117,9 +117,8 @@ class LMC(HamiltonianSampler):
 
     User contract
     -------------
-    ``model_fn(theta_full) -> (U_lik, G_lik)`` as for RMHMC: the scalar
-    likelihood potential and the ``(d_full, d_full)`` SPD metric in constrained
-    coordinates.
+    ``model_fn(theta_full) -> (U_lik, G_lik)``, the scalar likelihood potential
+    and the ``(d_full, d_full)`` SPD metric, both in constrained coordinates.
 
     Parameters
     ----------

@@ -4,24 +4,19 @@ import torch
 #                                                                             #
 #  Value adapters                                                             #
 #                                                                             #
-#  Every adapter carries one value, vectorised over a leading axis so that N  #
-#  independent problems are adapted elementwise in parallel, and exposes the  #
-#  interface a caller drives:                                                 #
-#                                                                             #
-#      reset(N, dtype, device)   size the state to (N,) at the initial value  #
-#      update(signal)            fold one signal, move the estimate           #
-#      finalize()                freeze the estimate                          #
-#      get_state() -> (x, x_avg) current value and its running average.       #
-#                                After finalize, and with no adaptation at    #
-#                                all, both entries are x_avg                  #
+#  The three classes share one protocol, reset / update / finalize /          #
+#  get_state, without a common base class. Each is a minimiser in its own     #
+#  right and the adapter role is a second reading of the same state, so a     #
+#  base class would have to own the intersection of two interfaces and would  #
+#  buy nothing back.                                                          #
 #                                                                             #
 #  An adapter has no notion of what its value means. The caller owns that, so #
 #  the same three classes serve a step size, a mass scale or a temperature.   #
+#  Every value is vectorised over a leading axis, so N independent problems   #
+#  adapt elementwise in parallel.                                             #
 #                                                                             #
-#  References                                                                 #
-#                                                                             #
-#  Nesterov, Primal-dual subgradient methods for convex problems.             #
-#  Hoffman and Gelman, The No-U-Turn Sampler.                                 #
+#  Internal. A sampler builds its own adapter from its own arguments, so      #
+#  nothing here is part of the package surface.                               #
 #                                                                             #
 # =========================================================================== #
 
@@ -91,6 +86,11 @@ class DualAveraging:
     init : float
         Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role.
         Ignored by the minimiser, which uses ``prox_center`` instead. Default 0.
+
+    References
+    ----------
+    Nesterov, Primal-dual subgradient methods for convex problems.
+    Hoffman and Gelman, The No-U-Turn Sampler.
     """
 
     def __init__(self, prox_center=0.0, t0=10, kappa=0.75, gamma=0.05, init=0.0):

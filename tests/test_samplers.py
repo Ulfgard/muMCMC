@@ -10,13 +10,8 @@ import torch
 import pytest
 from pyro.distributions import Normal
 
-from muMCMC import (
-    RMHMC,
-    NUTS,
-    UnconstrainedSpace,
-    DualAveraging,
-    Reinforce,
-)
+from muMCMC import RMHMC, NUTS, UnconstrainedSpace
+from muMCMC._adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)
 

@@ -4,15 +4,10 @@ __version__ = "0.1.0"
 
 from .MCMCSampler import MCMCSampler, PyroSampler
 from .HamiltonianSampler import HamiltonianSampler
-from .RMHMC import RMHMC, RMHMCState
-from .ChartRATTLE import (
-    ChartRATTLE,
-    ChartRATTLEState,
-    ChartConstraint,
-    LocationScaleChart,
-)
-from .HMC import HMC, HMCState
-from .LMC import LMC, LMCState
+from .RMHMC import RMHMC
+from .ChartRATTLE import ChartRATTLE, ChartConstraint, LocationScaleChart
+from .HMC import HMC
+from .LMC import LMC
 from .NUTS import NUTS
 from .SMC import SMC
 from .PT import PT
@@ -24,7 +19,6 @@ from .spaces import (
     UniformBoxSpace,
     transforms,
 )
-from .adapters import DualAveraging, Reinforce, NoAdaptation
 from .validation import PosteriorEvaluation
 
 __all__ = [
@@ -32,15 +26,11 @@ __all__ = [
     "PyroSampler",
     "HamiltonianSampler",
     "RMHMC",
-    "RMHMCState",
     "ChartRATTLE",
-    "ChartRATTLEState",
     "ChartConstraint",
     "LocationScaleChart",
     "HMC",
-    "HMCState",
     "LMC",
-    "LMCState",
     "NUTS",
     "SMC",
     "PT",
@@ -50,9 +40,6 @@ __all__ = [
     "UnconstrainedSpace",
     "UniformBoxSpace",
     "transforms",
-    "DualAveraging",
-    "Reinforce",
-    "NoAdaptation",
     "PosteriorEvaluation",
     "__version__",
 ]

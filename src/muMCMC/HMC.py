@@ -4,16 +4,14 @@ import math
 import torch
 
 from .HamiltonianSampler import HamiltonianSampler
-from .adapters import DualAveraging, NoAdaptation
+from ._adapters import DualAveraging, NoAdaptation
 
 # =========================================================================== #
 #                                                                             #
 #  Euclidean HMC  (explicit leapfrog, constant mass matrix)                   #
 #                                                                             #
-#  Standard HMC with a position-independent mass matrix M.  The leapfrog is   #
-#  explicit and symplectic, so acceptance is the plain energy difference with #
-#  no Jacobian correction.  This is the constant-metric limit of RMHMC and    #
-#  shares the HamiltonianSampler transition machinery.                        #
+#  The transition machinery is inherited from HamiltonianSampler, which HMC   #
+#  supplies the leapfrog and the energy to.                                   #
 #                                                                             #
 #  The chain state carries q with the momentum p and the potential and its    #
 #  gradient as tempered objects.  A trajectory ends where the next one        #
@@ -82,6 +80,9 @@ class HMC(HamiltonianSampler):
     and ``M`` a constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The
     model is given in constrained coordinates and evaluated through the space
     pull-back.
+
+    The leapfrog is explicit and symplectic, so acceptance is the plain energy
+    difference ``H(new) - H(old)`` with no Jacobian correction.
 
     Parameters
     ----------

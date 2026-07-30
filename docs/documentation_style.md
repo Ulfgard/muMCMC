@@ -73,6 +73,21 @@ the documentation.
 
 No restating of the signature in prose.
 
+## Do not compare against other algorithms
+
+Say what this code does. Do not explain it by contrast with a sibling
+implementation, as in "unlike X, this one ...". The reader may not know X, X may
+be a niche method nobody would accept as the reference point, and the sentence
+goes stale the moment X changes.
+
+The one comparison worth making is against the base class, where a subclass
+departs from documented shared behaviour. That is a contract the reader is
+already holding.
+
+A general-purpose tool must not need a specific algorithm to explain itself. If a
+root finder can only be described through the equation one particular sampler
+hands it, either the description is wrong or the tool is not general.
+
 ## Notation
 
 The library has one vocabulary and every file uses it. Position is `q`, momentum
@@ -84,16 +99,29 @@ not been introduced to is not documentation.
 
 ## Design notes and derivations
 
-Anything that explains why the code is shaped the way it is goes in a comment
-block delimited by full width `#` rules, near the top of the file or above the
-section it explains. This is the home for derivations, for the reasoning behind a
-design decision, for a discussion of what a chosen scheme does and does not
-guarantee, and for the trade offs that were taken deliberately.
+A comment block delimited by full width `#` rules is for what no docstring should
+carry: things that are about more than one API surface, or about why the code took
+the shape it did.
 
-A derivation may be as long as it needs to be. If a function reparameterises the
-problem it solves, the full derivation of that reparameterisation belongs in a
-design note block or in a comment at the code that performs it. Showing the work
-is the point, so length is not a fault here.
+It belongs there when it is
+
+* how two things relate, such as a sampler and the state object it threads,
+* a derivation of an equation the code encodes,
+* a reparameterisation that makes a solve tractable or cheap,
+* a trade off taken deliberately, together with what it costs.
+
+It does not belong there when it is
+
+* the defining property of a class or function, including its equation. A solver
+  implementing Newton says so in its docstring and states the Newton step there.
+  In a design note it is hidden from the reader who found the class.
+* the contract of an argument or a return value. Shapes, admissible values,
+  what raises, which rule needs what from its caller.
+
+A derivation may be as long as it needs to be, in the block or in a comment at
+the code that performs it. Showing the work is the point, so length is not a
+fault there. The test is whether a reader who has the docstring in front of them
+still needs it.
 
 ## Comments
 
@@ -123,3 +151,17 @@ When an invariant changes, delete what documented the old one. That applies to
 tests as well. A test that pins an invariant the design has moved past is not
 protecting anything, and reading it as a constraint on new work is worse than
 having no test at all.
+
+## Size
+
+Documentation competes with the code for the reader's attention, so its size is
+part of the design. A useful check is the ratio of documentation lines to code
+lines, per file. It is a ceiling, not a target: most files here sit between 0.5
+and 1.5 to 1, and a low ratio is not a defect. Much above 1.5 is a file claiming
+to be unusually subtle, and that claim is usually wrong.
+
+The same applies to a design note. Two hundred lines of note above two hundred
+lines of code means the note is arguing rather than stating. Keep the
+derivation, the identity, the caveat with teeth. Cut the paragraph that restates
+the equation above it in prose, and cut the measurement whose source no reader
+can find.

@@ -73,9 +73,10 @@ solvers are available via `solver=`: `"picard"` (default) and `"anderson"`,
 which applies Anderson acceleration to the same equation and often converges in
 fewer iterations — hence fewer likelihood/metric evaluations — on stiff metrics.
 The endpoint is identical up to `fp_tol`, so acceptance and mixing are
-unchanged; only solver cost differs. Its history length defaults to `dim(q)`
-(the free-parameter dimension), whose per-iteration linear-algebra overhead is
-negligible next to a single model evaluation.
+unchanged; only solver cost differs. Its history length defaults to the
+dimension of the solve, which for RMHMC is `2 dim(q)` because the unknown is the
+endpoint `(q, p)`. The per-iteration linear algebra that costs is negligible next
+to a single model evaluation.
 
 `damping=` (β ∈ (0, 1], default `1.0`) under-relaxes either solver as
 `(1−β)·z + β·(solver step)`. Because the implicit-midpoint iteration has a
@@ -178,7 +179,9 @@ src/muMCMC/
     LMC.py           # explicit Lagrangian MC (velocity variant of RMHMC)
     NUTS.py          # Pyro NUTS with constrained-space reparameterization
     spaces.py        # transforms, prior/metric pull-back, free/fixed split
-    adapters.py      # dual-averaging + derivative-free (REINFORCE) optimizer
+    ChartRATTLE.py   # constrained HMC on a reparameterization chart
+    _adapters.py     # internal: dual-averaging and REINFORCE step-size adapters
+    _solvers.py      # internal: batched fixed-point and Newton root finders
 ```
 
 ## License

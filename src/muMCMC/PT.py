@@ -146,11 +146,9 @@ class PT(MCMCSampler):
         ``log_evidence`` = -sum 0.5 (u[i+1]+u[i]) (beta[i+1]-beta[i]).
 
         ``log_evidence`` estimates ``log Z_1 - log Z_0``, so it is an absolute
-        evidence only when ``beta_min = 0`` *and* the kernel's beta = 0 target is
-        normalized. That holds for a kernel built on the default
-        ``MCMCSampler.evaluate_model``, whose beta = 0 rung is the prior. It does
-        not hold for every kernel. ``ChartRATTLE`` leaves an unnormalized
-        reference there, in which case the value is offset by ``log Z_0``.
+        evidence only when ``beta_min = 0`` and the kernel's beta = 0 target
+        integrates to one. A kernel whose coldest rung is unnormalized offsets
+        the value by its ``log Z_0``.
         """
         if self._nstep == 0:
             return {}
