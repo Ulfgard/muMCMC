@@ -162,11 +162,17 @@ def test_step_runs_exactly_num_steps_substeps():
     assert calls["n"] == 4
 
 
-def test_step_returns_complete_state():
+def test_step_keeps_only_the_fields_that_outlive_a_transition():
+    # q and p carry the chain and U.lik is the PT swap statistic, so those three
+    # survive. The metric, geometry and force are trajectory scratch rebuilt by
+    # sample_momentum, so carrying them would only risk them going stale behind a
+    # PT relabeling.
     s = _funnel_sampler(num_steps=3)
     out = s.step(s.init(torch.zeros(2, 1)))
-    assert out.U is not None and out.metric is not None and out.p is not None
     assert out.q.shape == (2, 1)
+    assert out.p is not None and out.U is not None
+    assert out.metric is None and out.psi is None and out.W is None
+    assert out.grad_V is None and out.dq is None
 
 
 # ========================================================================== #

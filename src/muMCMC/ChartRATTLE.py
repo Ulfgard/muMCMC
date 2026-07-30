@@ -299,14 +299,14 @@ class ChartRATTLEState:
 
     def select_accepted(self, accepted, other):
         """Per-chain choice between this endpoint (where ``accepted``) and the
-        start ``other``. The geometry, force and warm-start displacement are
-        trajectory scratch and are dropped."""
+        start ``other``, over the fields that outlive a transition. The metric,
+        geometry, force and warm-start displacement are trajectory scratch and
+        are dropped."""
         pick = accepted.unsqueeze(-1)
         return ChartRATTLEState(
             torch.where(pick, self.q, other.q),
             torch.where(pick, self.p, other.p),
             self.U.select(accepted, other.U),
-            self.metric.select(accepted, other.metric),
         )
 
 
