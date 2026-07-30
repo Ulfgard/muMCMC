@@ -68,43 +68,34 @@ from ._solvers import FixedPointSolver
 # =========================================================================== #
 #  Step  (q0, p0) -> (q1, p1)                                                 #
 #                                                                             #
-#      F(q1) = M(q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0,     #
-#      DF(q1) = M + β W0ᵀ W1,   so DF(q0) = G_M(q0),                          #
-#      p1 = (1/h)[M(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),                #
-#                                                                             #
-#  with V = U + ½ log det G_M, so ∇V is one autograd.grad(V.sum(), q). Only   #
-#  ψ(q^k) is evaluated in the loop, preconditioned by the Cholesky of         #
-#  G_M(q0), which makes Picard the frozen-Jacobian Newton step. The newton    #
-#  rule re-evaluates DF(q1) instead, at a tangent pass per iteration.         #
-#                                                                             #
-#  The step is the variational integrator of the discrete Lagrangian          #
+#  The step of integrate is the variational integrator of the discrete        #
+#  Lagrangian                                                                 #
 #                                                                             #
 #      S_h(q0, q1) = (q1 − q0)ᵀM(q1 − q0)/(2h) + β‖ψ1 − ψ0‖²/(2h)             #
-#                    − (h/2)[V(q0) + V(q1)],                                  #
+#                    − (h/2)[V(q0) + V(q1)],   V = U + ½ log det G_M,         #
 #                                                                             #
-#  in the sense that p0 = −∂S_h/∂q0 is F = 0 and p1 = +∂S_h/∂q1 is the        #
-#  momentum line. So the map is symplectic, hence volume-preserving on (q,    #
-#  p), which is the half of Metropolis exactness self-adjointness leaves      #
-#  open, and S_h(q0, q1) = S_h(q1, q0) makes it self-adjoint. Its kinetic     #
-#  Hessian as q1 -> q0 is G_M(q0)/h, which is where G_M comes from and what   #
-#  forces the W0 / W1 asymmetry.                                              #
+#  in the sense that p0 = −∂S_h/∂q0 is the position equation F(q1) = 0 it     #
+#  solves and p1 = +∂S_h/∂q1 is its momentum line. So the map is symplectic,  #
+#  hence volume-preserving on (q, p), which is the half of Metropolis         #
+#  exactness self-adjointness leaves open, and S_h(q0, q1) = S_h(q1, q0)      #
+#  makes it self-adjoint. The kinetic Hessian as q1 -> q0 is G_M(q0)/h, which #
+#  is where G_M comes from and what forces the W0 / W1 asymmetry.             #
 #                                                                             #
-#  Both hold up to the solve. Where F has several roots the forward and       #
-#  reverse solves can pick different ones, an effect that vanishes as h       #
-#  shrinks. A failed solve is rejected with +inf energy, but no reverse-      #
-#  projection check is run: discarding a step whose reverse solve lands       #
-#  elsewhere restores reversibility by turning the discarded set into a hard  #
-#  barrier, and those are the steps crossing strong nonlinearity that the     #
-#  method exists to take. Exact but reducible is the worse failure, and the   #
-#  quieter one.                                                               #
-# =========================================================================== #
-#  Constraint interface (untempered)                                          #
+#  Grouping U and ½ log det G_M into one V is what lets the step carry a      #
+#  single gradient. The position Jacobian is DF(q1) = M + β W0ᵀ W1, so        #
+#  DF(q0) = G_M(q0): preconditioning by the Cholesky of G_M(q0) makes Picard  #
+#  the frozen-Jacobian Newton step, and only ψ(q^k) is evaluated in the loop. #
+#  The newton rule re-evaluates DF(q1) instead, at a tangent pass per         #
+#  iteration.                                                                 #
 #                                                                             #
-#      psi(q)           -> ψ = φ_q⁻¹(x)         the inverse map               #
-#      log_abs_det_B(q) -> log|det B|           = ½ log det Σ for a scale     #
-#                                                                             #
-#  W follows from one reverse pass per latent. Override psi_with_jvp with     #
-#  explicit Jacobians to skip it. The constraint is temperature-free.         #
+#  Both properties hold up to the solve. Where F has several roots the        #
+#  forward and reverse solves can pick different ones, an effect that         #
+#  vanishes as h shrinks. A failed solve is rejected with +inf energy, but no #
+#  reverse-projection check is run: discarding a step whose reverse solve     #
+#  lands elsewhere restores reversibility by turning the discarded set into a #
+#  hard barrier, and those are the steps crossing strong nonlinearity that    #
+#  the method exists to take. Exact but reducible is the worse failure, and   #
+#  the quieter one.                                                           #
 # =========================================================================== #
 #  Tempering                                                                  #
 #                                                                             #
@@ -313,17 +304,6 @@ class ChartRATTLEState:
         )
 
 
-# =========================================================================== #
-#                                                                             #
-#  ChartRATTLE sampler                                                        #
-#                                                                             #
-#  Runs in the q chart. The space is the identity UnconstrainedSpace over the #
-#  θ names and the driver reads the position q off as θ. The space's prior    #
-#  goes into U, flat if it has none. evaluate_model builds U (TemperedAffine) #
-#  and G_M (TemperedMetric) from the constraint. integrate performs the step. #
-#                                                                             #
-# =========================================================================== #
-
 class ChartRATTLE(HamiltonianSampler):
     """RATTLE constrained HMC for the hierarchical posterior p(θ | x), sampled
     in the q chart of the manifold {φ_q(ε) = x}.
@@ -502,9 +482,18 @@ class ChartRATTLE(HamiltonianSampler):
         return state
 
     def integrate(self, state, step_size):
-        """One RATTLE substep at ``step_size``, tracking the worst position-solve
-        residual and iteration count. The solve is warm-started by the previous
-        displacement, which changes only the iteration count, not the fixed point."""
+        """One RATTLE substep at ``step_size`` = h, solving
+
+            F(q1) = M(q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − h p0 + (h²/2) ∇V(q0) = 0
+
+        for the new position and taking the momentum from
+
+            p1 = (1/h)[M(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),
+
+        with V = U + ½ log det G_M and M the prior metric. Tracks the worst
+        position-solve residual and iteration count over the batch. The solve is
+        warm-started by the previous displacement, which changes only the
+        iteration count, not the fixed point."""
         h = step_size.unsqueeze(-1)                        # (N, 1)
         beta_col = broadcast_beta(self.beta, 1)
         beta_mat = broadcast_beta(self.beta, 2)

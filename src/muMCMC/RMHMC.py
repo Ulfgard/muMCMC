@@ -12,16 +12,15 @@ from ._solvers import FixedPointSolver
 #                                                                             #
 #  RMHMC helpers  (implicit midpoint integrator)                              #
 #                                                                             #
-#  The implicit-midpoint step solves a per-chain fixed-point equation         #
-#  z = F(z).  Algorithm I.M.(a) of Brofos & Lederman (2021): the unknown      #
-#  is the endpoint (q_k, p_k), with the midpoint derived from it.  The        #
-#  update rule that drives the solve is pluggable: Picard iteration           #
-#  (z_{k+1} = F(z_k)) and Anderson acceleration both solve the same F, so     #
-#  the endpoint is solver- and damping-independent. Only the proposal,        #
-#  the iteration count, and stability differ.                                 #
+#  The unknown of the step is the whole endpoint (q_k, p_k), with the         #
+#  midpoint derived from it, so a substep is one root find in 2d rather than  #
+#  a staggered pair of solves.  Only the values F_q, F_p enter it and no      #
+#  Jacobian, so the sole gradient is the first-order dH/dq at the midpoint.   #
+#  That is also what rules the newton rule out here: DF would need the        #
+#  second derivative of H, which the model interface does not expose.         #
 #                                                                             #
-#  Only the values F_q, F_p are needed (no Jacobian), so the sole             #
-#  gradient is the first-order dH/dq at the midpoint.                         #
+#  Picard and Anderson drive the same F, so the endpoint is solver- and       #
+#  damping-independent. Only the iteration count and the stability differ.    #
 #                                                                             #
 # =========================================================================== #
 
@@ -217,11 +216,6 @@ class RMHMCState:
 #  prior log-prob and prior metric and pushes the metric forward to free      #
 #  unconstrained coordinates (spaces.push_forward_metric).                    #
 #                                                                             #
-#  Both solvers return the same endpoint up to fp_tol. Anderson               #
-#  typically reaches it in fewer iterations on stiff metrics, at the          #
-#  cost of a small m x m solve per iteration.  damping (beta) affects         #
-#  only stability and iteration count, not the endpoint.                      #
-#                                                                             #
 # =========================================================================== #
 
 class RMHMC(HamiltonianSampler):
@@ -280,9 +274,13 @@ class RMHMC(HamiltonianSampler):
         Raw |delta_H| above which (or non-finite values for which) the step
         is recorded as a divergence. Default 100.
 
+    References
+    ----------
+    Brofos and Lederman, Evaluating the implicit midpoint integrator for
+    Riemannian manifold Hamiltonian Monte Carlo (2021), Algorithm I.M.(a).
+
     Notes
     -----
-    RMHMC exposes no ``target_accept_prob``.
     The implicit-midpoint integrator can conserve energy over a wide range of
     step sizes, and exactly so on a Gaussian target up to the fixed-point
     tolerance. That makes acceptance a poor thing to adapt against, because
