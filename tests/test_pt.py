@@ -11,8 +11,7 @@ import math
 import torch
 import pytest
 
-from muMCMC import RMHMC, PT, NormalSpace, UnnormalizedSpace
-from pyro.distributions import Normal
+from muMCMC import RMHMC, PT, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 

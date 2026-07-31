@@ -14,23 +14,10 @@ import torch
 import pytest
 
 from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState, ChartConstraint
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace
 from muMCMC.PT import PT
 
 torch.set_default_dtype(torch.float64)
-
-
-def _eye(n):
-    """Identity prior metric. ChartRATTLE requires the space to supply M, and
-    these targets all want the plain identity."""
-    return lambda th: torch.eye(n).expand(th.shape[0], n, n)
-
-
-def _N01():
-    """Explicit standard-normal prior, the latent of the plain non-centered
-    parameterization. ChartRATTLE reads the prior off the space, so it is named
-    rather than assumed."""
-    return torch.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0))
 
 
 class FunnelChart(ChartConstraint):

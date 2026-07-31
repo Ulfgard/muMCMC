@@ -29,7 +29,7 @@ from muMCMC.RMHMC import (
     _implicit_midpoint_step,
 )
 from muMCMC._solvers import FixedPointSolver
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -446,7 +446,7 @@ def test_fallback_only_touches_unconverged_chains():
     eps = torch.tensor([0.3, 1.8])                     # easy, then diverges undamped
 
     qb, pb, ib, rb = _implicit_midpoint_step( q2, p2, eps, ev, _fp("picard", max_iter=100, tol=1e-9, damping=1.0))                # no ladder
-    ql, pl, il, rl = _implicit_midpoint_step( q2, p2, eps, ev, _fp("picard", max_iter=100, tol=1e-9, damping=1.0, fallback_damping=(0.5,), fallback_iter_scale=3))
+    ql, _, il, rl = _implicit_midpoint_step( q2, p2, eps, ev, _fp("picard", max_iter=100, tol=1e-9, damping=1.0, fallback_damping=(0.5,), fallback_iter_scale=3))
 
     # easy chain untouched by the ladder
     assert torch.equal(qb[0], ql[0]) and torch.equal(ib[0], il[0])

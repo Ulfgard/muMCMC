@@ -21,7 +21,7 @@ import pytest
 from muMCMC.ChartRATTLE import (
     ChartRATTLE, ChartRATTLEState, ChartConstraint, LocationScaleChart)
 from muMCMC.RMHMC import _hamiltonian
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace
 
 torch.set_default_dtype(torch.float64)
 

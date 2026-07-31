@@ -25,19 +25,6 @@ from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 torch.set_default_dtype(torch.float64)
 
 
-def _eye(n):
-    """Identity prior metric. ChartRATTLE requires the space to supply M, and
-    these targets all want the plain identity."""
-    return lambda th: torch.eye(n).expand(th.shape[0], n, n)
-
-
-def _N01():
-    """Explicit standard-normal prior, the latent of the plain non-centered
-    parameterization. ChartRATTLE reads the prior off the space, so it is named
-    rather than assumed."""
-    return torch.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0))
-
-
 class FunnelChart(ChartConstraint):
     """Neal funnel x = e^{σ q / 2} ε with q ~ N(0, 1). ψ = e^{−σ q / 2} x,
     W = (σ/2) ψ, log|det B| = (m/2) σ q. Temperature-free."""
@@ -124,7 +111,9 @@ def test_metric_scales_with_beta():
     _, m1, _, W = _eval(c, eta, beta=1.0, grad=False)
     _, mb, _, _ = _eval(c, eta, beta=0.3, grad=False)
     n = eta.shape[-1]
-    assert torch.allclose(mb.value, torch.eye(n) + 0.3 * W.transpose(-2, -1) @ W, atol=1e-10)
+    gram = W.transpose(-2, -1) @ W
+    assert torch.allclose(m1.value, torch.eye(n) + gram, atol=1e-10)
+    assert torch.allclose(mb.value, torch.eye(n) + 0.3 * gram, atol=1e-10)
 
 
 # ========================================================================== #
@@ -136,8 +125,8 @@ def test_explicit_jacobian_matches_autograd_default():
     # W (LocationScaleChart). W, U and ∇V must agree.
     fun, ls, _ = _funnel_pair()
     eta = torch.randn(8, 1)
-    Uf, mf, _, Wf, gf = _eval(fun, eta)
-    Ul, ml, _, Wl, gl = _eval(ls, eta)
+    Uf, _, _, Wf, gf = _eval(fun, eta)
+    Ul, _, _, Wl, gl = _eval(ls, eta)
     assert torch.allclose(Wf, Wl, atol=1e-9)
     assert torch.allclose(Uf.value, Ul.value, atol=1e-9)
     assert torch.allclose(gf, gl, atol=1e-8)

@@ -11,7 +11,7 @@ import pytest
 
 from muMCMC.RMHMC import RMHMC, RMHMCState
 from muMCMC._adapters import Reinforce, NoAdaptation
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 

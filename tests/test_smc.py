@@ -11,9 +11,8 @@ import math
 import torch
 import pytest
 
-from muMCMC import RMHMC, SMC, NormalSpace, UnnormalizedSpace
+from muMCMC import RMHMC, SMC, NormalSpace
 from muMCMC.SMC import _systematic_resample
-from pyro.distributions import Normal
 
 torch.set_default_dtype(torch.float64)
 

@@ -7,10 +7,8 @@ seed-fixed and sized to run on CPU in CI.  NUTS uses a single chain to avoid
 multiprocessing; RMHMC is batched in-process so it uses several chains.
 """
 import torch
-import pytest
-from pyro.distributions import Normal
 
-from muMCMC import RMHMC, NUTS, NormalSpace, UnnormalizedSpace
+from muMCMC import RMHMC, NUTS, NormalSpace
 from muMCMC._adapters import DualAveraging, Reinforce
 
 torch.set_default_dtype(torch.float64)

@@ -18,7 +18,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace
 from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_evidence
 
 torch.set_default_dtype(torch.float64)

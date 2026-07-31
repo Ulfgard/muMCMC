@@ -9,7 +9,7 @@ import math
 
 import torch
 
-from muMCMC.validation.mixture import GaussianMixture, ConditionalGaussianMixture
+from muMCMC.validation.mixture import GaussianMixture
 
 torch.set_default_dtype(torch.float64)
 
