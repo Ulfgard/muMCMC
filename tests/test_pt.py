@@ -116,3 +116,28 @@ def test_pt_recovers_bimodal_with_balanced_mass():
     assert float(near_neg.to(torch.float64).mean()) > 0.3
     frac_pos = float((x > 0).to(torch.float64).mean())
     assert frac_pos == pytest.approx(0.5, abs=0.15)
+
+
+def test_pt_reports_the_kernel_s_coordinates():
+    # PT wraps a kernel that may run in coordinates of its own, so a run has to
+    # come back on the variables rather than on the kernel's positions. A chart
+    # that is the identity hides the difference, so this one is shifted.
+    from muMCMC import ChartRATTLE, NormalSpace
+    from muMCMC.ChartRATTLE import LocationScaleChart
+
+    torch.manual_seed(0)
+    m, shift = 3, 5.0
+    space = NormalSpace(["v"], mu=shift, sigma=1.0)
+    chart = LocationScaleChart(
+        mean=lambda th: torch.tanh(th).expand(th.shape[0], m),
+        cov=lambda th: (torch.exp(0.3 * th[:, 0])[:, None, None]
+                        * torch.eye(m, dtype=th.dtype)),
+        x=torch.randn(m))
+    kernel = ChartRATTLE(chart, space, step_size=0.1, num_steps=6,
+                         adapt_step_size=False)
+    pt = PT(kernel, torch.tensor([0.5, 1.0]))
+    out = pt.run_mcmc({"v": torch.tensor(shift)}, 60, 40, num_chains=4,
+                      disable_progbar=True)
+    # theta = shift + q, so draws sit near the shift. Reporting q would put them
+    # near zero.
+    assert abs(float(out["v"].mean()) - shift) < 1.0
