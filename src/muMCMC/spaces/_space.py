@@ -21,13 +21,6 @@ from ._transform import NormalTransform
 class Space:
     """Named variables with a prior, read in the prior's normal chart.
 
-    A subclass supplies :attr:`as_transform`, the map ``theta = T(z)`` over the
-    free variables, and takes ``names`` and ``fixed`` as below plus ``dtype``
-    and ``device`` for its prior parameters. Each prior parameter is a scalar
-    shared across the free variables, a dict keyed by name, or a tensor in
-    free-name order, and raises when it misses a free name or is the wrong
-    shape.
-
     A point is a dict keyed by name, which is the only form a caller deals in.
     Inside, it is a free vector ``(..., d)`` over :attr:`free_names`, which the
     chain and the prior act on, and :meth:`to_full` widens that to the
@@ -61,7 +54,6 @@ class Space:
         self._free_names = [name for name in self.names if name not in self.fixed]
         index = {name: i for i, name in enumerate(self.names)}
         self.free_indices = [index[name] for name in self._free_names]
-        self.fixed_indices = [index[name] for name in self.fixed]
         self._template_cache = {}
 
     # ---- naming ------------------------------------------------------------ #
@@ -156,11 +148,12 @@ class Space:
         """Hold the same names fixed at new values, in place.
 
         The free/fixed split does not move, so everything derived from it stays
-        valid and nothing is rebuilt: only :meth:`to_full` reads the values, so
-        this changes what a model potential is handed and nothing else. It
-        mutates rather than returning a copy, so a sampler already holding the
-        space picks the new values up, which is the point when one space serves
-        a sequence of problems differing only in what they pin.
+        valid and nothing is rebuilt. The values are read by :meth:`to_full` and
+        by :meth:`add_fixed`, so this changes what a model potential is handed
+        and what a run reports, and nothing else. It mutates rather than
+        returning a copy, so a sampler already holding the space picks the new
+        values up, which is the point when one space serves a sequence of
+        problems differing only in what they pin.
 
         Raises
         ------
@@ -186,9 +179,9 @@ class Space:
 
     # ---- prior ------------------------------------------------------------- #
 
-    def prior_log_prob(self, y: dict) -> torch.Tensor:
-        """Factorized log-prior over the free names present in ``y``, a dict of
-        points on the variables of shape ``(...)``, giving ``(...)``.
+    def prior_log_prob(self, theta: dict) -> torch.Tensor:
+        """Factorized log-prior over the free names present in ``theta``, a dict
+        of points on the variables of shape ``(...)``, giving ``(...)``.
 
         The prior factorizes over the coordinate axis, so a subset of the free
         names gives the marginal over that subset. A name left out by accident
@@ -198,21 +191,21 @@ class Space:
         Raises
         ------
         ValueError
-            If ``y`` holds none of the free names.
+            If ``theta`` holds none of the free names.
         """
-        present = [i for i, name in enumerate(self._free_names) if name in y]
+        present = [i for i, name in enumerate(self._free_names) if name in theta]
         if not present:
-            raise ValueError("y contains none of the free parameter names")
+            raise ValueError("theta contains none of the free parameter names")
 
         # A variable the marginal does not range over is held at T(0), which is
         # in the support and so keeps its factor finite before it is dropped.
-        ref = y[self._free_names[present[0]]]
+        ref = theta[self._free_names[present[0]]]
         interior = self.as_transform.interior_point.to(ref.dtype)
-        theta = interior.expand(ref.shape + (self.d,)).clone()
+        theta_free = interior.expand(ref.shape + (self.d,)).clone()
         for i in present:
-            theta[..., i] = y[self._free_names[i]]
-        idx = torch.as_tensor(present, device=theta.device)
-        return self.as_transform.log_prob(theta).index_select(-1, idx).sum(-1)
+            theta_free[..., i] = theta[self._free_names[i]]
+        idx = torch.as_tensor(present, device=theta_free.device)
+        return self.as_transform.log_prob(theta_free).index_select(-1, idx).sum(-1)
 
     def prior_log_prob_vector(self, theta_free: torch.Tensor) -> torch.Tensor:
         """Log-prior on a free vector ``(..., d)``, shape ``(...)``."""
@@ -224,9 +217,8 @@ class Space:
 
             M_ii = (dz_i/dtheta_i)²,
 
-        or None when the space carries no prior. It is the pullback of the
-        identity along the chart, so it is the metric the prior itself induces on
-        the variables, and it varies with position.
+        It is the pullback of the identity along the chart, so it is the metric
+        the prior itself induces on the variables, and it varies with position.
         """
         return torch.diag_embed(self.as_transform.metric(theta_free))
 

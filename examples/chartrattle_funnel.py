@@ -5,8 +5,8 @@ Generative model, the hierarchical form ChartRATTLE targets:
     η ~ N(0, 1)                       log-scale hyperparameter
     x = e^{σ η / 2} ε,   ε ~ N(0, I_m)    noisy observation at that scale
 
-We observe one x and want p(η | x). ChartRATTLE samples the joint (η, ε)
-constrained to {φ_η(ε) = x} and reads η = θ off the constrained chain. The
+We observe one x and want p(η | x). ChartRATTLE samples the joint (η, ε) on the
+manifold {φ_η(ε) = x} and reports η, the variable θ, off that chain. The
 funnel is a conditionally-Gaussian layer μ(η) = 0, Σ(η) = e^{σ η} I, so it is a
 plain LocationScaleChart: the user supplies μ and Σ, nothing else.
 

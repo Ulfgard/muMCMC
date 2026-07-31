@@ -54,7 +54,7 @@ class LMCState:
     Parameters
     ----------
     q : Tensor, shape (N, d)
-        Position in the space's normal chart, free coordinates.
+        Position, which is the free variables ``theta`` in free-name order.
     v : Tensor, shape (N, d), or None
         Velocity. Drawn by ``sample_momentum`` and ``None`` only on the initial
         state before the first step.
@@ -88,13 +88,13 @@ class LMCState:
         """Per-chain choice between this endpoint (where ``accepted``) and the
         start ``other``. The Jacobian accumulator resets for the next step."""
         pick = accepted.unsqueeze(-1)
-        z = torch.zeros(self.q.shape[0], dtype=self.q.dtype, device=self.q.device)
+        zeros = torch.zeros(self.q.shape[0], dtype=self.q.dtype, device=self.q.device)
         return LMCState(
             torch.where(pick, self.q, other.q),
             torch.where(pick, self.v, other.v),
             self.U.select(accepted, other.U),
             self.metric.select(accepted, other.metric),
-            z,
+            zeros,
         )
 
 
@@ -111,9 +111,10 @@ class LMC(HamiltonianSampler):
 
         E(q, v) = U(q) - 1/2 log det G(q) + 1/2 v^T G(q) v,
 
-    with ``U`` the full chart potential and ``G`` the metric assembled by
-    ``MCMCSampler``. The integrator is explicit (a linear solve per
-    half-kick) and acceptance carries the trajectory Jacobian ``det J``.
+    with ``U`` the potential and ``G`` the metric assembled by ``MCMCSampler``.
+    The chain runs on the free variables, so ``q`` is ``theta``. The integrator
+    is explicit (a linear solve per half-kick) and acceptance carries the
+    trajectory Jacobian ``det J``.
 
     User contract
     -------------

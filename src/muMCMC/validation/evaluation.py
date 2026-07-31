@@ -2,25 +2,25 @@
 #                                                                             #
 #  Evidence and posterior density from MCMC draws                             #
 #                                                                             #
-#  Given posterior draws y ~ p(y|x), the likelihood p(x|y) bound in the       #
-#  sampler, and the space's prior p(y), this module estimates                 #
+#  Given posterior draws theta ~ p(theta|x), the likelihood p(x|theta) in the #
+#  sampler, and the space's prior p(theta), this module estimates             #
 #                                                                             #
-#      log p(x)   = log INT p(x|y) p(y) dy               the evidence         #
-#      log p(y|x) = loglik(y) + log p(y) - log p(x)   the posterior density   #
+#      log p(x)       = log INT p(x|theta) p(theta) dtheta      the evidence  #
+#      log p(theta|x) = loglik(theta) + log p(theta) - log p(x) the posterior #
 #                                                                             #
 #  Derivation of the evidence estimator (BAR, the Bennett acceptance ratio in #
 #  its reverse-logistic-regression form).                                     #
 #                                                                             #
-#  Work happens on the variables y, where sampler.evaluate_model(y).value is  #
-#  exactly -log f(y) for the unnormalized posterior density                   #
+#  Work happens on the variables theta, where the value returned by           #
+#  sampler.evaluate_model(theta) is exactly -log f(theta) for the             #
+#  unnormalized posterior density                                             #
 #                                                                             #
-#      f(y) = p(x|y) p(y),                                                    #
+#      f(theta) = p(x|theta) p(theta),                                        #
 #                                                                             #
-#  whose integral over z is the evidence. Fit a reference q-hat, a Gaussian   #
-#  mixture, to the z-draws and form the log-ratio                             #
+#  whose integral is the evidence. Fit a reference q-hat, a Gaussian mixture, #
+#  to the draws and form the log-ratio                                        #
 #                                                                             #
-#      W(z) = log f(z) - log q-hat(z)                                         #
-#           = -evaluate_model(z).value - log q-hat(z)                         #
+#      W(theta) = log f(theta) - log q-hat(theta)                             #
 #                                                                             #
 #  on the n1 posterior draws and on n0 draws from q-hat. The scalar b solving #
 #                                                                             #
@@ -33,13 +33,11 @@
 #  The root is unique and always bracketed, because                           #
 #  g(b) = n1 - SUM sigmoid(W + b) decreases strictly from +n1 to -n0.         #
 #                                                                             #
-#  The evidence is reparameterization-invariant, so the z-space value equals  #
-#  the y-space integral. Everything uses the sampler's current beta, so a     #
-#  tempered sampler yields the correspondingly tempered evidence.             #
+#  Everything uses the sampler's current beta, so a tempered sampler yields   #
+#  the correspondingly tempered evidence.                                     #
 #                                                                             #
-#  The prior is assumed proper and normalized, as set out in the prior        #
-#  contract in spaces. An unnormalized prior shifts log p(x) by its missing   #
-#  constant.                                                                  #
+#  The prior is assumed proper and normalized. An unnormalized prior shifts   #
+#  log p(x) by its missing constant.                                          #
 #                                                                             #
 # =========================================================================== #
 
@@ -95,21 +93,22 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
     return offset - brentq(g, lo, hi)
 
 
-def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
+def _bar_evidence(theta: torch.Tensor, log_target, *, n_components: int = 1,
                   n_q: Optional[int] = None, jitter: float = 1e-6,
                   generator: Optional[torch.Generator] = None,
-                  log_target_z: Optional[torch.Tensor] = None,
+                  log_target_theta: Optional[torch.Tensor] = None,
                   q: Optional[GaussianMixture] = None,
                   init: Optional[GaussianMixture] = None,
                   max_iter: int = 200, tol: float = 1e-5) -> float:
-    """BAR log-evidence of ``exp(log_target)`` from its draws ``z`` (shape ``(n, d)``).
+    """BAR log-evidence of ``exp(log_target)`` from its draws ``theta``, of
+    shape ``(n, d)``.
 
-    Fits a Gaussian mixture ``q̂`` to ``z``, draws ``n_q`` points from it, and
-    solves the BAR root over ``W = log_target − log q̂`` on both sets.
+    Fits a Gaussian mixture ``q̂`` to ``theta``, draws ``n_q`` points from it,
+    and solves the BAR root over ``W = log_target − log q̂`` on both sets.
 
     Parameters
     ----------
-    z : Tensor, shape (n, d)
+    theta : Tensor, shape (n, d)
         Draws from the normalized target, in the coordinates of ``log_target``.
     log_target : callable
         Maps ``(N, d) -> (N,)``, the unnormalized target log-density ``log f``.
@@ -121,11 +120,11 @@ def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
         Diagonal loading for the component covariances.
     generator : torch.Generator, optional
         RNG for the fit and the ``q̂`` draws.
-    log_target_z : Tensor, optional
-        Precomputed ``log_target(z)``. Pass it to avoid re-evaluating an
+    log_target_theta : Tensor, optional
+        Precomputed ``log_target(theta)``. Pass it to avoid re-evaluating an
         expensive target on the input draws.
     q : GaussianMixture, optional
-        A ``q̂`` already fitted to ``z``. Pass it to avoid refitting.
+        A ``q̂`` already fitted to ``theta``. Pass it to avoid refitting.
     init : GaussianMixture, optional
         Warm-start fit for ``q̂`` (e.g. a pooled fit when refitting one chain).
     max_iter, tol : int, float
@@ -136,15 +135,15 @@ def _bar_evidence(z: torch.Tensor, log_target, *, n_components: int = 1,
     float
         BAR estimate of ``log ∫ f``.
     """
-    n = z.shape[0]
+    n = theta.shape[0]
     if q is None:
-        q = GaussianMixture.fit(z, n_components, jitter=jitter, generator=generator,
+        q = GaussianMixture.fit(theta, n_components, jitter=jitter, generator=generator,
                                 init=init, max_iter=max_iter, tol=tol)
     n0 = n if n_q is None else int(n_q)
-    z_q = q.sample(n0, generator=generator)
-    lf_z = log_target(z) if log_target_z is None else log_target_z
-    W_post = lf_z - q.log_prob(z)
-    W_q = log_target(z_q) - q.log_prob(z_q)
+    theta_q = q.sample(n0, generator=generator)
+    lf = log_target(theta) if log_target_theta is None else log_target_theta
+    W_post = lf - q.log_prob(theta)
+    W_q = log_target(theta_q) - q.log_prob(theta_q)
     return _bar_root(W_post, W_q)
 
 
@@ -152,15 +151,15 @@ class PosteriorEvaluation:
     """Evidence and posterior density from posterior draws.
 
     Estimates the log-evidence ``log Z`` of the density the sampler targets and
-    the posterior log-density ``log p(y|x)`` that follows from it. When that
-    density is a valid posterior ``p(x|y) p(y)``, ``log Z`` is exactly the model
-    evidence ``log p(x)``. Otherwise it is the log normalizer of whatever
-    unnormalized density the sampler was run on.
+    the posterior log-density ``log p(theta|x)`` that follows from it. When that
+    density is a valid posterior ``p(x|theta) p(theta)``, ``log Z`` is exactly
+    the model evidence ``log p(x)``. Otherwise it is the log normalizer of
+    whatever unnormalized density the sampler was run on.
 
     The estimator is BAR (Bennett acceptance ratio, Bennett 1976), cast as
     reverse logistic regression (Geyer 1994). A reference ``q̂`` is fitted to the
-    draws as a Gaussian mixture on the variables, and
-    ``log Z`` is the intercept discriminating the draws from samples of ``q̂``.
+    draws as a Gaussian mixture on the variables, and ``log Z`` is the intercept
+    discriminating the draws from samples of ``q̂``.
     Fitting ``q̂`` on the same draws leaves the estimator consistent. The quality
     of the mixture fit sets the variance, not the limit.
 
@@ -170,7 +169,7 @@ class PosteriorEvaluation:
         The sampler that drew ``samples``. Supplies ``evaluate_model`` and
         ``space``. Its current ``beta`` sets the temperature of the evidence.
     samples : dict[str, Tensor]
-        Constrained draws keyed by free parameter name, as returned by
+        Draws on the variables keyed by free parameter name, as returned by
         ``run_mcmc`` (grouped by chain, shape ``(num_chains, num_samples)``). A
         single ungrouped axis ``(num_samples,)`` is also accepted.
     n_components : int
@@ -222,7 +221,7 @@ class PosteriorEvaluation:
         self._jackknife = bool(jackknife)
         self._generator = generator
 
-        # Constrained free vector grouped by chain: (K, n, d).
+        # Free vector on the variables, grouped by chain: (K, n, d).
         theta_free = self.space.to_free_vector(samples)
         if theta_free.dim() == 2:                   # (n, d) -> single chain
             theta_free = theta_free.unsqueeze(0)
@@ -250,7 +249,7 @@ class PosteriorEvaluation:
         # Main estimate: BAR on the pooled draws over all chains.
         self._log_evidence = _bar_evidence(
             self._theta.reshape(K * n, d), self._log_target, n_q=self._n0,
-            jitter=jitter, generator=generator, log_target_z=self._log_f_post,
+            jitter=jitter, generator=generator, log_target_theta=self._log_f_post,
             q=self._q_pool)
 
     def _log_target(self, theta: torch.Tensor) -> torch.Tensor:
@@ -267,54 +266,59 @@ class PosteriorEvaluation:
 
     @cached_property
     def entropy(self) -> float:
-        """Posterior entropy ``H[p(y|x)] = logZ − E_post[loglik] − E_post[log_prior]``,
-        a plain Monte Carlo average over the draws (w.r.t. ``dy``)."""
+        """Posterior entropy ``H[p(theta|x)] = logZ − E_post[loglik] −
+        E_post[log_prior]``, a plain Monte Carlo average over the draws (w.r.t.
+        ``dtheta``)."""
         theta = self._theta.reshape(self._n1, self._d)
         loglik = self._tempered_loglik(theta)
         log_prior = self.space.prior_log_prob_vector(theta)
         return self.log_evidence - float(loglik.mean()) - float(log_prior.mean())
 
-    def information_gain(self, y_star: dict, *, target_ess: Optional[float] = None,
+    def information_gain(self, theta_star: dict, *, target_ess: Optional[float] = None,
                          max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                          generator: Optional[torch.Generator] = None,
                          return_ess: bool = False):
-        """``log[ p(y*|x) / p(y*) ]`` at variable points ``y*``.
+        """``log[ p(theta*|x) / p(theta*) ]`` at points ``theta*`` on the
+        variables.
 
-        With every free name present this is ``loglik(y*) − logZ`` (the prior
-        cancels). With a subset present the rest is marginalized out, giving the
-        marginal information gain ``log ∫ p(x|y*_a,y_b) p(y_b) dy_b − logZ`` by the
-        same importance sampler as :meth:`log_posterior`.
+        With every free name present this is ``loglik(theta*) − logZ`` (the
+        prior cancels). With a subset present the rest is marginalized out,
+        giving the marginal information gain
+        ``log ∫ p(x|theta*_a, theta_b) p(theta_b) dtheta_b − logZ`` by the same
+        importance sampler as :meth:`log_posterior`.
         """
-        excluded = [name for name in self.space.free_names if name not in y_star]
+        excluded = [name for name in self.space.free_names
+                    if name not in theta_star]
         if not excluded:
             ig = self._tempered_loglik(
-                self.space.to_free_vector(y_star)) - self.log_evidence
+                self.space.to_free_vector(theta_star)) - self.log_evidence
             return (ig, None) if return_ess else ig
 
         log_post, ess = self._log_marginal_posterior(
-            y_star, excluded, target_ess, max_marginal, prior_weight, generator)
-        ig = log_post - self.space.prior_log_prob(y_star)
+            theta_star, excluded, target_ess, max_marginal, prior_weight, generator)
+        ig = log_post - self.space.prior_log_prob(theta_star)
         return (ig, ess) if return_ess else ig
 
-    def log_posterior(self, y: dict, *, target_ess: Optional[float] = None,
+    def log_posterior(self, theta: dict, *, target_ess: Optional[float] = None,
                       max_marginal: Optional[int] = None, prior_weight: float = 0.5,
                       generator: Optional[torch.Generator] = None,
                       return_ess: bool = False):
-        """``log p(y|x)`` at variable points ``y``, a density w.r.t. ``dy``.
+        """``log p(theta|x)`` at points ``theta`` on the variables, a density
+        w.r.t. ``dtheta``.
 
-        The free names present in ``y`` select the marginal. All names gives the
-        exact full density ``loglik(y) + log_prior(y) − logZ``. A subset gives the
-        marginal over those names, integrating the rest out by importance
-        sampling from a mixture of the prior and the joint ``q̂`` conditioned on
-        ``y_a`` (``prior_weight`` is the mixture weight on the prior). Draws are
-        added until every query point reaches ``target_ess`` or ``max_marginal``
-        draws are spent.
+        The free names present in ``theta`` select the marginal. All names gives
+        the exact full density ``loglik(theta) + log_prior(theta) − logZ``. A
+        subset gives the marginal over those names, integrating the rest out by
+        importance sampling from a mixture of the prior and the joint ``q̂``
+        conditioned on ``theta_a`` (``prior_weight`` is the mixture weight on
+        the prior). Draws are added until every query point reaches
+        ``target_ess`` or ``max_marginal`` draws are spent.
 
         Parameters
         ----------
-        y : dict[str, Tensor]
-            Query points on the variables keyed by free name. All free names give the
-            full density, a subset the marginal over those names.
+        theta : dict[str, Tensor]
+            Query points on the variables keyed by free name. All free names
+            give the full density, a subset the marginal over those names.
         target_ess : float, optional
             Per-query-point weight ESS to reach before stopping. Default draws
             ``max_marginal`` in one shot.
@@ -329,35 +333,37 @@ class PosteriorEvaluation:
             If True, also return the per-query-point weight ESS (``None`` for the
             exact full density).
         """
-        excluded = [name for name in self.space.free_names if name not in y]
+        excluded = [name for name in self.space.free_names if name not in theta]
         if not excluded:
             value = self.sampler.evaluate_model(
-                self.space.to_free_vector(y))[0].value
-            # log p(y|x) = loglik + log_prior − logZ = −value − logZ.
+                self.space.to_free_vector(theta))[0].value
+            # log p(theta|x) = loglik + log_prior − logZ = −value − logZ.
             log_post = -value - self.log_evidence
             return (log_post, None) if return_ess else log_post
 
         log_post, ess = self._log_marginal_posterior(
-            y, excluded, target_ess, max_marginal, prior_weight, generator)
+            theta, excluded, target_ess, max_marginal, prior_weight, generator)
         return (log_post, ess) if return_ess else log_post
 
-    def _log_marginal_posterior(self, y: dict, excluded: list,
+    def _log_marginal_posterior(self, theta: dict, excluded: list,
                                 target_ess: Optional[float], max_marginal: Optional[int],
                                 alpha: float, generator: Optional[torch.Generator]):
-        """Marginal ``log p(y_a|x)`` with the ``excluded`` block integrated out by
-        mixture importance sampling, drawn adaptively. Returns ``(log_post, ess)``."""
+        """Marginal ``log p(theta_a|x)`` with the ``excluded`` block integrated
+        out by mixture importance sampling, drawn adaptively. Returns
+        ``(log_post, ess)``."""
         if not 0.0 <= alpha <= 1.0:
             raise ValueError(f"prior_weight must be in [0, 1], got {alpha}")
         free_names = self.space.free_names
-        a_idx = [i for i, name in enumerate(free_names) if name in y]
-        b_idx = [i for i, name in enumerate(free_names) if name not in y]
+        a_idx = [i for i, name in enumerate(free_names) if name in theta]
+        b_idx = [i for i, name in enumerate(free_names) if name not in theta]
         if not a_idx:
-            raise ValueError("log_posterior needs at least one free name in y")
+            raise ValueError(
+                "log_posterior needs at least one free name in theta")
         a_names = [free_names[i] for i in a_idx]
         b_names = [free_names[i] for i in b_idx]
         na, nb = len(a_idx), len(b_idx)
 
-        M = y[a_names[0]].shape[0]
+        M = theta[a_names[0]].shape[0]
         d = self._d
         dtype, device = self._theta.dtype, self._theta.device
         a_t = torch.tensor(a_idx, device=device)
@@ -365,13 +371,15 @@ class PosteriorEvaluation:
 
         # The b block is filled with the interior placeholder T(0), which is in
         # the support of every coordinate, and dropped again straight after.
-        y0 = self.space.from_free_vector(self.space.as_transform.interior_point.to(dtype))
-        full = {name: y[name] for name in a_names}
+        theta0 = self.space.from_free_vector(
+            self.space.as_transform.interior_point.to(dtype))
+        full = {name: theta[name] for name in a_names}
         for name in b_names:
-            full[name] = y0[name].expand(M)
+            full[name] = theta0[name].expand(M)
         theta_a = self.space.to_free_vector(full)[:, a_t]                 # (M, |a|)
 
-        # Conditional q(z_b | z_a) from the pooled joint fit (itself a mixture).
+        # Conditional q(theta_b | theta_a) from the pooled joint fit (itself a
+        # mixture).
         q_b = self._q_pool.conditional(a_idx, b_idx, theta_a, jitter=self._jitter)
 
         def draw(n_prior, n_cond):
@@ -381,7 +389,7 @@ class PosteriorEvaluation:
                 blocks.append(q_b.sample(n_cond, generator=generator))
             if n_prior > 0:
                 prior = self.space.sample(n_prior, generator=generator)  # shared over query points
-                full_p = {name: y0[name].expand(n_prior) for name in a_names}
+                full_p = {name: theta0[name].expand(n_prior) for name in a_names}
                 for name in b_names:
                     full_p[name] = prior[name]
                 theta_bp = self.space.to_free_vector(full_p)[:, b_t]
@@ -429,7 +437,8 @@ class PosteriorEvaluation:
             step *= 2
 
         log_integral = torch.logsumexp(log_w, 1) - math.log(drawn)
-        log_post = self.space.prior_log_prob(y) + log_integral - self.log_evidence
+        log_post = (self.space.prior_log_prob(theta) + log_integral
+                    - self.log_evidence)
         return log_post, ess
 
     def _tempered_loglik(self, theta: torch.Tensor) -> torch.Tensor:
@@ -454,7 +463,7 @@ class PosteriorEvaluation:
                 self._theta[[j for j in range(K) if j != k]].reshape((K - 1) * n, self._d),
                 self._log_target, n_components=self._n_components, n_q=self._n0,
                 jitter=self._jitter, generator=self._generator,
-                log_target_z=lf[[j for j in range(K) if j != k]].reshape(-1),
+                log_target_theta=lf[[j for j in range(K) if j != k]].reshape(-1),
                 init=self._q_pool, max_iter=self._max_iter, tol=self._tol)
             for k in range(K)
         ])
@@ -481,7 +490,7 @@ class PosteriorEvaluation:
         return torch.tensor([
             _bar_evidence(self._theta[k], self._log_target, n_components=self._n_components,
                           jitter=self._jitter, generator=self._generator,
-                          log_target_z=self._log_f_post[k * n:(k + 1) * n],
+                          log_target_theta=self._log_f_post[k * n:(k + 1) * n],
                           init=self._q_pool, max_iter=self._max_iter, tol=self._tol)
             for k in range(K)
         ])

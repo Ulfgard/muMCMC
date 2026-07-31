@@ -2,15 +2,15 @@
 
 NUTS currently delegates the actual transitions to Pyro, so it is correct by
 construction.  What is *ours* -- and what these tests pin down -- is the
-constrained-space reparameterization layered on top: the potential Pyro sees is
+potential layered on top: the one Pyro sees is
 
-    U(z) = U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
+    U(theta) = U_lik(theta_full) - log p(theta)
 
 assembled in ``MCMCSampler.evaluate_model``, plus the free/fixed splicing and the
-output schema.  The statistical tests below (sample the prior; sample a flat
-target on a box and recover a *uniform* marginal) exercise exactly the prior and
-Jacobian terms that a future non-Pyro kernel would have to reproduce, so they
-double as a behaviour spec should we ever cut the Pyro tether.
+output schema.  The statistical tests below sample the prior under a flat
+likelihood, which exercises the prior term a future non-Pyro kernel would have
+to reproduce, so they double as a behaviour spec should we ever cut the Pyro
+tether.
 
 Runs are single-chain (Pyro spawns a worker process per chain; single-chain
 keeps these in-process, fast, and deterministic) and seed-fixed.  Expensive
@@ -21,9 +21,8 @@ import math
 import torch
 import pytest
 import pyro
-from pyro.distributions import Normal
 
-from muMCMC import NUTS, LogNormalSpace, NormalSpace, UnnormalizedSpace
+from muMCMC import NUTS, LogNormalSpace, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -44,8 +43,8 @@ def _flat_likelihood(theta):
 
 @pytest.fixture(scope="module")
 def prior_run():
-    """Flat likelihood under N(0,1) priors on an unconstrained space: NUTS
-    should reproduce the prior as its stationary distribution."""
+    """Flat likelihood under N(0,1) priors: NUTS should reproduce the prior as
+    its stationary distribution."""
     torch.manual_seed(0)
     names = ["a", "b"]
     space = NormalSpace(names)

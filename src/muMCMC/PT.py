@@ -78,9 +78,9 @@ class PT(MCMCSampler):
         self.L, self.K = q.shape[0], len(self.betas)
         M = self.L * self.K
         self.sampler.beta = self.betas.unsqueeze(0).expand(self.L, -1).reshape(M)
-        z = q.unsqueeze(1).expand(self.L, self.K, -1).reshape(M, q.shape[-1])
+        q_rep = q.unsqueeze(1).expand(self.L, self.K, -1).reshape(M, q.shape[-1])
         self._reset_stats()
-        return _PTState(self.sampler.init(z), self.L, self.K)
+        return _PTState(self.sampler.init(q_rep), self.L, self.K)
 
     def _reset_stats(self):
         L, K = self.L, self.K

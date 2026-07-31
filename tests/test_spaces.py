@@ -1,14 +1,12 @@
 """Contract tests for the space classes.
 
 A space owns the parameter naming, the free/fixed split, the chart between the
-constrained variables and the standard normal, and the prior. The samplers drive
+variables and the standard normal latent, and the prior. The samplers drive
 spaces through a fixed protocol -- ``to_free_vector`` / ``from_free_vector``,
 ``to_full``, ``add_fixed`` / ``remove_fixed``, ``as_transform``,
 ``prior_log_prob[_vector]``, ``prior_metric``, ``free_block``, ``sample`` -- so
 these tests exercise that protocol's invariants.
 """
-import math
-
 import torch
 import pytest
 from torch.distributions import Normal
@@ -34,7 +32,6 @@ def test_dimensions_without_fixed():
     s = NormalSpace(NAMES)
     assert s.d == 3 and s.d_full == 3
     assert s.free_names == NAMES and s.free_indices == [0, 1, 2]
-    assert s.fixed_indices == []
 
 
 def test_dimensions_with_interior_fixed():
@@ -43,7 +40,7 @@ def test_dimensions_with_interior_fixed():
     s = NormalSpace(NAMES, fixed={"b": 0.5})
     assert s.d == 2 and s.d_full == 3
     assert s.free_names == ["a", "c"]
-    assert s.free_indices == [0, 2] and s.fixed_indices == [1]
+    assert s.free_indices == [0, 2]
 
 
 def test_fixed_names_must_appear_in_names():

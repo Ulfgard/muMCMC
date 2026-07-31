@@ -39,7 +39,7 @@ class NormalSpace(Space):
         log_sigma = torch.log(sigma)
         self._transform = NormalTransform(
             lambda z: (mu + sigma * z, log_sigma.expand_as(z)),
-            lambda th: ((th - mu) / sigma, (-log_sigma).expand_as(th)),
+            lambda theta: ((theta - mu) / sigma, (-log_sigma).expand_as(theta)),
             reference=mu)
 
     @property
@@ -99,7 +99,7 @@ class UnnormalizedSpace(Space):
         zero = torch.zeros(self.d, dtype=dtype, device=device)
         self._transform = NormalTransform(
             lambda z: (z, torch.zeros_like(z)),
-            lambda th: (th, torch.zeros_like(th)),
+            lambda theta: (theta, torch.zeros_like(theta)),
             reference=zero)
 
     @property

@@ -222,10 +222,10 @@ class HamiltonianSampler(MCMCSampler):
     def _reset_diagnostics(self):
         """Zero the delta_H summaries (and the subclass ones) for a new phase."""
         N = self.step_size.shape[0]
-        z = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
-        self._delta_H_last    = z.clone()
-        self._delta_H_abs_sum = z.clone()
-        self._delta_H_abs_max = z.clone()
+        zeros = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
+        self._delta_H_last    = zeros.clone()
+        self._delta_H_abs_sum = zeros.clone()
+        self._delta_H_abs_max = zeros.clone()
         self.reset_extra_diagnostics()
 
     # ---- hooks the subclass overrides --------------------------------------- #

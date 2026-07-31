@@ -1,9 +1,9 @@
 """Contract tests for the metric pipeline: ``space.free_block`` and the
 tempering-aware evaluation objects ``TemperedMetric`` / ``TemperedAffine``.
 
-``free_block`` restricts a metric over every variable to the free block
-and scales by the diagonal Jacobian ``dθ/dz`` (elementwise transforms, so the
-free block of the push-forward is the push-forward of the free block).
+``free_block`` restricts a metric over every variable to the free block, by
+dropping the rows and columns of the fixed variables. The chain runs on the
+variables, so nothing is transformed on the way.
 ``TemperedMetric`` and ``TemperedAffine`` assemble the metric and potential
 affinely in an inverse temperature; ``beta`` is slot-bound, so a moved
 configuration is retempered to its slot's temperature by ``reorder``/``select``
@@ -17,7 +17,6 @@ import torch
 from muMCMC.spaces import (
     TemperedMetric,
     TemperedAffine,
-    LogNormalSpace,
     NormalSpace,
     UnnormalizedSpace,
 )
@@ -44,22 +43,20 @@ def _identity_space(d):
 #  free_block                                                                 #
 # --------------------------------------------------------------------------- #
 
-def test_push_forward_identity_is_free_block():
+def test_free_block_is_the_whole_metric_without_fixed():
     torch.manual_seed(0)
     n, d = 4, 3
     s = _identity_space(d)
     G = _rand_spd(n, d)
-    z = torch.randn(n, d)
     A = s.free_block(G)
-    assert torch.allclose(A, G, atol=ATOL)          # identity J, no fixed
+    assert torch.allclose(A, G, atol=ATOL)          # nothing fixed
 
 
-def test_push_forward_projects_out_fixed():
+def test_free_block_projects_out_fixed():
     torch.manual_seed(1)
     n = 4
     s = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 0.0})   # free = a, b
     G = _rand_spd(n, 3)
-    z_free = torch.randn(n, 2)
     A = s.free_block(G)
     assert torch.allclose(A, G[:, :2, :2], atol=ATOL)
 
