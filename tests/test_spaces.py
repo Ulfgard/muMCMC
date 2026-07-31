@@ -140,6 +140,28 @@ def test_from_free_vector_rejects_the_wrong_width(width):
 #  Fixed variables at the dict level                                          #
 # --------------------------------------------------------------------------- #
 
+def test_set_fixed_repins_in_place():
+    # The point of mutating: one space serves a sequence of problems that
+    # differ only in the value pinned, so the chart is never rebuilt.
+    s = NormalSpace(NAMES, fixed={"b": 7.0})
+    chart = s.as_transform
+    free = torch.randn(5, 2)
+    s.set_fixed({"b": -3.0})
+    assert torch.allclose(s.to_full(free)[:, 1], torch.full((5,), -3.0),
+                          atol=ATOL)
+    assert torch.allclose(s.add_fixed({"a": torch.zeros(3)})["b"],
+                          torch.full((3,), -3.0), atol=ATOL)
+    assert s.as_transform is chart
+    assert s.free_names == ["a", "c"] and s.free_indices == [0, 2]
+
+
+def test_set_fixed_rejects_a_different_fixed_set():
+    s = NormalSpace(NAMES, fixed={"b": 7.0})
+    for bad in ({"c": 1.0}, {"b": 1.0, "c": 2.0}, {}):
+        with pytest.raises(ValueError, match="same names fixed"):
+            s.set_fixed(bad)
+
+
 def test_add_and_remove_fixed_round_trip():
     s = NormalSpace(NAMES, fixed={"c": 4.0})
     free = {"a": torch.randn(3), "b": torch.randn(3)}

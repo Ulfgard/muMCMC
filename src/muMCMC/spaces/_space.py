@@ -152,6 +152,29 @@ class Space:
                                        device=ref.device, dtype=ref.dtype)
         return samples
 
+    def set_fixed(self, fixed: dict) -> None:
+        """Hold the same names fixed at new values, in place.
+
+        The free/fixed split does not move, so everything derived from it stays
+        valid and nothing is rebuilt: only :meth:`to_full` reads the values, so
+        this changes what a model potential is handed and nothing else. It
+        mutates rather than returning a copy, so a sampler already holding the
+        space picks the new values up, which is the point when one space serves
+        a sequence of problems differing only in what they pin.
+
+        Raises
+        ------
+        ValueError
+            If ``fixed`` does not name exactly the variables already fixed.
+        """
+        if set(fixed) != set(self.fixed):
+            raise ValueError(
+                f"set_fixed holds the same names fixed, so that what is derived "
+                f"from the free/fixed split stays valid: got {sorted(fixed)} "
+                f"against {sorted(self.fixed)}")
+        self.fixed = dict(fixed)
+        self._template_cache.clear()
+
     def remove_fixed(self, samples: dict) -> dict:
         """``samples`` with every fixed name dropped."""
         if not self.fixed:
