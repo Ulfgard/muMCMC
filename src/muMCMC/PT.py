@@ -66,6 +66,14 @@ class PT(MCMCSampler):
         self.sampler = sampler
         self.betas = betas
 
+    def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """The kernel's own, since the replicas are the kernel's chains and run
+        in whatever coordinates it runs in."""
+        return self.sampler.to_position(theta_free)
+
+    def to_variables(self, q_free: torch.Tensor) -> torch.Tensor:
+        return self.sampler.to_variables(q_free)
+
     def init(self, q: torch.Tensor) -> _PTState:
         self.L, self.K = q.shape[0], len(self.betas)
         M = self.L * self.K
