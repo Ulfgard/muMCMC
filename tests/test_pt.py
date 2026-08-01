@@ -121,8 +121,8 @@ def test_pt_reports_the_kernel_s_coordinates():
     # PT wraps a kernel that may run in coordinates of its own, so a run has to
     # come back on the variables rather than on the kernel's positions. A chart
     # that is the identity hides the difference, so this one is shifted.
-    from muMCMC import ChartRATTLE, NormalSpace
-    from muMCMC.ChartRATTLE import LocationScaleChart
+    from muMCMC import ChartRMHMC, NormalSpace
+    from muMCMC.ChartRMHMC import LocationScaleChart
 
     torch.manual_seed(0)
     m, shift = 3, 5.0
@@ -132,7 +132,7 @@ def test_pt_reports_the_kernel_s_coordinates():
         cov=lambda th: (torch.exp(0.3 * th[:, 0])[:, None, None]
                         * torch.eye(m, dtype=th.dtype)),
         x=torch.randn(m))
-    kernel = ChartRATTLE(chart, space, step_size=0.1, num_steps=6,
+    kernel = ChartRMHMC(chart, space, step_size=0.1, num_steps=6,
                          adapt_step_size=False)
     pt = PT(kernel, torch.tensor([0.5, 1.0]))
     out = pt.run_mcmc({"v": torch.tensor(shift)}, 60, 40, num_chains=4,

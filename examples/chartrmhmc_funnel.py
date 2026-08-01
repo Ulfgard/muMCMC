@@ -1,21 +1,21 @@
-"""ChartRATTLE on Neal's funnel, given a noisy observation.
+"""ChartRMHMC on Neal's funnel, given a noisy observation.
 
-Generative model, the hierarchical form ChartRATTLE targets:
+The generative model, in the hierarchical form ChartRMHMC targets:
 
-    η ~ N(0, 1)                       log-scale hyperparameter
-    x = e^{σ η / 2} ε,   ε ~ N(0, I_m)    noisy observation at that scale
+    η ~ N(0, 1)                           log-scale hyperparameter
+    x = e^{σ η / 2} ε,   ε ~ N(0, I_m)    observation at that scale
 
-We observe one x and want p(η | x). ChartRATTLE samples the joint (η, ε) on the
-manifold {φ_η(ε) = x} and reports η, the variable θ, off that chain. The
-funnel is a conditionally-Gaussian layer μ(η) = 0, Σ(η) = e^{σ η} I, so it is a
-plain LocationScaleChart: the user supplies μ and Σ, nothing else.
+One x is observed and the target is p(η | x). ChartRMHMC samples the joint
+(η, ε) on the manifold {φ_η(ε) = x} and reports η, which is the variable θ.
+The funnel is a conditionally-Gaussian layer with μ(η) = 0 and
+Σ(η) = e^{σ η} I, so it is a LocationScaleChart built from μ and Σ alone.
 
-η is scalar, so the exact posterior is available by 1-D quadrature and we check
-the chain against it. Run:  python examples/chartrattle_funnel.py
+η is scalar, so the exact posterior follows from one-dimensional quadrature and
+the run is checked against it. Run:  python examples/chartrmhmc_funnel.py
 """
 import torch
 
-from muMCMC.ChartRATTLE import ChartRATTLE, LocationScaleChart
+from muMCMC.ChartRMHMC import ChartRMHMC, LocationScaleChart
 from muMCMC.spaces import NormalSpace
 
 torch.set_default_dtype(torch.float64)
@@ -29,7 +29,7 @@ def main():
     eta_true = torch.randn(1)
     x = torch.exp(sigma * eta_true / 2) * torch.randn(m)
 
-    # The model as the user writes it: batched μ(η) and Σ(η).
+    # The model is the batched μ(η) and Σ(η), and nothing else.
     mean = lambda eta: torch.zeros(eta.shape[0], m, dtype=eta.dtype)
     cov = lambda eta: torch.exp(sigma * eta[:, 0])[:, None, None] * torch.eye(m, dtype=eta.dtype)
     constraint = LocationScaleChart(mean, cov, x)
@@ -42,12 +42,12 @@ def main():
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
-    # Fixed step (adaptation is out of scope here). Anderson solves the n = 1
-    # position equation in a few iterations per substep.
-    sampler = ChartRATTLE(
+    # A fixed step size, so the run shows the integrator alone. Anderson
+    # solves the n = 1 position equation in a few iterations per substep.
+    sampler = ChartRMHMC(
         constraint,
-        # eta ~ N(0, 1) is the model's own prior, so the space carries it. The
-        # chain runs in its normal chart, which is where M = I comes from.
+        # eta ~ N(0, 1) is the model's own prior, so the space carries it, and
+        # its normal chart is where the constant prior block M = I comes from.
         NormalSpace(["log_scale"], mu=0.0, sigma=1.0),
         step_size=0.08, num_steps=12, adapt_step_size=False,
         solver="anderson", fp_tol=1e-9,
@@ -62,7 +62,7 @@ def main():
 
     print(f"\ntrue log-scale      {float(eta_true):+.4f}")
     print(f"quadrature          mean {float(mean_q):+.4f}   sd {float(sd_q):.4f}")
-    print(f"ChartRATTLE ({v.numel()})   mean {float(v.mean()):+.4f}   sd {float(v.std()):.4f}")
+    print(f"ChartRMHMC ({v.numel()})   mean {float(v.mean()):+.4f}   sd {float(v.std()):.4f}")
     print(f"acceptance          {float(diag['accept_rate'].mean()):.3f}")
     print(f"divergences         {int(diag['num_divergences'].sum())}")
     print(f"solve iters / step  {float(diag['fp_iters_mean'].mean()):.2f}")
