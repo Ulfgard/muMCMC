@@ -6,24 +6,30 @@ from .MCMCSampler import MCMCSampler
 
 
 # =========================================================================== #
-# Each replica keeps its temperature for the whole run, so the kernel's
-# per-temperature step size adapts during warmup. A swap only relabels
-# configurations across temperature slots: reorder permutes the kept kernel
-# state and retempers each moved configuration to its new slot temperature,
-# avoiding any model re-evaluation.
+#  Why a swap is a relabeling                                                 #
+#                                                                             #
+#  A temperature slot keeps its temperature for the whole run, so the         #
+#  kernel's step size for that slot adapts over every transition taken there  #
+#  rather than over a temperature that keeps changing under it.               #
+#                                                                             #
+#  A swap therefore moves configurations between slots instead of moving      #
+#  temperatures between configurations. reorder permutes the kernel state     #
+#  and leaves each slot's beta where it is, which recombines the two parts    #
+#  of every tempered quantity at the new temperature. No model evaluation is  #
+#  needed for that, so a swap sweep costs one permutation.                    #
 # =========================================================================== #
 
 
 class _PTState:
-    """Kernel state over ``L * K`` replica slots. ``q`` returns the target chain
-    (``beta = betas[-1]``).
+    """Kernel state over ``L * K`` replica slots, laid out ladder-major so slot
+    ``l * K + k`` is rung ``k`` of ladder ``l``.
 
     Parameters
     ----------
     inner
-        Wrapped kernel state.
+        State of the wrapped kernel, over all ``L * K`` slots at once.
     L, K : int
-        Ladder count and number of temperatures.
+        Number of ladders and number of temperatures on each.
     """
 
     def __init__(self, inner, L: int, K: int):
@@ -32,32 +38,45 @@ class _PTState:
 
     @property
     def q(self) -> torch.Tensor:
-        return self.inner.q.reshape(self.L, self.K, -1)[:, -1, :]   # target chain, beta=betas[-1]
+        """Positions of the ``betas[-1]`` rung of each ladder, of shape
+        ``(L, d)``. These are the draws a run collects. The lower rungs are
+        there to move them and are not reported."""
+        return self.inner.q.reshape(self.L, self.K, -1)[:, -1, :]
 
 
 class PT(MCMCSampler):
-    """
-    Parallel tempering wrapping a :class:`MCMCSampler` exploration kernel.
+    """Parallel tempering around a :class:`MCMCSampler` exploration kernel.
 
-    Replica k targets ``pi_{beta_k}(theta) ~ prior(theta) * p(data|theta)**beta_k``
-    (``beta = 1`` posterior, ``beta = 0`` prior). Each step explores every replica
-    with one kernel transition, then sweeps even and odd adjacent pairs, exchanging
-    replicas ``a`` and ``a+1`` with probability
+    Rung ``k`` targets
+
+        pi_{beta_k}(theta) ~ prior(theta) * p(data | theta)**beta_k,
+
+    so ``beta = 1`` is the posterior and ``beta = 0`` the prior. One
+    :meth:`step` explores every rung with one kernel transition, then sweeps
+    the even and then the odd adjacent pairs, exchanging rungs ``a`` and
+    ``a+1`` with probability
 
         min(1, exp((beta_{a+1} - beta_a) (U_lik[a+1] - U_lik[a]))),
 
-    ``U_lik = -log p(data|theta)``.
+    where ``U_lik = -log p(data | theta)``. Only ``betas[-1]`` is sampled from,
+    the rest of the ladder being there to move it.
 
-    The wrapped kernel state must expose ``q``, the tempered potential ``U`` (whose
-    ``lik`` is the likelihood potential used in the swap ratio), and a ``reorder``
-    that retempers under a temperature change.
+    ``num_chains`` in :meth:`run_mcmc` is the number of ladders. Each is run at
+    the full set of temperatures, so the kernel carries ``num_chains * K``
+    chains.
+
+    The kernel is driven rung by rung through its own ``beta``, which this
+    class takes over for the duration of the run. Its state must expose ``q``,
+    the tempered potential ``U``, whose ``lik`` part is the likelihood potential
+    the swap ratio is built from, and a ``reorder`` that leaves each slot's
+    temperature in place.
 
     Parameters
     ----------
     sampler : MCMCSampler
-        Exploration kernel.
-    betas : torch.Tensor
-        Increasing 1-D inverse temperatures. Target chain is ``betas[-1]``.
+        Exploration kernel, used for every rung of every ladder at once.
+    betas : Tensor, shape (K,)
+        Increasing inverse temperatures. ``betas[-1]`` is the target.
     """
 
     def __init__(self, sampler: MCMCSampler, betas: torch.Tensor):
@@ -67,14 +86,19 @@ class PT(MCMCSampler):
         self.betas = betas
 
     def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
-        """The kernel's own, since the replicas are the kernel's chains and run
-        in whatever coordinates it runs in."""
+        """The kernel's own, the rungs being the kernel's chains and running in
+        whatever coordinates it runs in."""
         return self.sampler.to_position(theta_free)
 
     def to_variables(self, q_free: torch.Tensor) -> torch.Tensor:
+        """The kernel's own, the inverse of :meth:`to_position`."""
         return self.sampler.to_variables(q_free)
 
     def init(self, q: torch.Tensor) -> _PTState:
+        """The initial :class:`_PTState` at the positions ``q`` of shape
+        ``(L, d)``, one per ladder. Each is copied to all ``K`` rungs of its
+        ladder, and the kernel's ``beta`` is bound to the ladder-major slot
+        layout for the rest of the run."""
         self.L, self.K = q.shape[0], len(self.betas)
         M = self.L * self.K
         self.sampler.beta = self.betas.unsqueeze(0).expand(self.L, -1).reshape(M)
@@ -91,21 +115,24 @@ class PT(MCMCSampler):
         self._nstep = 0
 
     def end_warmup(self):
-        self.sampler.end_warmup()          # freeze kernel step-size adaptation
+        """Freeze the kernel's per-rung adaptation and zero the swap and
+        potential statistics, so what :meth:`diagnostics` reports covers the
+        sampling phase alone."""
+        self.sampler.end_warmup()
         self._reset_stats()
 
     def _swap(self, u, parity):
-        """One even (parity 0) or odd (parity 1) sweep over adjacent pairs.
-
-        Returns the per-ladder column permutation ``(L, K)`` and the likelihood
-        potentials gathered through it.
+        """One sweep over the adjacent pairs of one parity, as the per-ladder
+        rung permutation of shape ``(L, K)`` it accepted and the likelihood
+        potentials ``u`` gathered through that permutation.
 
         Parameters
         ----------
-        u : torch.Tensor
-            Likelihood potentials, ``(L, K)``.
+        u : Tensor, shape (L, K)
+            Likelihood potentials, rung by rung.
         parity : int
-            0 for even pairs, 1 for odd pairs.
+            0 sweeps the pairs starting at an even rung, 1 those starting at an
+            odd one. The two together cover every adjacent pair once.
         """
         L, K = self.L, self.K
         device = u.device
@@ -123,6 +150,8 @@ class PT(MCMCSampler):
         return perm, torch.gather(u, 1, perm)
 
     def step(self, s: _PTState) -> _PTState:
+        """One kernel transition on every rung, then an even and an odd swap
+        sweep composed into a single relabeling of the rungs."""
         L, K, M = self.L, self.K, self.L * self.K
 
         inner = self.sampler.step(s.inner)                 # explore every replica at its temperature
@@ -140,23 +169,31 @@ class PT(MCMCSampler):
         return _PTState(inner, L, K)
 
     def logging(self) -> dict:
+        """``swap``, the lowest mean swap rate over the adjacent pairs, which is
+        the pair the ladder communicates worst across."""
         if self._nstep == 0:
             return {}
         rate = float((self._swap_acc / self._swap_cnt.clamp(min=1.0)).mean(0).min())
         return {"swap": f"{rate:.2f}"}
 
     def diagnostics(self) -> dict:
-        """Post-warmup diagnostics (empty before any step).
+        """Diagnostics over the steps since the last :meth:`init` or
+        :meth:`end_warmup`, empty before the first of them.
 
-        Returns ``betas``, per-pair ``swap_accept_rate``, per-chain
-        ``explore_accept_rate`` (averaged over ladders), ``communication_barrier``
-        (sum of per-pair mean rejection), and thermodynamic-integration
-        ``log_evidence`` = -sum 0.5 (u[i+1]+u[i]) (beta[i+1]-beta[i]).
+        The entries are ``betas``, ``swap_accept_rate`` per adjacent pair of
+        shape ``(K-1,)``, ``explore_accept_rate`` per rung of shape ``(K,)``
+        and averaged over the ladders, ``communication_barrier`` as the sum of
+        the per-pair mean rejection, and ``log_evidence`` by thermodynamic
+        integration,
 
-        ``log_evidence`` estimates ``log Z_1 - log Z_0``, so it is an absolute
-        evidence only when ``beta_min = 0`` and the kernel's beta = 0 target
-        integrates to one. A kernel whose coldest rung is unnormalized offsets
-        the value by its ``log Z_0``.
+            log_evidence = -sum_i 0.5 (u[i+1] + u[i]) (beta[i+1] - beta[i]),
+
+        with ``u`` the run's mean likelihood potential per rung.
+
+        ``log_evidence`` estimates ``log Z_last - log Z_first``, so it is an
+        evidence in its own right only when ``betas[0]`` is 0 and the target at
+        ``beta = 0`` integrates to one. A space carrying no prior leaves it
+        offset by that target's own ``log Z``.
         """
         if self._nstep == 0:
             return {}

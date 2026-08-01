@@ -39,15 +39,16 @@ class NoAdaptation:
         self._value = torch.full((N,), self._init, dtype=dtype, device=device)
 
     def set_upper_bound(self, ub):
-        """No-op: the fixed value already sits at the caller's step size."""
+        """Does nothing. The value is constant at ``init``, so an ``init``
+        greater than ``ub`` is reported unchanged."""
         pass
 
     def update(self, signal):
-        """No-op: the value never moves."""
+        """Does nothing. The value is constant."""
         pass
 
     def finalize(self):
-        """No-op: nothing to freeze."""
+        """Does nothing. There is no estimate to freeze."""
         pass
 
     def get_state(self):
@@ -78,11 +79,14 @@ class DualAveraging:
         Reference point the primal sequence is pulled toward (minimiser use).
         Default 0.
     t0 : float
-        Early-iteration stabiliser.  Default 10.
+        Offset in the subgradient average's weight ``1/(t + t0)``, which damps
+        the first iterations. Default 10.
     kappa : float
-        Averaging-weight exponent in (0.5, 1].  Default 0.75.
+        Averaging-weight exponent in (0.5, 1]. Default 0.75.
     gamma : float
-        Step scale.  Default 0.05.
+        Gain. ``x_t`` is displaced from ``prox_center`` by ``sqrt(t)/gamma``
+        times the averaged subgradient, so a smaller value is a larger
+        response. Default 0.05.
     init : float
         Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role.
         Ignored by the minimiser, which uses ``prox_center`` instead. Default 0.
@@ -170,20 +174,21 @@ class Reinforce:
     ``mu``. ``f_t`` and the state are ``(N,)``, one entry per problem.
 
     As an adapter, :meth:`get_state` reports the perturbed point
-    ``mu + sigma*eps`` (the next value to try) and ``mu``. Once frozen it reports
-    ``(mu, mu)``.
+    ``mu_t + sigma * eps``, which is the next value to try, and the averaged
+    ``mu``. Once frozen it reports ``(mu, mu)``.
 
     Parameters
     ----------
     n : int or None
-        Number of problems in the minimiser role, or ``None`` when the batch size
+        Number of problems in the minimiser role, or None when the batch size
         is instead seeded through :meth:`reset`.
     sigma : float
-        Smoothing radius and gradient-estimate denominator.  Default 0.1.
+        Radius the objective is smoothed over, and the denominator of the
+        gradient estimate. Default 0.1.
     ema_decay : float
-        EMA baseline decay.  Default 0.2.
+        Decay of the baseline ``b_t``. Default 0.2.
     gamma : float
-        Step scale of the underlying dual averaging.  Default 0.05.
+        Gain of the underlying dual averaging. Default 0.05.
     init : float
         Initial value seeded over ``(N,)`` at :meth:`reset` in the adapter role.
         Ignored by the minimiser, which uses ``prox_center`` instead. Default 0.
@@ -236,9 +241,9 @@ class Reinforce:
         self._eps = self._draw_eps()
 
     def get_state(self):
-        """Return ``(proposal, mu)``, the perturbed point ``x_t + sigma*eps`` to
-        evaluate next and the dual-averaged estimate ``x_avg``, or
-        ``(x_avg, x_avg)`` once frozen."""
+        """Return ``(proposal, mu)``, with ``proposal = mu_t + sigma * eps`` the
+        point to evaluate next and ``mu`` the dual-averaged estimate. Both are
+        ``mu`` once frozen."""
         x_t, x_avg = self._dual.get_state()
         if self._frozen:
             return x_avg, x_avg

@@ -141,6 +141,31 @@ Prefer the direct statement. "Raises when the covariance is not positive
 definite" rather than "note that it should be pointed out that an error may be
 raised in the event that".
 
+Write technically. No metaphor, no analogy, no figurative or decorative
+language. Name the object, the quantity and the operation, in the terms the
+code and the mathematics already use. Write "the metric depends on position"
+rather than "the metric breathes with the chain", and "the free block of the
+metric" rather than "the metric's beating heart".
+
+Three habits produce most of the violations. The first is giving the code
+intent or feeling, as in what a function "wants", "knows", "cares about", "is
+happy with" or "refuses to do". Say what it computes and what it raises. The
+second is emphasis that carries no information, as in "crucially", "elegantly",
+"beautifully", "the whole point" or "the magic here". Cut the word and keep the
+statement.
+
+The third is the quiet one, because it reads as ordinary prose. It is the
+physical figure for something that is not physical: a value that "moves", state
+that "survives", a quantity that "lives on" an object, a step that "runs away".
+Each has a plain replacement that is also more precise. A value is constant or
+changes, state is kept or dropped, a quantity is held by an object, a step size
+grows without bound.
+
+A term stays when it has a definition the reader can look up or that the
+documentation supplies. Chart, pullback, Cholesky factor and detailed balance
+are terms of the subject and stay. Workhorse, journey, heartbeat, dance and
+under the hood are not terms of anything and go.
+
 ## Keeping it true
 
 Every claim in a docstring is a claim the code must honour. A named term must

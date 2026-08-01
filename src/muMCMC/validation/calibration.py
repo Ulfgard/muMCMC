@@ -50,8 +50,14 @@ def _ess(trace, method):
 
 SBCHistogram = namedtuple(
     "SBCHistogram", ["counts", "bin_edges", "expected", "low", "high", "n_objects"])
+SBCHistogram.__doc__ = """Binned SBC ranks with the count each bin is expected
+to hold under the discrete-uniform null, the band around it, and the number of
+objects binned."""
 
 Coverage = namedtuple("Coverage", ["coverage", "low", "high", "target", "n_objects"])
+Coverage.__doc__ = """An empirical central-interval coverage with its confidence
+interval, the coverage a calibrated sampler gives at this rank scale, and the
+number of objects it was measured over."""
 
 
 def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
@@ -60,8 +66,8 @@ def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
 
     Bins the ranks over ``{0, ..., L}`` and returns the per-bin counts with the
     band under the discrete-uniform null: each bin count is ``Binomial(N, 1/B)``,
-    and ``[low, high]`` are its central-``confidence`` quantiles. Counts drifting
-    outside the band flag miscalibration. Non-finite ranks are dropped.
+    and ``[low, high]`` are its central-``confidence`` quantiles. Counts outside
+    the band indicate miscalibration. Non-finite ranks are dropped.
 
     Parameters
     ----------
@@ -70,8 +76,9 @@ def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
     L : int
         Rank scale the ranks were computed on.
     n_bins : int, optional
-        Number of equal bins over ``{0, ..., L}``. Default is ``L + 1`` (one bin
-        per rank). Rebin (e.g. to keep ``N / n_bins`` around 20) to cut noise.
+        Number of equal bins over ``{0, ..., L}``. Default is ``L + 1``, one bin
+        per rank. Fewer bins give a less noisy histogram, and around 20 objects
+        per bin is enough for the band to be informative.
     confidence : float
         Central mass of the band under the uniform null.
 
@@ -96,16 +103,18 @@ def _sbc_histogram(ranks, L, *, n_bins=None, confidence=0.99):
 class Calibration:
     """Accumulate SBC ranks for several statistics over a stream of objects.
 
-    Feed one object at a time with :meth:`add`. Each object is ranked at a common
-    ``L`` draws spread evenly across the whole chain (Talts et al. 2018, Algorithm
-    2, "uniformly thin to ``L`` states"), so ranks from different objects share one
-    scale. The spacing is the largest the chain allows and at least the ESS
-    thinning factor (taken once, as the largest over the statistics), so every
-    statistic uses ~independent draws. An object that cannot supply ``L`` draws
-    that far apart is discarded and counted in :attr:`n_discarded`.
-    :meth:`coverage` reads the central-interval coverage at a level and
-    :meth:`sbc_histogram` the full rank histogram, both from the accumulated
-    ranks of a statistic.
+    Feed one object at a time with :meth:`add`. Every object is ranked against
+    the same number ``L`` of draws, spread evenly across the whole chain, so
+    ranks from different objects are on one scale. The spacing between those
+    draws is the largest the chain allows, and it is required to be at least the
+    ESS thinning factor, which is taken once as the largest over the statistics.
+    Every statistic is therefore ranked on nearly independent draws. An object
+    whose chain cannot supply ``L`` draws that far apart is discarded and
+    counted in :attr:`n_discarded`.
+
+    :meth:`coverage` reads the central-interval coverage at a level from the
+    accumulated ranks of one statistic, and :meth:`sbc_histogram` the full rank
+    histogram.
 
     Parameters
     ----------
@@ -113,12 +122,24 @@ class Calibration:
         Named statistics. Each maps the draws to a ``(chains, draws)`` trace and
         the truth to a scalar.
     L : int
-        Common number of thinned draws to rank against (the rank scale).
+        Number of thinned draws each object is ranked against, which is the
+        scale the ranks live on.
     thin : bool or int
-        ``True`` thins by ``max_k ceil(n / ESS_k)`` over the statistics, ``False``
-        keeps every draw, an int forces the factor.
+        True requires a spacing of at least ``max_k ceil(n / ESS_k)`` over the
+        statistics, False requires none, and an int requires that value.
     ess_method : str
-        arviz ESS method used when ``thin=True``.
+        arviz ESS method, used only when ``thin`` is True.
+
+    Attributes
+    ----------
+    n_discarded : int
+        Objects passed to :meth:`add` whose chain was too short to rank.
+
+    References
+    ----------
+    S. Talts, M. Betancourt, D. Simpson, A. Vehtari and A. Gelman, Validating
+    Bayesian Inference Algorithms with Simulation-Based Calibration, 2018. The
+    thinning is their Algorithm 2 and the uniformity their Theorem 1.
     """
 
     def __init__(self, statistics, L, *, thin=True, ess_method="bulk"):
@@ -131,11 +152,21 @@ class Calibration:
         self.n_discarded = 0
 
     def add(self, samples, truth, weight=1.0):
-        """Rank one object and accumulate, or discard it if under-resolved.
+        """Rank one object and accumulate it, or discard it when its chain
+        cannot supply ``L`` draws far enough apart. Returns ``self``, so calls
+        chain.
 
-        ``weight`` is a per-object weight carried into :meth:`coverage` (e.g. an
-        importance weight for reweighting the test set). Discarded objects drop
-        their weight with them. Equal weights give the unweighted result.
+        Parameters
+        ----------
+        samples : object
+            Posterior draws, in whatever form the statistics accept.
+        truth : object
+            The value the draws were generated from, in the form the statistics
+            accept.
+        weight : float
+            Per-object weight, read by :meth:`coverage`, for instance an
+            importance weight that reweights the test set. A discarded object
+            drops its weight too, and equal weights give the unweighted result.
         """
         traces = {n: _as_numpy(f(samples)) for n, f in self.statistics.items()}
         truths = {n: float(f(truth)) for n, f in self.statistics.items()}
@@ -224,13 +255,14 @@ class Calibration:
         return Coverage(cov, float(ci.low), float(ci.high), target, M)
 
     def sbc_histogram(self, name, *, n_bins=None, confidence=0.99):
-        """SBC rank histogram + band for statistic ``name``, as an
-        ``SBCHistogram(counts, bin_edges, expected, low, high, n_objects)``.
+        """SBC rank histogram for statistic ``name``, with its band, as an
+        :class:`SBCHistogram`.
 
-        Bins the accumulated ranks over ``{0, ..., L}``. Under the discrete-
-        uniform null each bin count is ``Binomial(N, 1/n_bins)`` and
-        ``[low, high]`` are its central-``confidence`` quantiles (the band).
-        ``n_bins`` defaults to ``L + 1``. Rebin to keep ``N / n_bins`` around 20.
+        Bins the accumulated ranks over ``{0, ..., L}``. Under the
+        discrete-uniform null each bin count is ``Binomial(N, 1/n_bins)`` and
+        ``[low, high]`` are its central-``confidence`` quantiles. ``n_bins``
+        defaults to ``L + 1``, and around 20 objects per bin is enough for the
+        band to be informative.
         """
         return _sbc_histogram(self.ranks(name), self.L,
                               n_bins=n_bins, confidence=confidence)

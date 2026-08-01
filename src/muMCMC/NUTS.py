@@ -7,19 +7,22 @@ from pyro.infer.mcmc.mcmc_kernel import MCMCKernel
  
  
 class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
-    """Pyro NUTS kernel whose ``diagnostics()`` also returns the adapted
-    post-warmup state.
+    """Pyro NUTS kernel whose ``diagnostics()`` also reports the state warmup
+    adapted, which Pyro keeps on the kernel and does not otherwise return.
 
-    Added keys:
+    The keys it adds are
 
-        step_size:           final adapted step size (post warmup)
-        divergences:         post-warmup step indices that diverged
-        accept_cnt:          accumulated accept count post warmup
-        t:                   total step count (warmup + sampling)
-        warmup_steps:        warmup count
-        inverse_mass_matrix: adapted IMM at end of warmup (full d-by-d if
-                             full_mass else diagonal d-vector)
-        inverse_mass_matrix_site_key: site-name tuple the IMM is stored under
+        step_size                     step size warmup settled on
+        divergences_list              sampling step indices that diverged
+        accept_cnt                    accepted transitions since warmup ended
+        t                             steps taken, warmup and sampling
+        warmup_steps                  warmup steps taken
+        inverse_mass_matrix           the matrix warmup settled on, of shape
+                                      (d, d) under full_mass and (d,) otherwise
+        inverse_mass_matrix_site_key  the site name it is stored under
+
+    The last two are absent when Pyro holds no mass matrix, in which case
+    ``inverse_mass_matrix_error`` carries the exception that reported it.
     """
  
     def diagnostics(self):
@@ -41,19 +44,33 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
  
  
 class NUTS(PyroSampler):
-    """
-    No-U-Turn Sampler running on the free variables.
+    """No-U-Turn Sampler running on the free variables.
 
-    Wraps Pyro's NUTS kernel with the potential ``MCMCSampler`` assembles.
+    The transition is Pyro's NUTS kernel, given the potential
+    :class:`~muMCMC.MCMCSampler.MCMCSampler` assembles. The trajectory length
+    and the mass matrix are Pyro's to choose, so this class holds no step size
+    and no integrator of its own.
 
     Parameters
     ----------
     potential_fn : callable
-        Likelihood-only potential on the full variable vector.
-    space
-        Parameter space object.
-    adapt_step_size, adapt_mass_matrix, full_mass, target_accept_prob,
-    jit_compile : standard NUTS knobs.
+        ``potential_fn(theta_full) -> U_lik``, the likelihood potential
+        ``-log p(data | theta)`` on the full variable vector.
+    space : Space
+        Parameter space, giving the prior's normal chart and the free/fixed
+        split.
+    adapt_step_size : bool
+        Adapt the step size during warmup toward ``target_accept_prob``.
+    adapt_mass_matrix : bool
+        Estimate the inverse mass matrix from the warmup draws.
+    full_mass : bool
+        Adapt a dense inverse mass matrix rather than a diagonal one. Unused
+        when ``adapt_mass_matrix`` is False.
+    target_accept_prob : float
+        Target Metropolis acceptance probability for the step-size
+        adaptation.
+    jit_compile : bool
+        Let Pyro trace the potential and its gradient with the PyTorch JIT.
     """
  
     def __init__(

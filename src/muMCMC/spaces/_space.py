@@ -4,28 +4,34 @@ from ._transform import NormalTransform
 
 
 # =========================================================================== #
-#  The two identities of the normal chart                                     #
+#  The prior read on the variables and read in the chart                      #
 #                                                                             #
-#  A chain runs on the variables, where the prior contributes -log p(theta)   #
-#  to the potential and M_theta = J^-T J^-1, with J = dtheta/dz, to the        #
-#  metric. That metric is the pullback of the identity along the chart, so it  #
-#  is the one the prior itself induces, and it varies with position.          #
+#  A chain runs on the variables theta. There the prior contributes           #
+#  -log p(theta) to the potential and M_theta = J^-T J^-1, with J = dtheta/dz #
+#  the Jacobian of the chart, to the metric. M_theta is the pullback of the   #
+#  identity along the chart, so it is the metric the prior induces on the     #
+#  variables, and it depends on position.                                     #
 #                                                                             #
-#  Read instead in the chart, the prior is exactly N(0, I) and its metric is   #
-#  J^T M_theta J = I, constant. A scheme needing a fixed prior block therefore #
-#  puts no condition on the prior, only on where it is read, and it can        #
-#  compute both from the chart without asking the space for them.             #
+#  Read in the chart instead, the prior is N(0, I) and its metric is the      #
+#  pushforward J^T M_theta J = I, independent of position. A scheme that      #
+#  needs a constant prior block therefore constrains the coordinates it reads #
+#  the prior in and not the prior itself, and it can compute both quantities  #
+#  from the chart without asking the space for them.                          #
 # =========================================================================== #
 
 
 class Space:
     """Named variables with a prior, read in the prior's normal chart.
 
-    A point is a dict keyed by name, which is the only form a caller deals in.
-    Inside, it is a free vector ``(..., d)`` over :attr:`free_names`, which the
-    chain and the prior act on, and :meth:`to_full` widens that to the
+    A caller passes and receives points as a dict keyed by name. Internally a
+    point is a free vector ``(..., d)`` over :attr:`free_names`, which the chain
+    and the prior act on, and :meth:`to_full` widens that to the
     ``(..., d_full)`` layout over :attr:`names` that a model potential is
     handed.
+
+    The chart is supplied by the subclass as :attr:`as_transform`, so this class
+    defines the layout and the prior's interface and a subclass defines which
+    prior.
 
     Parameters
     ----------
@@ -35,6 +41,18 @@ class Space:
         Names held at the given value. They keep their place in the full layout
         and are absent from the free one, so a fixed name may sit between two
         free ones. None or empty means nothing is fixed.
+
+    Attributes
+    ----------
+    names : list of str
+        Variable names in full layout order.
+    fixed : dict[str, float]
+        The fixed names and their current values, empty when nothing is fixed.
+        Rebind through :meth:`set_fixed` rather than in place, so the cached
+        conversions stay in step with it.
+    free_indices : list of int
+        Position of each free variable in the full layout, in :attr:`free_names`
+        order.
 
     Raises
     ------
@@ -70,11 +88,19 @@ class Space:
 
     @property
     def free_names(self):
+        """The names that are sampled, in full layout order."""
         return self._free_names
 
     @property
     def as_transform(self) -> NormalTransform:
-        """The map ``theta = T(z)`` over the free variables."""
+        """The chart ``theta = T(z)`` over the free variables, pushing
+        ``z ~ N(0, I)`` forward to the prior. Supplied by the subclass.
+
+        Raises
+        ------
+        NotImplementedError
+            Always, on :class:`Space` itself, which carries no prior.
+        """
         raise NotImplementedError
 
     # ---- vector layouts ---------------------------------------------------- #
@@ -147,13 +173,12 @@ class Space:
     def set_fixed(self, fixed: dict) -> None:
         """Hold the same names fixed at new values, in place.
 
-        The free/fixed split does not move, so everything derived from it stays
-        valid and nothing is rebuilt. The values are read by :meth:`to_full` and
-        by :meth:`add_fixed`, so this changes what a model potential is handed
-        and what a run reports, and nothing else. It mutates rather than
-        returning a copy, so a sampler already holding the space picks the new
-        values up, which is the point when one space serves a sequence of
-        problems differing only in what they pin.
+        The free/fixed split is unchanged, so :attr:`free_indices`, the chart
+        and everything else derived from it stay valid. The values are read by
+        :meth:`to_full` and by :meth:`add_fixed`, so this changes what a model
+        potential is handed and what a run reports, and nothing else. It mutates
+        the space rather than returning a copy, so a sampler already constructed
+        on this space reads the new values.
 
         Raises
         ------
@@ -180,12 +205,15 @@ class Space:
     # ---- prior ------------------------------------------------------------- #
 
     def prior_log_prob(self, theta: dict) -> torch.Tensor:
-        """Factorized log-prior over the free names present in ``theta``, a dict
-        of points on the variables of shape ``(...)``, giving ``(...)``.
+        """Log-prior over the free names present in ``theta``.
 
-        The prior factorizes over the coordinate axis, so a subset of the free
-        names gives the marginal over that subset. A name left out by accident
-        therefore returns a marginal rather than raising. Fixed names are
+        ``theta`` is a dict of points on the variables, each entry of shape
+        ``(...)``, and the result has shape ``(...)``.
+
+        The prior factorizes over the coordinate axis, so passing a subset of
+        the free names gives the log of the marginal over that subset. A name
+        omitted by accident therefore returns a marginal rather than raising.
+        Names in ``theta`` that are not free, the fixed ones included, are
         ignored.
 
         Raises
@@ -212,13 +240,13 @@ class Space:
         return self.as_transform.log_prob(theta_free).sum(-1)
 
     def prior_metric(self, theta_free: torch.Tensor):
-        """The prior's natural metric at ``theta_free``, the diagonal
-        ``(..., d, d)`` matrix
+        """The metric the prior induces on the variables at ``theta_free`` of
+        shape ``(..., d)``, the diagonal ``(..., d, d)`` matrix
 
-            M_ii = (dz_i/dtheta_i)²,
+            M_ii = (dz_i/dtheta_i)².
 
-        It is the pullback of the identity along the chart, so it is the metric
-        the prior itself induces on the variables, and it varies with position.
+        It is the pullback of the identity along the chart, so it depends on
+        position.
         """
         return torch.diag_embed(self.as_transform.metric(theta_free))
 

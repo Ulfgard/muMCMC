@@ -3,19 +3,21 @@ from collections import namedtuple
 import torch
 
 # =========================================================================== #
+#  What the fallback ladder trades                                            #
 #                                                                             #
-#  Internal. A caller picks the update rule by name and the solver builds it, #
-#  so nothing here is part of the package surface.                            #
+#  Damping changes the iteration and not the root. A row that will not        #
+#  converge can therefore be re-solved more slowly rather than handed back    #
+#  as a failure the caller has to deal with, and a row that converges on the  #
+#  second pass is at the same root as one that converged on the first.        #
 #                                                                             #
-#  Damping does not move the root, which is what the fallback ladder trades   #
-#  on: a row that will not converge can be re-solved more slowly instead of   #
-#  being handed back as a failure the caller has to deal with. That is worth  #
-#  the extra iterations because the alternative costs the caller a rejection  #
-#  it cannot attribute to the problem rather than to the solver.              #
-#                                                                             #
+#  The cost is the extra iterations. It is worth paying because the           #
+#  alternative costs the caller a rejection it cannot distinguish from one    #
+#  the target itself implies.                                                 #
 # =========================================================================== #
 
 SolveResult = namedtuple("SolveResult", ["z", "iters", "residual"])
+SolveResult.__doc__ = """The root, and per row the iteration count it took and
+the final residual in max norm."""
 
 _RULES = ("picard", "anderson", "newton")
 
@@ -206,11 +208,14 @@ class FixedPointSolver:
         Returns
         -------
         SolveResult
-            ``z`` the root, detached, with the per-row iteration count and final
-            residual max-norm. A row whose ``residual`` exceeds :attr:`tol` did
-            not converge and its ``z`` is not a root. A row is abandoned when its
-            residual goes non-finite, which is also what a singular J produces,
-            so one bad row does not raise for the others.
+            ``z`` the root, detached, with the per-row iteration count and
+            final residual in max norm. A row whose ``residual`` exceeds
+            :attr:`tol` did not converge and its ``z`` is not a root.
+
+            A row is abandoned once its residual goes non-finite or grows far
+            past where it started, the first of which is also what a singular J
+            produces. Nothing raises on either, so one bad row does not cost the
+            others their solve.
         """
         d = z_init.shape[-1]
         history = d if self.history is None else self.history

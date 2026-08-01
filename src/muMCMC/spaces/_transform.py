@@ -56,7 +56,8 @@ class ElementwiseMap:
 
     @cached_property
     def inv(self) -> "ElementwiseMap":
-        """The same map read backwards, so its Jacobian is the reciprocal."""
+        """The inverse map evaluated at :attr:`mapped_point`. The map is
+        elementwise, so its Jacobian diagonal is the reciprocal of this one."""
         return ElementwiseMap(self._mapped_point, self._point,
                               -self._log_jacobian_diag)
 
@@ -69,11 +70,11 @@ class NormalTransform:
     """``theta = T(z)``, elementwise and strictly increasing per coordinate,
     pushing ``z ~ N(0, I)`` forward to the prior on ``theta``.
 
-    Both directions and both Jacobians are supplied by the caller, each
-    direction returning its value with the log of its Jacobian diagonal so that
-    one pass over the shared intermediates gives both. Nothing is differentiated
-    numerically and nothing is inverted by a root find, so every quantity is
-    exact, differentiable to any order, and costs one evaluation.
+    The caller supplies both directions, each returning its value together with
+    the log of its Jacobian diagonal. All four are required in closed form.
+    ``inverse`` must be the exact inverse of ``forward``, and each log Jacobian
+    must be that of the map it is returned beside. Neither condition is checked,
+    and every result on this class is wrong if one of them fails.
 
     Parameters
     ----------
@@ -92,8 +93,8 @@ class NormalTransform:
     Raises
     ------
     ValueError
-        If either direction returns None in place of its log Jacobian, checked
-        by calling both once at ``z = 0``.
+        From the constructor, if either direction returns None in place of its
+        log Jacobian.
     """
 
     def __init__(self, forward, inverse, *, reference):
@@ -110,15 +111,17 @@ class NormalTransform:
 
     @property
     def d(self) -> int:
-        """Number of coordinates the transform spans."""
+        """Number of coordinates the map acts on."""
         return self._reference.shape[-1]
 
     @property
     def dtype(self) -> torch.dtype:
+        """Dtype of the reference tensor, which the map is evaluated in."""
         return self._reference.dtype
 
     @property
     def device(self) -> torch.device:
+        """Device of the reference tensor, which the map is evaluated on."""
         return self._reference.device
 
     def forward(self, z: torch.Tensor) -> ElementwiseMap:
@@ -131,13 +134,13 @@ class NormalTransform:
         return ElementwiseMap(theta, *self._inverse_fn(theta))
 
     def metric(self, theta: torch.Tensor) -> torch.Tensor:
-        """Diagonal of the prior's natural metric ``M = J⁻ᵀ J⁻¹`` at ``theta``,
+        """Diagonal of the metric the prior induces on ``theta``,
+        ``M = J⁻ᵀ J⁻¹`` with ``J = dtheta/dz``, so
 
             M_ii = (dz_i/dtheta_i)²,
 
-        shape ``(..., d)``. It is the Jacobian of the inverse map that squares,
-        so this is the reciprocal of ``(dtheta/dz)²``. Its pushforward to ``z``
-        is the identity."""
+        of shape ``(..., d)`` for ``theta`` of shape ``(..., d)``. Its
+        pushforward along the map is the identity."""
         return self.inverse(theta).jacobian_diag ** 2
 
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
@@ -145,8 +148,8 @@ class NormalTransform:
 
             log p_i(theta_i) = log phi(z_i) + log(dz_i/dtheta_i),
 
-        shape ``(..., d)``. The inverse map already carries both terms, so this
-        is one call of it."""
+        where ``z = T⁻¹(theta)`` and ``phi`` is the standard normal density.
+        Shape ``(..., d)`` for ``theta`` of shape ``(..., d)``."""
         m = self.inverse(theta)
         z = m.mapped_point
         return -0.5 * z * z - _LOG_SQRT_2PI + m.jacobian_log_diag
