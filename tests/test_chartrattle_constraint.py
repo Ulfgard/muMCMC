@@ -192,8 +192,10 @@ def test_beta_tempers_the_data_fit_only():
     eta = torch.randn(30, 1)
     U, _, _, _ = _eval(fun, eta, beta=0.4, grad=False)
     e = eta[:, 0]
-    # The space's Normal(0, 1) is normalized, so -log p(q) carries ½ log 2π.
+    # Both densities are normalized, so the untempered part carries the prior's
+    # ½ log 2π over one coordinate and the likelihood's over m.
     neg_log_post = 0.5 * e * e + 0.5 * math.log(2 * math.pi) \
+        + 0.5 * x.shape[-1] * math.log(2 * math.pi) \
         + 0.5 * x.shape[-1] * fun.s * e \
         + 0.4 * 0.5 * torch.exp(-fun.s * e) * (x * x).sum()
     assert torch.allclose(U.value, neg_log_post, atol=1e-9)
@@ -229,11 +231,12 @@ def test_a_space_without_a_prior_is_rejected():
 
 
 def test_standard_normal_prior_is_the_non_centered_latent():
-    # The chart of Normal(0, 1) is the identity, so U.base is 1/2||q||^2 up to
-    # its normalizer, plus the volume term.
-    c, _, _ = _funnel_pair()
+    # The chart of Normal(0, 1) is the identity, so U.base is 1/2||q||^2 plus
+    # the volume term and the two normalizers.
+    c, _, x = _funnel_pair()
     eta = torch.randn(7, 1)
     expected = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
+                + 0.5 * x.shape[-1] * math.log(2 * math.pi)
                 + c.log_abs_det_B(eta))
     assert torch.allclose(_base_of(c, eta), expected, atol=1e-12)
 
@@ -242,7 +245,7 @@ def test_space_prior_enters_U_as_its_chart():
     # A Normal(mu0, s0) prior is the chart theta = mu0 + s0 q, so U.base stays
     # the standard normal potential plus the volume term read at theta, and the
     # likelihood is the one evaluated at theta rather than at q.
-    c, _, _ = _funnel_pair(sigma=2.0, m=4, seed=3)
+    c, _, x = _funnel_pair(sigma=2.0, m=4, seed=3)
     eta = torch.randn(9, 1)
     mu0, s0 = 0.7, 1.6
     theta = mu0 + s0 * eta
@@ -250,6 +253,7 @@ def test_space_prior_enters_U_as_its_chart():
     U_pri = _prior_eval(c, eta, mu0, s0)[0]
 
     expected_base = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
+                     + 0.5 * x.shape[-1] * math.log(2 * math.pi)
                      + c.log_abs_det_B(theta))
     assert torch.allclose(U_pri.base, expected_base, atol=1e-10)
     assert torch.allclose(U_pri.lik, _eval(c, theta)[0].lik, atol=1e-10)

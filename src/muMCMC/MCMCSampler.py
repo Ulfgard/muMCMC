@@ -44,9 +44,14 @@ class MCMCSampler(ABC):
         requires_metric: bool,
     ):
         self.potential_fn = potential_fn
-        self.space = space
+        self._space = space
         self.requires_metric = requires_metric
         self.beta = 1.0   # inverse temperature
+
+    @property
+    def space(self):
+        """The sampler's parameter space."""
+        return self._space
 
     def evaluate_model(
         self, theta_free: torch.Tensor, beta: Optional[float] = None,
@@ -124,6 +129,25 @@ class MCMCSampler(ABC):
                                   grad_of(U_base).detach(), beta)
         potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
+
+    def potential(self, theta_free: torch.Tensor,
+                  beta: Optional[float] = None) -> torch.Tensor:
+        """``U(theta, beta)`` on the free variables, shape ``(...)`` for
+        ``theta_free`` of shape ``(..., d)``.
+
+        It holds ``p(theta | beta) = exp(-U(theta, beta)) / Z_beta``, a density
+        with respect to ``dtheta``. The chain runs on the variables, so this is
+        :meth:`evaluate_model`'s value. A sampler running in other coordinates
+        overrides it to pull its own potential back.
+
+        Parameters
+        ----------
+        theta_free : Tensor, shape (..., d)
+            Free variable vector.
+        beta : float, optional
+            Inverse temperature. Default ``self.beta``.
+        """
+        return self.evaluate_model(theta_free, beta)[0].value
 
     def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
         """The chain's position at the free variables ``theta_free``. The chain

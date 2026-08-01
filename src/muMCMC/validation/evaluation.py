@@ -253,9 +253,12 @@ class PosteriorEvaluation:
             q=self._q_pool)
 
     def _log_target(self, theta: torch.Tensor) -> torch.Tensor:
-        """``log f(theta) = −evaluate_model(theta).value`` for a batch
-        ``(N, d)``."""
-        return -self.sampler.evaluate_model(theta)[0].value
+        """``log f(theta) = −sampler.potential(theta)`` for a batch ``(N, d)``.
+
+        The sampler's potential is a density with respect to ``dtheta`` whatever
+        coordinates its chain ran in, so nothing here depends on those.
+        """
+        return -self.sampler.potential(theta)
 
     @property
     def log_evidence(self) -> float:
@@ -335,8 +338,7 @@ class PosteriorEvaluation:
         """
         excluded = [name for name in self.space.free_names if name not in theta]
         if not excluded:
-            value = self.sampler.evaluate_model(
-                self.space.to_free_vector(theta))[0].value
+            value = self.sampler.potential(self.space.to_free_vector(theta))
             # log p(theta|x) = loglik + log_prior − logZ = −value − logZ.
             log_post = -value - self.log_evidence
             return (log_post, None) if return_ess else log_post
@@ -442,9 +444,12 @@ class PosteriorEvaluation:
         return log_post, ess
 
     def _tempered_loglik(self, theta: torch.Tensor) -> torch.Tensor:
-        """``beta·loglik(theta) = −beta·U_lik``, the tempered log-likelihood."""
-        pot = self.sampler.evaluate_model(theta)[0]
-        return -pot.value if pot.base is None else pot.base - pot.value
+        """``beta·loglik(theta) = −U(theta) − log p(theta)``, the tempered
+        log-likelihood. The potential carries the prior and the likelihood
+        together, so subtracting the prior the space holds leaves the
+        likelihood."""
+        return (-self.sampler.potential(theta)
+                - self.space.prior_log_prob_vector(theta))
 
     @cached_property
     def _jackknife_result(self) -> dict:
