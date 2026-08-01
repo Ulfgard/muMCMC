@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -44,9 +44,14 @@ class MCMCSampler(ABC):
         requires_metric: bool,
     ):
         self.potential_fn = potential_fn
-        self.space = space
+        self._space = space
         self.requires_metric = requires_metric
         self.beta = 1.0   # inverse temperature
+
+    @property
+    def space(self):
+        """The sampler's parameter space."""
+        return self._space
 
     def evaluate_model(
         self, theta_free: torch.Tensor, beta: Optional[float] = None,
@@ -54,24 +59,27 @@ class MCMCSampler(ABC):
     ):
         """``value = beta * U_lik + U_base``, ``U_base = -log p(theta)``.
 
-        Posterior evaluation at the free variable vector ``theta``, which is
-        where the chain runs and where the model is written, so nothing is
-        transformed. The user's ``potential_fn`` is:
+        Posterior evaluation at the free variable vector ``theta_free``, which
+        is where the chain runs and where the model is written, so nothing is
+        transformed. The user's ``potential_fn`` is handed the full vector
+        ``space.to_full(theta_free)``, of width ``d_full`` over ``space.names``
+        and carrying each fixed variable at its value:
 
-          requires_metric=False:  potential_fn(theta) -> scalar U_lik
-          requires_metric=True:   potential_fn(theta) -> (U_lik, G_lik), with
-              G_lik a (d_full, d_full) SPD metric on the same vector.
+          requires_metric=False:  potential_fn(theta_full) -> scalar U_lik
+          requires_metric=True:   potential_fn(theta_full) -> (U_lik, G_lik),
+              with G_lik a (d_full, d_full) SPD metric on that same vector.
 
         Batched over the leading axis: ``(N, d)`` -> ``(N,)`` potential.
 
         Parameters
         ----------
         theta_free : Tensor
-            Free variable vector.
+            Free variable vector, shape ``(N, d)``.
         beta : float, optional
             Inverse temperature. Default ``self.beta`` (1.0 = untempered).
         grad : bool
-            If True, also return the gradient and detach all returned objects.
+            If True, also return the gradient. The potential and the gradient
+            are then detached. The metric carries its graph either way.
 
         Returns
         -------
@@ -79,10 +87,11 @@ class MCMCSampler(ABC):
             ``value = beta * U_lik + U_base``.
         metric
             ``G(beta) = beta * A_lik + M``, the free block of the likelihood
-            metric plus the prior's own metric on the variables, ``None`` for a
-            space with no prior. ``None`` when ``requires_metric`` is False.
+            metric plus the prior's own metric ``M`` on the variables. ``M`` is
+            ``None`` for a space with no prior, and the metric itself is
+            ``None`` when ``requires_metric`` is False.
         gradient
-            ``value = ∂U/∂theta``. Returned only when ``grad`` is True.
+            ``∂U/∂theta_free``. Returned only when ``grad`` is True.
         """
         if beta is None:
             beta = self.beta
@@ -120,6 +129,25 @@ class MCMCSampler(ABC):
                                   grad_of(U_base).detach(), beta)
         potential = TemperedAffine(u_likelihood.detach(), U_base.detach(), beta)
         return potential, metric, gradient
+
+    def potential(self, theta_free: torch.Tensor,
+                  beta: Optional[float] = None) -> torch.Tensor:
+        """``U(theta, beta)`` on the free variables, shape ``(...)`` for
+        ``theta_free`` of shape ``(..., d)``.
+
+        It holds ``p(theta | beta) = exp(-U(theta, beta)) / Z_beta``, a density
+        with respect to ``dtheta``. The chain runs on the variables, so this is
+        :meth:`evaluate_model`'s value. A sampler running in other coordinates
+        overrides it to pull its own potential back.
+
+        Parameters
+        ----------
+        theta_free : Tensor, shape (..., d)
+            Free variable vector.
+        beta : float, optional
+            Inverse temperature. Default ``self.beta``.
+        """
+        return self.evaluate_model(theta_free, beta)[0].value
 
     def to_position(self, theta_free: torch.Tensor) -> torch.Tensor:
         """The chain's position at the free variables ``theta_free``. The chain
@@ -277,8 +305,8 @@ class PyroSampler(MCMCSampler):
         ``(d,)`` state and expects a scalar. Only valid when
         ``requires_metric=False``.
         """
-        z = params_dict["params"]                  # (d,)
-        potential, _ = self.evaluate_model(z.unsqueeze(0))
+        theta_free = params_dict["params"]         # (d,)
+        potential, _ = self.evaluate_model(theta_free.unsqueeze(0))
         return potential.value.squeeze(0)          # (1,d)->(1,)->()
 
     def diagnostics(self) -> dict:
@@ -315,7 +343,7 @@ class PyroSampler(MCMCSampler):
 
         Parameters
         ----------
-        initial_params : Tensor
+        initial_params : dict[str, Tensor]
             Starting point keyed by name, in the form a run returns. Fixed
             names are ignored.
         num_samples : int

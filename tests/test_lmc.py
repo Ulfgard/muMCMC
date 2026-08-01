@@ -6,8 +6,6 @@ Jacobian of the full (q, v) -> (q', v') map. Then a statistical-recovery test on
 a curved metric (which leaves the target unchanged).
 """
 import torch
-import pytest
-from pyro.distributions import Normal
 
 from muMCMC import LMC, HMC, NormalSpace, UnnormalizedSpace
 from muMCMC.LMC import LMCState

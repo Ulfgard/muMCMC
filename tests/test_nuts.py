@@ -2,15 +2,15 @@
 
 NUTS currently delegates the actual transitions to Pyro, so it is correct by
 construction.  What is *ours* -- and what these tests pin down -- is the
-constrained-space reparameterization layered on top: the potential Pyro sees is
+potential layered on top: the one Pyro sees is
 
-    U(z) = U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
+    U(theta) = U_lik(theta_full) - log p(theta)
 
 assembled in ``MCMCSampler.evaluate_model``, plus the free/fixed splicing and the
-output schema.  The statistical tests below (sample the prior; sample a flat
-target on a box and recover a *uniform* marginal) exercise exactly the prior and
-Jacobian terms that a future non-Pyro kernel would have to reproduce, so they
-double as a behaviour spec should we ever cut the Pyro tether.
+output schema.  The statistical tests below sample the prior under a flat
+likelihood, which exercises the prior term a future non-Pyro kernel would have
+to reproduce, so they double as a behaviour spec should we ever cut the Pyro
+tether.
 
 Runs are single-chain (Pyro spawns a worker process per chain; single-chain
 keeps these in-process, fast, and deterministic) and seed-fixed.  Expensive
@@ -21,9 +21,8 @@ import math
 import torch
 import pytest
 import pyro
-from pyro.distributions import Normal
 
-from muMCMC import NUTS, LogNormalSpace, NormalSpace, UnnormalizedSpace
+from muMCMC import NUTS, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -31,6 +30,8 @@ COMMON_KEYS = {"accept_rate", "num_divergences", "step_size"}
 
 N_SAMPLES = 500
 N_WARMUP = 250
+
+MU0, SIGMA0 = 0.7, 1.6      # a prior whose chart is not the identity
 
 
 def _flat_likelihood(theta):
@@ -44,8 +45,8 @@ def _flat_likelihood(theta):
 
 @pytest.fixture(scope="module")
 def prior_run():
-    """Flat likelihood under N(0,1) priors on an unconstrained space: NUTS
-    should reproduce the prior as its stationary distribution."""
+    """Flat likelihood under N(0,1) priors: NUTS should reproduce the prior as
+    its stationary distribution."""
     torch.manual_seed(0)
     names = ["a", "b"]
     space = NormalSpace(names)
@@ -58,15 +59,14 @@ def prior_run():
 
 @pytest.fixture(scope="module")
 def chart_run():
-    """Flat likelihood under a log-normal prior, whose support is the positive
-    half line. The chain runs on the variables, so it meets that boundary
-    directly and pays for it in divergences and mixing, which is why this draws
-    more than the unbounded fixtures."""
+    """Flat likelihood under a shifted, scaled normal prior, so the chart is not
+    the identity. The prior is the whole target, and it has to come back as the
+    one it was drawn from."""
     torch.manual_seed(0)
-    space = LogNormalSpace(["x", "y"])
+    space = NormalSpace(["x", "y"], mu=MU0, sigma=SIGMA0)
     nuts = NUTS(_flat_likelihood, space)
-    out = nuts.run_mcmc({n: torch.tensor(1.0) for n in nuts.space.free_names}, num_samples=8 * N_SAMPLES,
-                        num_warmup_steps=4 * N_WARMUP, num_chains=1,
+    out = nuts.run_mcmc({n: torch.tensor(MU0) for n in nuts.space.free_names}, num_samples=N_SAMPLES,
+                        num_warmup_steps=N_WARMUP, num_chains=1,
                         disable_progbar=True)
     return space, nuts, out
 
@@ -85,19 +85,13 @@ def test_prior_recovery_marginals(prior_run):
         assert abs(float(x.std()) - 1.0) < 0.15
 
 
-def test_chart_samples_stay_in_the_support(chart_run):
-    _, _, out = chart_run
-    assert torch.all(out["x"] > 0.0) and torch.all(out["y"] > 0.0)
-
-
 def test_chart_flat_target_is_the_prior(chart_run):
-    # With a flat likelihood the prior is the whole target, so a bounded support
-    # must still come back as the prior it was drawn from.
+    # With a flat likelihood the prior is the whole target, so the draws have to
+    # carry the prior's own location and scale rather than a standard normal's.
     _, _, out = chart_run
     for name in ["x", "y"]:
-        log_x = torch.log(out[name])
-        assert abs(float(log_x.mean())) < 0.15
-        assert abs(float(log_x.std()) - 1.0) < 0.15
+        assert abs(float(out[name].mean()) - MU0) < 0.15
+        assert abs(float(out[name].std()) - SIGMA0) < 0.15
 
 
 # --------------------------------------------------------------------------- #
@@ -108,15 +102,14 @@ def test_output_keys_and_grouping(chart_run):
     _, _, out = chart_run
     assert set(out) == {"x", "y"}
     # single chain -> (num_chains, num_samples)
-    assert out["x"].shape == (1, 8 * N_SAMPLES)
-    assert out["y"].shape == (1, 8 * N_SAMPLES)
+    assert out["x"].shape == (1, N_SAMPLES)
+    assert out["y"].shape == (1, N_SAMPLES)
 
 
 def test_fixed_parameter_is_spliced_as_constant():
     torch.manual_seed(0)
     names = ["a", "b", "c"]
-    space = NormalSpace(names,
-                               fixed={"c": 1.5})
+    space = NormalSpace(names, fixed={"c": 1.5})
     nuts = NUTS(_flat_likelihood, space)
     out = nuts.run_mcmc({n: torch.tensor(0.0) for n in nuts.space.free_names}, num_samples=40, num_warmup_steps=20,
                         num_chains=1, disable_progbar=True)

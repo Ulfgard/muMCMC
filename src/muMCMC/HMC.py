@@ -30,7 +30,7 @@ class HMCState:
     Parameters
     ----------
     q : Tensor, shape (N, d)
-        Position in the space's normal chart, free coordinates.
+        Position, which is the free variables ``theta`` in free-name order.
     U : TemperedAffine
         Potential at ``q``.
     grad : TemperedAffine
@@ -76,9 +76,9 @@ class HMC(HamiltonianSampler):
 
         H(q, p) = U(q) + 1/2 pT M^-1 p,
 
-    with ``U`` the full chart potential assembled by ``MCMCSampler`` and ``M`` a
-    constant mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The model is
-    given on the variables and read at ``theta = T(q)``.
+    with ``U`` the potential assembled by ``MCMCSampler`` and ``M`` a constant
+    mass matrix.  Momentum is drawn ``p ~ N(0, M)``.  The chain runs on the free
+    variables, so ``q`` is ``theta`` and nothing is transformed.
 
     The leapfrog is explicit and symplectic, so acceptance is the plain energy
     difference ``H(new) - H(old)`` with no Jacobian correction.

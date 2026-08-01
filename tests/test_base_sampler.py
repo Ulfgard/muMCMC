@@ -2,30 +2,28 @@
 
 Two responsibilities live here, independent of any concrete sampler:
 
-* :meth:`evaluate_model` pulls the user's constrained-space ``potential_fn``
-  back to unconstrained coordinates and assembles
+* :meth:`evaluate_model` assembles, on the free variables the chain runs on,
 
-      U(z) = U_lik(theta(z)) + U_prior(theta(z)) - log|det dtheta/dz|
+      U(theta) = U_lik(theta_full) - log p(theta)
 
-  (plus, when ``requires_metric``, the pulled-back metric G_lik + G_prior).
-  We check each term of that composition in isolation: the prior term on an
-  identity space, the Jacobian term on a box space, fixed-coordinate splicing,
-  and the metric assembly (with and without a prior metric).
+  (plus, when ``requires_metric``, the free block of G_lik plus the prior's
+  metric). We check each term of that composition in isolation: the prior
+  term, the full-width vector the user's ``potential_fn`` is handed,
+  fixed-coordinate splicing, and the metric assembly (with and without a
+  prior metric).
 
 * :meth:`run_mcmc` is the batched driver: ``init`` once, ``step`` per
   iteration, ``end_warmup`` exactly at the warmup boundary, collecting only
-  post-warmup states and mapping them back to constrained space.  We drive it
-  with a tiny recording sampler so the mechanics are testable without a real
+  post-warmup states and returning them keyed by name.  We drive it with a
+  tiny recording sampler so the mechanics are testable without a real
   integrator.
 """
-import math
-
 import torch
 import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import NormalSpace, LogNormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -67,24 +65,20 @@ class _RecordingSampler(MCMCSampler):
         self.end_warmup_at_step = self.calls["step"]
 
 
-def _matvec(M, v):
-    return (M @ v[..., None])[..., 0]
-
-
 # ========================================================================== #
 #  evaluate_model: potential composition                                     #
 # ========================================================================== #
 
 def test_potential_adds_prior_on_identity_space():
-    # Identity transform (Jacobian log-det = 0): U = U_lik - log prior.
+    # Nothing is transformed, so U = U_lik - log prior.
     names = ["a", "b"]
     space = NormalSpace(names)
     s = _RecordingSampler(space, potential_fn=lambda th: 0.5 * (th ** 2).sum(-1))
 
-    z = torch.randn(5, 2)
-    U = s.evaluate_model(z)[0].value
-    u_lik = 0.5 * (z ** 2).sum(-1)
-    prior_lp = Normal(0.0, 1.0).log_prob(z).sum(-1)   # computed independently
+    theta = torch.randn(5, 2)
+    U = s.evaluate_model(theta)[0].value
+    u_lik = 0.5 * (theta ** 2).sum(-1)
+    prior_lp = Normal(0.0, 1.0).log_prob(theta).sum(-1)   # computed independently
     assert U.shape == (5,)
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
 
@@ -92,10 +86,10 @@ def test_potential_adds_prior_on_identity_space():
 def test_potential_is_the_likelihood_plus_the_prior_on_the_variables():
     # The chain runs on the variables, so U = U_lik(theta) - log_prior(theta)
     # with nothing transformed and no Jacobian anywhere.
-    space = LogNormalSpace(["x", "y"])
+    space = NormalSpace(["x", "y"], mu=0.4, sigma=1.3)
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
-    theta = torch.rand(6, 2) + 0.5
+    theta = torch.randn(6, 2)
     expected = theta.sum(-1) - space.prior_log_prob_vector(theta)
     assert torch.allclose(s.evaluate_model(theta)[0].value, expected, atol=ATOL)
 
@@ -104,14 +98,13 @@ def test_potential_splices_fixed_coordinate_and_skips_its_prior():
     # c is fixed at 2.0: potential_fn sees the full vector (so its sum includes
     # the +2.0), while the prior sums over the free names a, b only.
     names = ["a", "b", "c"]
-    space = NormalSpace(names,
-                               fixed={"c": 2.0})
+    space = NormalSpace(names, fixed={"c": 2.0})
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
-    z = torch.randn(4, 2)                       # free coords a, b
-    U = s.evaluate_model(z)[0].value
-    u_lik = z.sum(-1) + 2.0                      # fixed c spliced in
-    prior_lp = Normal(0.0, 1.0).log_prob(z).sum(-1)   # free names only
+    theta = torch.randn(4, 2)                    # free coords a, b
+    U = s.evaluate_model(theta)[0].value
+    u_lik = theta.sum(-1) + 2.0                  # fixed c spliced in
+    prior_lp = Normal(0.0, 1.0).log_prob(theta).sum(-1)   # free names only
     assert torch.allclose(U, u_lik - prior_lp, atol=ATOL)
 
 
@@ -140,15 +133,15 @@ def _metric_model(scale):
     return model
 
 
-def test_metric_branch_returns_pulled_back_likelihood_metric():
-    # No prior metric, identity transform: the pulled-back metric is just G_lik.
+def test_metric_branch_returns_the_likelihood_metric():
+    # No prior metric, so the assembled metric is just G_lik.
     space = UnnormalizedSpace(["a", "b"])        # no priors, no prior metric
     s = _RecordingSampler(space, potential_fn=_metric_model(2.0), requires_metric=True)
 
-    z = torch.randn(4, 2)
-    potential, metric = s.evaluate_model(z)
-    # U = U_lik (no prior, identity Jacobian)
-    assert torch.allclose(potential.value, 0.5 * (z ** 2).sum(-1), atol=ATOL)
+    theta = torch.randn(4, 2)
+    potential, metric = s.evaluate_model(theta)
+    # U = U_lik, since the space carries no prior
+    assert torch.allclose(potential.value, 0.5 * (theta ** 2).sum(-1), atol=ATOL)
     v = torch.randn(4, 2)
     assert torch.allclose(metric.inv_metric_times_vec(v), v / 2.0, atol=ATOL)   # G = 2 I
 
@@ -171,7 +164,6 @@ def test_metric_branch_adds_prior_metric():
 
 def test_to_full_splices_fixed():
     space = UnnormalizedSpace(["a", "b", "c"], fixed={"c": 2.0})
-    s = _RecordingSampler(space)
     theta_free = torch.randn(5, 2)
     full = space.to_full(theta_free)
     assert full.shape == (5, 3)
@@ -183,7 +175,7 @@ def test_to_full_splices_fixed():
 def test_init_position_is_the_variables_themselves():
     # The chain runs on the variables, so the starting position is the caller's
     # point stacked in free-name order, with no map applied.
-    s = _RecordingSampler(LogNormalSpace(["x", "y"]))
+    s = _RecordingSampler(NormalSpace(["x", "y"], mu=0.4, sigma=1.3))
     point = {"x": torch.tensor(0.3), "y": torch.tensor(2.0)}
     assert torch.allclose(s._init_position(point),
                           torch.tensor([0.3, 2.0]), atol=ATOL)

@@ -42,7 +42,7 @@ class _RichDiagNUTS(pyro.infer.mcmc.NUTS):
  
 class NUTS(PyroSampler):
     """
-    No-U-Turn Sampler running in the space's normal chart.
+    No-U-Turn Sampler running on the free variables.
 
     Wraps Pyro's NUTS kernel with the potential ``MCMCSampler`` assembles.
 

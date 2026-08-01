@@ -13,9 +13,10 @@ from ._solvers import FixedPointSolver
 #  ChartRATTLE: constrained HMC for hierarchical posteriors                   #
 #                                                                             #
 #  q is the library's name for the sampled position. Here it is the free      #
-#  vector in the space's normal chart, so the hyperparameter is θ = T(q) and  #
-#  q is also the chart coordinate of the manifold below. ε is the inner       #
-#  latent and x the observation.                                              #
+#  vector in the space's normal chart, so q is the latent z of the space's    #
+#  transform, the hyperparameter is θ = T(q), and q is also the chart         #
+#  coordinate of the manifold below. ε is the inner latent and x the          #
+#  observation.                                                               #
 #                                                                             #
 #  With q ~ p(q), ε ~ N(0, I_m) and a diffeomorphism φ_q, the non-centered    #
 #  reparameterization of x | q is φ_q(ε) = x, so conditioning on the data is  #
@@ -34,12 +35,14 @@ from ._solvers import FixedPointSolver
 #  Change of variables gives x | q the density N(ψ(q); 0, I)/|det B(q)|,      #
 #  which involves the ε block alone, so any prior p(q) carries through:       #
 #                                                                             #
-#      U(q) = −log p(q) + log|det B| + β·½‖ψ‖²,   G_M(q) = M + β Wᵀ W,        #
+#      U(q) = −log p(q) + log|det B| + (m/2)·log 2π + β·½‖ψ‖²,               #
+#      G_M(q) = M + β Wᵀ W,                                                  #
 #                                                                             #
 #  with p(q) and M the space's prior and its metric. Read in the space's      #
-#  normal chart the prior is exactly N(0, I), so −log p(q) is ½‖q‖² and M is  #
-#  the identity. Both are properties of the chart rather than conditions on   #
-#  the model, which is what lets an arbitrary prior be sampled here.          #
+#  normal chart the prior is exactly N(0, I), so −log p(q) is ½‖q‖² +         #
+#  (n/2)·log 2π and M is the identity. Both are properties of the chart       #
+#  rather than conditions on the model, which is what lets an arbitrary prior #
+#  be sampled here.                                                           #
 #                                                                             #
 #  No co-area factor survives into U, and that is not an omission. The        #
 #  Hausdorff-measure form carries 1/√(det Λ) with Λ = Dg Dgᵀ, and reading it  #
@@ -284,8 +287,9 @@ class ChartRATTLEState:
     Attributes
     ----------
     q, p : (N, n)
-        Position (the chart coordinate, ``q`` = θ) and momentum. ``q`` is read
-        as the sample.
+        Position and momentum. The position is the chart coordinate, so ``q`` is
+        the latent ``z`` of the space's transform and the variables are
+        θ = T(q). A run reports θ, not ``q``.
     U : TemperedAffine
         Potential. ``U.value`` is the ``(N,)`` energy and ``U.lik`` the swap
         statistic.
@@ -424,14 +428,26 @@ class ChartRATTLE(HamiltonianSampler):
 
     # ---- model evaluation (the extension point) ---------------------------- #
 
-    def evaluate_model(self, z_free, beta=None, grad=False):
-        """The model at the position ``z_free`` (the chart coordinate ``q``), and
+    def evaluate_model(self, q_free, beta=None, grad=False):
+        """The model at the position ``q_free`` (the chart coordinate ``q``), and
         with ``grad`` the force driving the integrator. Returns ``(U, metric,
         psi, W)``, or ``(U, metric, psi, W, grad_V)`` when ``grad`` is set.
 
+        The argument is the chart coordinate, unlike
+        :meth:`MCMCSampler.evaluate_model`, which takes the variables. Map one
+        to the other with :meth:`to_position` and :meth:`to_variables`.
+
         U : TemperedAffine
-            Potential U(q) = ½‖q‖² + log|det B| + β·½‖ψ‖², the prior read in the
-            space's normal chart. The target is e^{−U}.
+            Potential
+
+                U(q) = ½‖q‖² + (n/2)·log 2π + (m/2)·log 2π + log|det B|
+                       + β·½‖ψ‖²,
+
+            whose first two terms are −log p(q) for the prior read in the
+            space's normal chart, where it is exactly N(0, I), and whose next
+            two are −log p(x | q) less the tempered data fit. The target is
+            e^{−U}. Read on the variables by :meth:`potential`, it is
+            normalized, so its integral there is the evidence.
 
         metric : TemperedMetric
             Metric G_M(q) = I + β WᵀW on the q-chart: the ambient metric
@@ -454,7 +470,7 @@ class ChartRATTLE(HamiltonianSampler):
         beta = self.beta if beta is None else beta
         # Detached leaf regardless of ``grad``: W comes from a reverse pass
         # through psi, so the input has to carry a graph either way.
-        q = z_free.detach().requires_grad_(True)
+        q = q_free.detach().requires_grad_(True)
         # In the chart the prior is exactly N(0, I), so its potential is ½‖q‖²
         # and the prior block M of G_M is the identity. Both hold for any prior,
         # which is the whole reason this sampler runs here.
@@ -465,8 +481,14 @@ class ChartRATTLE(HamiltonianSampler):
             psi, W, log_abs_det_B = self._chart.psi_with_jvp(q)
             gram = W.transpose(-2, -1) @ W                 # (N, n, n) = WᵀW
             lik = 0.5 * (psi * psi).sum(-1)                # U_lik = ½‖ψ‖²
+            # Both normalizers, the prior's over n coordinates and the
+            # likelihood's over m, sit in base rather than lik. They are
+            # constants, so they leave the trajectory and the accept step alone,
+            # and keeping them out of lik leaves PT's thermodynamic integration
+            # untouched while making e^{-U} integrate to the evidence.
             base = (0.5 * (q * q).sum(-1)
                     + 0.5 * q.shape[-1] * math.log(2.0 * math.pi)
+                    + 0.5 * psi.shape[-1] * math.log(2.0 * math.pi)
                     + log_abs_det_B)
             if grad:
                 G = A_prior + broadcast_beta(beta, 2) * gram
@@ -485,6 +507,22 @@ class ChartRATTLE(HamiltonianSampler):
         return out
 
     # ---- the chain's coordinates ------------------------------------------- #
+
+    def potential(self, theta_free, beta=None):
+        """``U(theta, beta)`` on the variables, the chart potential of
+        :meth:`evaluate_model` pulled back along ``q = T⁻¹(theta)``,
+
+            U(theta) = U(q) − log|det dq/dtheta|
+                     = −log p(theta) + log|det B| + (m/2)·log 2π + β·½‖ψ‖².
+
+        At ``beta = 1`` that is −log[p(theta) p(x | theta)], so ``Z_1`` is the
+        evidence p(x). The coarea factor and the change of variables on
+        ``x | theta`` are the same log|det B|, so no measure factor is left
+        over.
+        """
+        chart = self.space.as_transform.inverse(theta_free)
+        return (self.evaluate_model(chart.mapped_point, beta)[0].value
+                - chart.jacobian_log_det)
 
     def to_position(self, theta_free):
         """The chart coordinate q at the variables theta, so q = T⁻¹(theta).
@@ -512,9 +550,9 @@ class ChartRATTLE(HamiltonianSampler):
         # Sole initialization point for the trajectory's model quantities: a PT
         # swap can relabel q to another temperature slot between transitions, so
         # nothing model-dependent may be carried across the accept boundary.
-        z = torch.zeros(state.q.shape[0], dtype=state.q.dtype, device=state.q.device)
-        self._step_residual = z.clone()
-        self._step_iters = z.clone()
+        zeros = torch.zeros(state.q.shape[0], dtype=state.q.dtype, device=state.q.device)
+        self._step_residual = zeros.clone()
+        self._step_iters = zeros.clone()
         (state.U, state.metric, state.psi, state.W,
          state.grad_V) = self.evaluate_model(state.q, grad=True)
         state.p = state.metric.sample_momentum()
@@ -592,10 +630,10 @@ class ChartRATTLE(HamiltonianSampler):
         """Zero the run-level solver summaries and this transition's worst-solve
         accumulators (re-zeroed each transition in :meth:`sample_momentum`)."""
         N = self.step_size.shape[0]
-        z = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
-        self._residual_sum = z.clone()
-        self._residual_max = z.clone()
-        self._fp_iters_sum = z.clone()
-        self._fp_iters_max = z.clone()
-        self._step_residual = z.clone()
-        self._step_iters = z.clone()
+        zeros = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
+        self._residual_sum = zeros.clone()
+        self._residual_max = zeros.clone()
+        self._fp_iters_sum = zeros.clone()
+        self._fp_iters_max = zeros.clone()
+        self._step_residual = zeros.clone()
+        self._step_iters = zeros.clone()

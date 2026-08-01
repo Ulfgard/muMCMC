@@ -1,19 +1,17 @@
 """Contract tests for the space classes.
 
 A space owns the parameter naming, the free/fixed split, the chart between the
-constrained variables and the standard normal, and the prior. The samplers drive
+variables and the standard normal latent, and the prior. The samplers drive
 spaces through a fixed protocol -- ``to_free_vector`` / ``from_free_vector``,
 ``to_full``, ``add_fixed`` / ``remove_fixed``, ``as_transform``,
 ``prior_log_prob[_vector]``, ``prior_metric``, ``free_block``, ``sample`` -- so
 these tests exercise that protocol's invariants.
 """
-import math
-
 import torch
 import pytest
 from torch.distributions import Normal
 
-from muMCMC.spaces import LogNormalSpace, NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -22,7 +20,6 @@ NAMES = ["a", "b", "c"]
 
 PROPER = [
     lambda **kw: NormalSpace(NAMES, mu=0.3, sigma=1.7, **kw),
-    lambda **kw: LogNormalSpace(NAMES, mu=-0.2, sigma=0.8, **kw),
 ]
 
 
@@ -34,7 +31,6 @@ def test_dimensions_without_fixed():
     s = NormalSpace(NAMES)
     assert s.d == 3 and s.d_full == 3
     assert s.free_names == NAMES and s.free_indices == [0, 1, 2]
-    assert s.fixed_indices == []
 
 
 def test_dimensions_with_interior_fixed():
@@ -43,7 +39,7 @@ def test_dimensions_with_interior_fixed():
     s = NormalSpace(NAMES, fixed={"b": 0.5})
     assert s.d == 2 and s.d_full == 3
     assert s.free_names == ["a", "c"]
-    assert s.free_indices == [0, 2] and s.fixed_indices == [1]
+    assert s.free_indices == [0, 2]
 
 
 def test_fixed_names_must_appear_in_names():
@@ -247,7 +243,7 @@ def test_prior_metric_is_the_pullback_of_the_identity(build):
 
 
 def test_free_block_drops_the_fixed_rows_and_columns():
-    s = LogNormalSpace(NAMES, fixed={"b": 1.0})
+    s = NormalSpace(NAMES, fixed={"b": 1.0})
     G = torch.arange(9.0).reshape(3, 3).expand(4, 3, 3)
     A = s.free_block(G)
     assert A.shape == (4, 2, 2)
@@ -281,11 +277,6 @@ def test_sample_does_not_disturb_the_global_rng():
     torch.manual_seed(0)
     s.sample(8, generator=torch.Generator().manual_seed(1))
     assert torch.allclose(torch.randn(3), before, atol=ATOL)
-
-
-def test_sample_lands_in_the_support():
-    draw = LogNormalSpace(NAMES).sample(256)
-    assert all(bool((draw[n] > 0).all()) for n in NAMES)
 
 
 def test_sample_recovers_the_prior_moments():

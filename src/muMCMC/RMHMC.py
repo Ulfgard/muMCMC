@@ -212,10 +212,6 @@ class RMHMCState:
 #  energy through the build_initial_state / sample_momentum / integrate /     #
 #  acceptance_delta / adapt hooks. All chains run in one batched state.       #
 #                                                                             #
-#  model_fn is specified on the variables, which is where the chain runs, so  #
-#  MCMCSampler adds the prior's potential and its metric and takes the free   #
-#  block of the likelihood metric. Nothing is transformed.                    #
-#                                                                             #
 # =========================================================================== #
 
 class RMHMC(HamiltonianSampler):
@@ -224,8 +220,9 @@ class RMHMC(HamiltonianSampler):
     q ~ exp(−U(q)) under the position-dependent metric G(q) with Hamiltonian
     H(q, p) = U(q) + ½ pᵀ G⁻¹(q) p + ½ log det G(q).
 
-    Runs in the space's normal chart. The model is specified on the variables
-    and read there by :meth:`MCMCSampler.evaluate_model`.
+    Runs on the free variables, so ``q`` is ``theta``. The model is specified
+    there and read by :meth:`MCMCSampler.evaluate_model`, which adds the prior's
+    potential and its metric. Nothing is transformed.
 
     Parameters
     ----------
@@ -238,14 +235,14 @@ class RMHMC(HamiltonianSampler):
     step_size : float
         Integration step size. Adapted during warmup when adapting.
     num_steps : int
-        Number of leapfrog substeps per transition.
+        Number of implicit-midpoint substeps per transition.
     adapt_step_size : bool
         Adapt the step size during warmup via the REINFORCE adapter.
         Default True.
     adaptation_sigma : float
         Perturbation scale of the REINFORCE adapter. Default 0.1.
     fp_max_iter : int
-        Maximum fixed-point iterations per leapfrog substep. Default 100.
+        Maximum fixed-point iterations per substep. Default 100.
     fp_tol : float
         Convergence tolerance for fixed-point iteration (max norm).
     solver : str
@@ -348,9 +345,9 @@ class RMHMC(HamiltonianSampler):
         """Evaluate the model at ``q`` and return the initial :class:`RMHMCState`
         (momentum drawn later by :meth:`sample_momentum`). Seeds the
         per-transition solver scratch so the sampler is usable right after init."""
-        z = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
-        self._step_residual = z.clone()
-        self._step_iters    = z.clone()
+        zeros = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
+        self._step_residual = zeros.clone()
+        self._step_iters    = zeros.clone()
         with torch.no_grad():
             U, metric = self.evaluate_model(q)
         return RMHMCState(q, U=U, metric=metric)
@@ -360,9 +357,9 @@ class RMHMC(HamiltonianSampler):
         per-transition solver scratch (worst residual / iteration count over the
         transition's substeps), read by :meth:`acceptance_delta` and :meth:`adapt`."""
         N = state.q.shape[0]
-        z = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
-        self._step_residual = z.clone()
-        self._step_iters    = z.clone()
+        zeros = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
+        self._step_residual = zeros.clone()
+        self._step_iters    = zeros.clone()
         state.p = state.metric.sample_momentum()
         return state
 
@@ -435,9 +432,9 @@ class RMHMC(HamiltonianSampler):
         (``_step_residual`` / ``_step_iters``) is reset each transition in
         :meth:`sample_momentum`, so it is left alone here."""
         N = self.step_size.shape[0]
-        z = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
-        self._residual_sum = z.clone()
-        self._residual_max = z.clone()
-        self._fp_iters_sum = z.clone()
-        self._fp_iters_max = z.clone()
+        zeros = torch.zeros(N, dtype=self.step_size.dtype, device=self.step_size.device)
+        self._residual_sum = zeros.clone()
+        self._residual_max = zeros.clone()
+        self._fp_iters_sum = zeros.clone()
+        self._fp_iters_max = zeros.clone()
 

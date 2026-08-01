@@ -7,9 +7,8 @@ gradient).  Tests are seed-fixed and sized to run on CPU in CI.
 """
 import torch
 import pytest
-from pyro.distributions import Normal
 
-from muMCMC import HMC, PT, NormalSpace, UnnormalizedSpace
+from muMCMC import HMC, PT, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 

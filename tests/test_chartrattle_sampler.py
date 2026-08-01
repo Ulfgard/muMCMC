@@ -13,24 +13,13 @@ import math
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState, ChartConstraint
-from muMCMC.spaces import NormalSpace, UnnormalizedSpace
+from muMCMC.ChartRATTLE import (ChartRATTLE, ChartRATTLEState, ChartConstraint,
+                                LocationScaleChart)
+from muMCMC.spaces import NormalSpace
 from muMCMC.PT import PT
+from muMCMC.validation import PosteriorEvaluation
 
 torch.set_default_dtype(torch.float64)
-
-
-def _eye(n):
-    """Identity prior metric. ChartRATTLE requires the space to supply M, and
-    these targets all want the plain identity."""
-    return lambda th: torch.eye(n).expand(th.shape[0], n, n)
-
-
-def _N01():
-    """Explicit standard-normal prior, the latent of the plain non-centered
-    parameterization. ChartRATTLE reads the prior off the space, so it is named
-    rather than assumed."""
-    return torch.distributions.Normal(torch.tensor(0.0), torch.tensor(1.0))
 
 
 class FunnelChart(ChartConstraint):
@@ -395,3 +384,71 @@ def test_pt_runs_swaps_and_recovers_target_mean():
     assert diag["swap_accept_rate"].shape == (3,)
     assert float(diag["swap_accept_rate"].min()) > 0.1   # every pair communicates
     assert abs(float(state.q.reshape(-1).mean()) - mean_q) < 0.05
+
+
+# ========================================================================== #
+#  7. The potential on the variables                                        #
+# ========================================================================== #
+
+def _scale_model(m, seed=0, mu=0.7, sigma=1.6):
+    """x | theta ~ N(0, e^theta I_m) as a LocationScaleChart, with the closed
+    form of its log-likelihood. The space is Normal(mu, sigma), so the chart
+    theta = mu + sigma z is not the identity and the pull-back has work to do."""
+    torch.manual_seed(seed)
+    x = torch.randn(m)
+    chart = LocationScaleChart(
+        lambda th: torch.zeros(th.shape[0], m, dtype=th.dtype),
+        lambda th: torch.exp(th[:, 0])[:, None, None] * torch.eye(m, dtype=th.dtype),
+        x)
+    space = NormalSpace(["v"], mu=mu, sigma=sigma)
+    sampler = ChartRATTLE(chart, space, step_size=0.25, num_steps=8,
+                          adapt_step_size=False, solver="anderson")
+
+    def log_lik(theta):                                   # (N, 1) -> (N,)
+        return (-0.5 * (x @ x) * torch.exp(-theta[:, 0]) - 0.5 * m * theta[:, 0]
+                - 0.5 * m * math.log(2 * math.pi))
+
+    return sampler, space, log_lik
+
+
+def test_potential_on_the_variables_is_the_joint_density():
+    # evaluate_model works in the chart, so U there is a density in q. potential
+    # pulls it back, and what comes out is exactly -log[p(theta) p(x|theta)],
+    # both normalizers included. Nothing else lets a caller on the variables
+    # read this sampler's target.
+    sampler, space, log_lik = _scale_model(m=3)
+    theta = torch.randn(11, 1) * 1.6 + 0.7
+    expected = -(log_lik(theta) + space.prior_log_prob_vector(theta))
+    assert torch.allclose(sampler.potential(theta), expected, atol=1e-10)
+
+
+def test_potential_integrates_to_the_evidence():
+    # The pull-back Jacobian and the two 2pi normalizers are exactly what make
+    # the normalizer of exp(-potential) the evidence rather than a multiple of
+    # it, so quadrature pins both at once.
+    sampler, space, log_lik = _scale_model(m=3, seed=1)
+    grid = torch.linspace(-40.0, 40.0, 200001)[:, None]
+    log_dx = math.log(float(grid[1, 0] - grid[0, 0]))
+
+    log_Z = torch.logsumexp(-sampler.potential(grid) + log_dx, 0)
+    evidence = torch.logsumexp(
+        log_lik(grid) + space.prior_log_prob_vector(grid) + log_dx, 0)
+    assert torch.allclose(log_Z, evidence, atol=1e-8)
+
+
+def test_posterior_evaluation_recovers_the_evidence():
+    # The end of the same thread: PosteriorEvaluation runs on the variables and
+    # the chain runs in the chart, so it has to go through potential to get the
+    # coordinates right.
+    sampler, space, log_lik = _scale_model(m=3)
+    grid = torch.linspace(-40.0, 40.0, 200001)[:, None]
+    log_dx = math.log(float(grid[1, 0] - grid[0, 0]))
+    evidence = float(torch.logsumexp(
+        log_lik(grid) + space.prior_log_prob_vector(grid) + log_dx, 0))
+
+    out = sampler.run_mcmc({"v": torch.tensor(0.7)}, num_samples=300,
+                           num_warmup_steps=150, num_chains=6,
+                           disable_progbar=True)
+    ev = PosteriorEvaluation(sampler, out,
+                             generator=torch.Generator().manual_seed(0))
+    assert abs(ev.log_evidence - evidence) < 0.05

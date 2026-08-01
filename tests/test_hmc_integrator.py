@@ -6,9 +6,8 @@ rests on: the leapfrog map is (with a momentum flip) an involution
 energy error shrinks with the step size.
 """
 import torch
-from pyro.distributions import Normal
 
-from muMCMC import HMC, NormalSpace, UnnormalizedSpace
+from muMCMC import HMC, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
