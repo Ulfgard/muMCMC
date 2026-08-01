@@ -47,38 +47,6 @@ class NormalSpace(Space):
         return self._transform
 
 
-class LogNormalSpace(Space):
-    """Independent log-normal priors, chart ``theta = exp(mu + sigma z)``, so
-    every free variable is positive.
-
-    Parameters
-    ----------
-    mu, sigma : float, dict[str, float] or Tensor
-        Location and scale of the underlying normal, ``sigma`` positive.
-    """
-
-    def __init__(self, names, mu=0.0, sigma=1.0, *, fixed=None,
-                 dtype=None, device=None):
-        super().__init__(names, fixed=fixed)
-        mu = _as_parameter(mu, self._free_names, "mu", dtype, device)
-        sigma = _as_parameter(sigma, self._free_names, "sigma", dtype, device)
-        log_sigma = torch.log(sigma)
-
-        def forward(z):
-            w = mu + sigma * z
-            return torch.exp(w), log_sigma + w
-
-        def inverse(theta):
-            log_theta = torch.log(theta)
-            return (log_theta - mu) / sigma, -log_sigma - log_theta
-
-        self._transform = NormalTransform(forward, inverse, reference=mu)
-
-    @property
-    def as_transform(self):
-        return self._transform
-
-
 class UnnormalizedSpace(Space):
     """No prior, so the chart is the identity and ``z`` is ``theta``.
 
@@ -106,7 +74,7 @@ class UnnormalizedSpace(Space):
     def as_transform(self):
         return self._transform
 
-    def prior_log_prob(self, y: dict) -> torch.Tensor:
+    def prior_log_prob(self, theta: dict) -> torch.Tensor:
         raise ValueError(
             "UnnormalizedSpace carries no prior, so prior_log_prob is not "
             "defined. Use a space with a prior if you need one.")

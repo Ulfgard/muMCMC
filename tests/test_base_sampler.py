@@ -23,7 +23,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import NormalSpace, LogNormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -86,10 +86,10 @@ def test_potential_adds_prior_on_identity_space():
 def test_potential_is_the_likelihood_plus_the_prior_on_the_variables():
     # The chain runs on the variables, so U = U_lik(theta) - log_prior(theta)
     # with nothing transformed and no Jacobian anywhere.
-    space = LogNormalSpace(["x", "y"])
+    space = NormalSpace(["x", "y"], mu=0.4, sigma=1.3)
     s = _RecordingSampler(space, potential_fn=lambda th: th.sum(-1))
 
-    theta = torch.rand(6, 2) + 0.5
+    theta = torch.randn(6, 2)
     expected = theta.sum(-1) - space.prior_log_prob_vector(theta)
     assert torch.allclose(s.evaluate_model(theta)[0].value, expected, atol=ATOL)
 
@@ -175,7 +175,7 @@ def test_to_full_splices_fixed():
 def test_init_position_is_the_variables_themselves():
     # The chain runs on the variables, so the starting position is the caller's
     # point stacked in free-name order, with no map applied.
-    s = _RecordingSampler(LogNormalSpace(["x", "y"]))
+    s = _RecordingSampler(NormalSpace(["x", "y"], mu=0.4, sigma=1.3))
     point = {"x": torch.tensor(0.3), "y": torch.tensor(2.0)}
     assert torch.allclose(s._init_position(point),
                           torch.tensor([0.3, 2.0]), atol=ATOL)

@@ -11,7 +11,7 @@ import torch
 import pytest
 from torch.distributions import Normal
 
-from muMCMC.spaces import LogNormalSpace, NormalSpace, UnnormalizedSpace
+from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -20,7 +20,6 @@ NAMES = ["a", "b", "c"]
 
 PROPER = [
     lambda **kw: NormalSpace(NAMES, mu=0.3, sigma=1.7, **kw),
-    lambda **kw: LogNormalSpace(NAMES, mu=-0.2, sigma=0.8, **kw),
 ]
 
 
@@ -244,7 +243,7 @@ def test_prior_metric_is_the_pullback_of_the_identity(build):
 
 
 def test_free_block_drops_the_fixed_rows_and_columns():
-    s = LogNormalSpace(NAMES, fixed={"b": 1.0})
+    s = NormalSpace(NAMES, fixed={"b": 1.0})
     G = torch.arange(9.0).reshape(3, 3).expand(4, 3, 3)
     A = s.free_block(G)
     assert A.shape == (4, 2, 2)
@@ -278,11 +277,6 @@ def test_sample_does_not_disturb_the_global_rng():
     torch.manual_seed(0)
     s.sample(8, generator=torch.Generator().manual_seed(1))
     assert torch.allclose(torch.randn(3), before, atol=ATOL)
-
-
-def test_sample_lands_in_the_support():
-    draw = LogNormalSpace(NAMES).sample(256)
-    assert all(bool((draw[n] > 0).all()) for n in NAMES)
 
 
 def test_sample_recovers_the_prior_moments():
