@@ -1,6 +1,6 @@
-"""Solver and integrator tests for ChartRATTLE, independent of the sampler.
+"""Solver and integrator tests for ChartRMHMC, independent of the sampler.
 
-The RATTLE step is exercised through :meth:`ChartRATTLE.integrate` on crafted
+The position step is exercised through :meth:`ChartRMHMC.integrate` on crafted
 states, checking the properties that make it a valid MCMC proposal:
 
 1. The position solve drives the orthogonality residual F(q1) to tolerance.
@@ -18,8 +18,8 @@ import math
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import (
-    ChartRATTLE, ChartRATTLEState, ChartConstraint, LocationScaleChart)
+from muMCMC.ChartRMHMC import (
+    ChartRMHMC, ChartRMHMCState, ChartConstraint, LocationScaleChart)
 from muMCMC.RMHMC import _hamiltonian
 from muMCMC.spaces import NormalSpace
 
@@ -65,7 +65,7 @@ def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_sd=None, **kw):
     torch.manual_seed(seed)
     c = FunnelChart(sigma, torch.randn(m))
     space = NormalSpace(["v"], sigma=prior_sd or 1.0)
-    return ChartRATTLE(c, space, adapt_step_size=False, **kw)
+    return ChartRMHMC(c, space, adapt_step_size=False, **kw)
 
 
 def _affine_sampler(n=2, m=5, seed=0, **kw):
@@ -75,19 +75,19 @@ def _affine_sampler(n=2, m=5, seed=0, **kw):
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
     space = NormalSpace([f"v{i}" for i in range(n)])
-    return ChartRATTLE(c, space, adapt_step_size=False, **kw), n
+    return ChartRMHMC(c, space, adapt_step_size=False, **kw), n
 
 
 def _seed_state(sampler, eta):
     """A momentum-carrying start state at ``eta`` (as sample_momentum builds it)."""
     U, metric, psi, W, grad_V = sampler.evaluate_model(eta, grad=True)
-    st = ChartRATTLEState(eta, None, U, metric, psi, W, grad_V, None)
+    st = ChartRMHMCState(eta, None, U, metric, psi, W, grad_V, None)
     return sampler.sample_momentum(st)
 
 
 def _restart(st, q, p):
     """A fresh trajectory state at (q, p) reusing st's endpoint bundle."""
-    return ChartRATTLEState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
+    return ChartRMHMCState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
 
 
 def _H(st):
@@ -99,10 +99,10 @@ def _H(st):
 # ========================================================================== #
 
 def test_position_solve_reaches_orthogonality_tolerance():
-    # Recompute the RATTLE position residual at the endpoint from the constraint
+    # Recompute the position residual at the endpoint from the constraint
     # itself, not from the solver's own stopping value:
     #   F(q1) = (q1 − q0) − β W0ᵀ(ψ(q1) − ψ0) − hp0 + (h²/2)∇V(q0).
-    # At convergence F(q1) is at tolerance, so q1 sits on the RATTLE update.
+    # At convergence F(q1) is at tolerance, so q1 sits on the update.
     h = 0.2
     s = _funnel_sampler(step_size=h, num_steps=1, fp_tol=1e-12, fp_max_iter=200)
     torch.manual_seed(1)
@@ -169,7 +169,7 @@ def test_step_preserves_volume_and_symplectic_form(prior_sd):
                                lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
                                torch.randn(m))
     space = NormalSpace([f"v{i}" for i in range(n)], sigma=prior_sd or 1.0)
-    s = ChartRATTLE(chart, space, step_size=h, num_steps=1,
+    s = ChartRMHMC(chart, space, step_size=h, num_steps=1,
                     adapt_step_size=False, solver="anderson",
                     fp_tol=1e-14, fp_max_iter=500)
     s.init(torch.zeros(1, n))                     # seeds the solver diagnostics

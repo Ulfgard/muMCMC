@@ -1,9 +1,10 @@
-"""Sampler-level tests for ChartRATTLE: the operator interface around the
+"""Sampler-level tests for ChartRMHMC: the operator interface around the
 integrator, plus statistical recovery on targets with a closed form.
 
-Adaptation is out of scope here (finicky against the solver-convergence cliff),
-so every sampler runs at a fixed step. The integrator internals live in
-test_chartrattle_solver.py. Recovery is checked against the exact Gaussian
+Adaptation is out of scope here, since it interacts with the step size at
+which the position solve stops converging, so every sampler runs at a fixed
+step. The integrator internals live in
+test_chartrmhmc_solver.py. Recovery is checked against the exact Gaussian
 induced by an affine map and against a quadrature reference for the funnel;
 parallel tempering rides on the TemperedAffine / TemperedMetric that
 evaluate_model returns.
@@ -13,7 +14,7 @@ import math
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import (ChartRATTLE, ChartRATTLEState, ChartConstraint,
+from muMCMC.ChartRMHMC import (ChartRMHMC, ChartRMHMCState, ChartConstraint,
                                 LocationScaleChart)
 from muMCMC.spaces import NormalSpace
 from muMCMC.PT import PT
@@ -69,7 +70,7 @@ def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
     c = FunnelChart(sigma, torch.randn(m))
     kw.setdefault("adapt_step_size", False)
     kw.setdefault("step_size", 0.1)
-    return ChartRATTLE(c, NormalSpace(["v"]), **kw)
+    return ChartRMHMC(c, NormalSpace(["v"]), **kw)
 
 
 def _endpoint_state(sampler, eta):
@@ -78,7 +79,7 @@ def _endpoint_state(sampler, eta):
 
 
 def _restart(st, q, p):
-    return ChartRATTLEState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
+    return ChartRMHMCState(q, p, st.U, st.metric, st.psi, st.W, st.grad_V, None)
 
 
 # ========================================================================== #
@@ -108,7 +109,7 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
     c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    s = ChartRMHMC(c, NormalSpace(["a", "b"]),
                     step_size=0.1, adapt_step_size=False)
     N = 40000
     state = s.sample_momentum(s.init(torch.zeros(N, 2)))
@@ -214,7 +215,7 @@ def test_recovers_affine_gaussian_posterior():
     c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
     mu, Sigma = c.posterior()
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    s = ChartRMHMC(c, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -248,7 +249,7 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     mu_flat, _ = c.posterior()
     assert float((mu - mu_flat).abs().max()) > 0.1
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"], mu=m0, sigma=s0),
+    s = ChartRMHMC(c, NormalSpace(["a", "b"], mu=m0, sigma=s0),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -271,7 +272,7 @@ def test_metric_is_the_identity_plus_the_gram():
 
     eta = torch.randn(6, 2)
     for sigma in (1.0, 2.5):
-        s = ChartRATTLE(c, NormalSpace(names, sigma=sigma), step_size=0.2,
+        s = ChartRMHMC(c, NormalSpace(names, sigma=sigma), step_size=0.2,
                         adapt_step_size=False)
         _, metric, _, W = s.evaluate_model(eta, grad=False)
         gram = W.transpose(-2, -1) @ W
@@ -295,7 +296,7 @@ def test_a_wide_prior_mixes_across_its_own_width():
     sd_exact = torch.linalg.inv(
         torch.eye(n) / S + W.transpose(-2, -1) @ W).diagonal().sqrt()
 
-    s = ChartRATTLE(c, NormalSpace(names, sigma=math.sqrt(S)), step_size=0.15,
+    s = ChartRMHMC(c, NormalSpace(names, sigma=math.sqrt(S)), step_size=0.15,
                     num_steps=10, adapt_step_size=False, solver="anderson",
                     fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
@@ -315,7 +316,7 @@ def test_newton_recovers_the_affine_gaussian_posterior():
     c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
     mu, Sigma = c.posterior()
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    s = ChartRMHMC(c, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="newton", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -341,7 +342,7 @@ def test_recovers_funnel_posterior_against_quadrature():
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
-    s = ChartRATTLE(c, NormalSpace(["v"]),
+    s = ChartRMHMC(c, NormalSpace(["v"]),
                     step_size=0.08, num_steps=16,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-9)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
@@ -357,7 +358,7 @@ def test_recovers_funnel_posterior_against_quadrature():
 # ========================================================================== #
 
 def test_pt_runs_swaps_and_recovers_target_mean():
-    # ChartRATTLE as a PT exploration kernel: evaluate_model returns U / G_M as a
+    # ChartRMHMC as a PT exploration kernel: evaluate_model returns U / G_M as a
     # TemperedAffine / TemperedMetric, so the swap statistic U.lik and the
     # retempering reorder ride on the base machinery. The target chain (β = 1)
     # recovers the funnel posterior mean.
@@ -370,11 +371,12 @@ def test_pt_runs_swaps_and_recovers_target_mean():
                  + 0.5 * m * sigma * grid)
     mean_q = float((torch.softmax(log_post, 0) * grid).sum())
 
-    kernel = ChartRATTLE(FunnelChart(sigma, xobs),
+    kernel = ChartRMHMC(FunnelChart(sigma, xobs),
                          NormalSpace(["v"]),
                          step_size=0.06, num_steps=12, adapt_step_size=False,
                          solver="anderson", fp_tol=1e-9)
-    # β > 0 throughout: β = 0 sends Σ/β -> ∞, outside the scale family.
+    # β = 0 is the prior and is a legitimate rung. This ladder starts above
+    # it only to keep every rung informative about the funnel.
     pt = PT(kernel, betas=torch.tensor([0.1, 0.3, 0.55, 1.0]))
     state = pt.init(torch.zeros(24, 1))
     for _ in range(400):
@@ -401,7 +403,7 @@ def _scale_model(m, seed=0, mu=0.7, sigma=1.6):
         lambda th: torch.exp(th[:, 0])[:, None, None] * torch.eye(m, dtype=th.dtype),
         x)
     space = NormalSpace(["v"], mu=mu, sigma=sigma)
-    sampler = ChartRATTLE(chart, space, step_size=0.25, num_steps=8,
+    sampler = ChartRMHMC(chart, space, step_size=0.25, num_steps=8,
                           adapt_step_size=False, solver="anderson")
 
     def log_lik(theta):                                   # (N, 1) -> (N,)

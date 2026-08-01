@@ -1,7 +1,7 @@
 """Contract tests for ``NormalTransform`` and ``ElementwiseMap``.
 
 The transform is the chart every space leans on: it exposes both directions,
-each with its own diagonal Jacobian and log-determinant, and ChartRATTLE trusts
+each with its own diagonal Jacobian and log-determinant, and ChartRMHMC trusts
 those to match the analytic Jacobian. These tests pin that contract down.
 
 The transform is built from callables rather than by subclassing, so these
@@ -149,7 +149,7 @@ def test_a_missing_inverse_log_jacobian_is_rejected():
 
 def test_the_forward_map_is_differentiable_to_second_order():
     # Both directions are closed forms, so the graph reaches the input. The
-    # force ChartRATTLE integrates differentiates the chart Jacobian, so it is
+    # force ChartRMHMC integrates differentiates the chart Jacobian, so it is
     # the second derivative that has to survive, on a chart that has one.
     T = NormalTransform(lambda z: (torch.exp(z), z),
                         lambda th: (torch.log(th), -torch.log(th)),

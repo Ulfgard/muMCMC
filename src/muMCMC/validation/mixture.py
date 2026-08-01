@@ -48,6 +48,11 @@ class GaussianMixture:
         Component means.
     scale_tril : Tensor, shape (K, d, d)
         Lower Cholesky factor of each component covariance.
+
+    Attributes
+    ----------
+    covs : Tensor, shape (K, d, d)
+        The component covariances themselves.
     """
 
     def __init__(self, weights: torch.Tensor, means: torch.Tensor,
@@ -60,10 +65,12 @@ class GaussianMixture:
 
     @property
     def n_components(self) -> int:
+        """Number of components ``K``."""
         return self.means.shape[0]
 
     @property
     def dim(self) -> int:
+        """Dimension ``d`` the mixture is defined on."""
         return self.means.shape[-1]
 
     @classmethod
@@ -71,14 +78,32 @@ class GaussianMixture:
             max_iter: int = 200, tol: float = 1e-5,
             generator: Optional[torch.Generator] = None,
             init: Optional["GaussianMixture"] = None) -> "GaussianMixture":
-        """EM fit of a ``n_components`` mixture to ``z`` (shape ``(n, d)``).
+        """EM fit of an ``n_components`` mixture to ``z``.
 
-        ``jitter`` loads every component covariance diagonal so the Choleskys stay
-        stable. ``K = 1`` is the plain sample mean and covariance. EM stops on a
-        relative log-likelihood change below ``tol`` or after ``max_iter`` steps.
-        ``init`` warm-starts EM from an existing fit (e.g. a pooled fit when
-        refitting each chain), so a nearby fit converges in a few steps instead of
-        from a cold k-means++ seed.
+        ``n_components = 1`` is the sample mean and covariance and takes no
+        iterations.
+
+        Parameters
+        ----------
+        z : Tensor, shape (n, d)
+            Points to fit.
+        n_components : int
+            Number of components ``K``.
+        jitter : float
+            Added to every component covariance diagonal, which keeps the
+            Cholesky factors defined when a component collapses.
+        max_iter : int
+            Iteration cap.
+        tol : float
+            EM stops once the relative change in the total log-likelihood is at
+            or below this.
+        generator : torch.Generator or None
+            Drives the k-means++ seeding, the global RNG when omitted. Unused
+            when ``init`` is given.
+        init : GaussianMixture or None
+            Fit to start EM from, in place of a k-means++ seeding. A nearby
+            starting fit, such as a pooled one when refitting per chain,
+            converges in a few iterations.
         """
         z = z.detach()
         n, d = z.shape

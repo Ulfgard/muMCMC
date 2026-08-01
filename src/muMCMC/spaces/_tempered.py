@@ -27,12 +27,14 @@ class TemperedAffine:
         value = beta * lik + base
 
     ``lik`` is the temperature-scaled (likelihood) part and ``base`` the
-    temperature-free part (``None`` when absent).  ``lik`` and ``base`` share a
+    temperature-free part, ``None`` when absent. ``lik`` and ``base`` share a
     leading batch axis and may carry further trailing feature axes, over which
-    ``beta`` broadcasts.  ``beta`` is slot-bound: :meth:`select` and
-    :meth:`reorder` mix or permute ``lik``/``base`` along the batch axis while
-    leaving ``beta`` in place, so a moved configuration is retempered to its
-    slot's temperature.
+    ``beta`` broadcasts.
+
+    ``beta`` is bound to the batch position rather than to the parts held there.
+    :meth:`select` and :meth:`reorder` mix or permute ``lik`` and ``base`` along
+    the batch axis and leave ``beta`` in place, so a configuration moved to
+    another position is evaluated at that position's temperature.
 
     Parameters
     ----------
@@ -49,10 +51,8 @@ class TemperedAffine:
         self._base = base
         self._beta = beta
 
-    # Read-only: ``value`` (and ``TemperedMetric.L``) are cached_property, so a
-    # post-construction mutation of these inputs would silently return a stale
-    # result. Retempering/mixing goes through reorder/select, which build fresh
-    # objects instead of mutating in place.
+    # Read-only because ``value`` and ``TemperedMetric.L`` are cached, so
+    # mutating these inputs after construction would return a stale result.
     @property
     def lik(self):
         return self._lik
@@ -75,8 +75,9 @@ class TemperedAffine:
         return v if self.base is None else v + self.base
 
     def select(self, mask: torch.Tensor, other: "TemperedAffine") -> "TemperedAffine":
-        """This quantity where ``mask`` is True, ``other`` where False, per batch
-        element.  Both share the same temperature."""
+        """This quantity where ``mask`` is True and ``other`` where it is False,
+        per batch element. Both must carry the same ``beta``, which the result
+        keeps."""
         m = mask.reshape(mask.shape + (1,) * (self.lik.dim() - mask.dim()))
         return type(self)(
             torch.where(m, self.lik, other.lik),
@@ -85,8 +86,9 @@ class TemperedAffine:
         )
 
     def reorder(self, perm: torch.Tensor) -> "TemperedAffine":
-        """Permute the batch axis: row ``i`` of the result is row ``perm[i]``.
-        ``beta`` is slot-bound and stays in place."""
+        """Permute the batch axis, so row ``i`` of the result is row ``perm[i]``
+        of this one. ``beta`` is bound to the batch position and stays in
+        place."""
         return type(self)(
             self.lik[perm],
             None if self.base is None else self.base[perm],
@@ -96,21 +98,28 @@ class TemperedAffine:
 
 class TemperedMetric(TemperedAffine):
     """
-    Metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD :attr:`value`
-    whose operations are built from its Cholesky factor ``G = L Lᵀ``.
+    Metric ``G = beta * A_lik + A_prior``, an ``(N, d, d)`` SPD :attr:`value`.
 
     ``A_lik`` (``lik``) is the free block of the model's metric and ``A_prior``
-    (``base``) the prior's own, ``None`` for a space carrying no prior. Both are
-    read in the coordinates the chain runs in.
+    (``base``) the metric the prior induces, ``None`` for a space carrying no
+    prior. Both are read in the coordinates the chain runs in.
+
+    Raises
+    ------
+    RuntimeError
+        From :attr:`L`, and from every method that uses it, when ``G`` is not
+        positive definite.
     """
 
     @cached_property
     def L(self) -> torch.Tensor:
-        """Lower-triangular Cholesky factor of :attr:`value`, positive diagonal."""
+        """Lower-triangular Cholesky factor ``G = L Lᵀ`` of :attr:`value`, with
+        positive diagonal, of shape ``(N, d, d)``."""
         return torch.linalg.cholesky(self.value)
 
     def inv_metric_times_vec(self, v: torch.Tensor) -> torch.Tensor:
-        """G⁻¹ v = L⁻ᵀ L⁻¹ v via two triangular solves."""
+        """``G⁻¹ v = L⁻ᵀ L⁻¹ v`` for ``v`` of shape ``(N, d)``, giving
+        ``(N, d)``."""
         return _solve_triangular_vec(
             self.L.transpose(-2, -1),
             _solve_triangular_vec(self.L, v, upper=False),
@@ -118,10 +127,11 @@ class TemperedMetric(TemperedAffine):
         )
 
     def log_det_metric(self) -> torch.Tensor:
-        """log det G = 2 Σ log|diag L|."""
+        """``log det G = 2 Σ_i log L_ii``, of shape ``(N,)``."""
         return 2.0 * self.L.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)
 
     def sample_momentum(self) -> torch.Tensor:
-        """Sample p ~ N(0, G) via p = L ξ, ξ ~ N(0, I)."""
+        """A draw ``p ~ N(0, G)`` of shape ``(N, d)``, detached and taken from
+        the global RNG."""
         xi = torch.randn(self.lik.shape[:-1], dtype=self.lik.dtype, device=self.lik.device)
         return (self.L @ xi[..., None])[..., 0].detach()

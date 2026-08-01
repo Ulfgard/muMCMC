@@ -29,13 +29,17 @@ def _systematic_resample(weights: torch.Tensor) -> torch.Tensor:
 
 
 def _rhat(x: torch.Tensor) -> torch.Tensor:
-    """Gelman-Rubin R-hat = sqrt(var_plus / W), with var_plus = (M-1)/M W + B/M,
-    across the C populations of ``x`` ``(C, M)``.
+    """Gelman-Rubin R-hat across the ``C`` populations of ``x``,
+
+        R-hat = sqrt(var_plus / W),  var_plus = (M-1)/M W + B/M,
+
+    with ``W`` the mean within-population variance and ``B`` the between-
+    population variance scaled by ``M``. A scalar.
 
     Parameters
     ----------
-    x : torch.Tensor
-        Samples, ``(C, M)`` (C populations, M draws).
+    x : Tensor, shape (C, M)
+        Draws, ``C`` populations of ``M`` each.
     """
     C, M = x.shape
     chain_mean = x.mean(dim=1)
@@ -46,41 +50,53 @@ def _rhat(x: torch.Tensor) -> torch.Tensor:
 
 
 # =========================================================================== #
-# num_chains independent populations run in parallel over the kernel's
-# batch axis, each with its own particles, resampling, and schedule.
-# Independent populations give a between-run estimate of Monte Carlo error:
-# the spread of the log-evidence estimates and R-hat across populations.
-# The likelihood potential for reweighting is read from the kernel state's
-# tempered potential (state.U.lik), grad-free, rather than recomputed. The
-# mutation kernel runs at a fixed step size, its adaptation frozen via
-# end_warmup.
+#  Why the populations are independent                                        #
+#                                                                             #
+#  num_chains populations share the kernel's batch axis but nothing else.     #
+#  Each carries its own particles, its own resampling and its own schedule.   #
+#  That independence is what turns the spread of their log-evidence           #
+#  estimates and their R-hat into an estimate of the Monte Carlo error, which #
+#  a single population cannot give.                                           #
+#                                                                             #
+#  The likelihood potential the reweighting needs is already on the kernel    #
+#  state as state.U.lik, held apart from the prior part and carrying no       #
+#  graph, so a stage reads it rather than evaluating the model again.         #
 # =========================================================================== #
 
 
 class SMC:
     """
-    Adaptive tempered Sequential Monte Carlo on top of a batched sampler.
+    Adaptive tempered Sequential Monte Carlo around a batched sampler.
 
-    Transports a particle population from the prior (beta = 0) to the posterior
-    (beta = 1) along ``prior * likelihood**beta``, each stage being reweight ->
-    systematic resample -> mutate. Per-chain ``beta_{k+1}`` is bisected so the
-    post-reweighting ESS = ``ess_target * num_particles``. Incremental weights are
-    ``exp(-dbeta * U_lik)`` and the log-evidence accumulates ``LSE(log_w) - log M``.
+    Transports a particle population from the prior at ``beta = 0`` to the
+    posterior at ``beta = 1`` along ``prior * likelihood**beta``. A stage
+    reweights, resamples systematically, and then mutates. The next
+    temperature is bisected per population so that the post-reweighting ESS is
+    ``ess_target * num_particles``, the incremental weights are
+    ``exp(-dbeta * U_lik)``, and the log-evidence accumulates
+    ``LSE(log_w) - log M``.
 
-    The wrapped ``sampler`` supplies the mutation kernel via its
-    ``init`` / ``step`` / ``beta`` interface. The likelihood potential for
-    reweighting is read from the kernel state's tempered potential (``state.U.lik``).
+    The mutation kernel is ``sampler``, driven through its ``init``, ``step``
+    and ``beta``. This class takes over that ``beta`` for the run and freezes
+    the kernel's warmup adaptation, so the kernel mutates at a fixed step size.
 
     Parameters
     ----------
     sampler : MCMCSampler
-        The mutation kernel.
+        The mutation kernel, used for every particle of every population at
+        once.
     ess_target : float
         Post-reweighting ESS as a fraction of the particle count, in (0, 1).
     num_mcmc_steps : int
-        Mutation transitions applied per temperature.
+        Mutation transitions applied at each temperature.
     min_dbeta : float
-        Smallest temperature increment.
+        Floor on the temperature increment, which keeps a stage from making no
+        progress. The last stage takes ``1 - beta`` even where that is smaller.
+
+    Raises
+    ------
+    ValueError
+        If ``ess_target`` is not in ``(0, 1)``.
     """
 
     def __init__(
@@ -117,10 +133,10 @@ class SMC:
 
         Parameters
         ----------
-        u_lik : torch.Tensor
-            Likelihood potentials, ``(C, M)``.
-        max_dbeta : torch.Tensor
-            Per-chain upper bound ``1 - beta``, ``(C,)``.
+        u_lik : Tensor, shape (C, M)
+            Likelihood potentials of the current particles.
+        max_dbeta : Tensor, shape (C,)
+            Per-population upper bound ``1 - beta``.
         max_iter : int
             Bisection iterations.
         """
@@ -151,21 +167,29 @@ class SMC:
         num_chains: int = 1,
         disable_progbar: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Transport ``num_chains`` independent populations of ``num_particles`` each
-        from the prior to the posterior (beta = 1). Returns the final populations
-        on the variables, keyed by parameter name, each ``(num_chains,
-        num_particles)``. Schedule, ESS, evidence, and R-hat are available via
-        :meth:`diagnostics`.
+        """Transport ``num_chains`` independent populations of
+        ``num_particles`` each from the prior to the posterior at ``beta = 1``.
+
+        The initial particles are drawn from the prior, so the space must carry
+        one. The kernel's ``beta`` is left at 1.0 afterwards, and its warmup
+        adaptation stays frozen.
 
         Parameters
         ----------
         num_particles : int
             Particles per population.
         num_chains : int
-            Independent populations run in parallel.
+            Independent populations, advanced together in one batch.
         disable_progbar : bool
             Suppress the progress bar.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            The final populations on the variables, keyed by name, each of
+            shape ``(num_chains, num_particles)``. The fixed names are present
+            too, each held at its value. The schedule, the ESS, the evidence
+            and R-hat are read from :meth:`diagnostics`.
         """
         sampler, space = self.sampler, self.space
         C, M, N = num_chains, num_particles, num_chains * num_particles
@@ -230,17 +254,20 @@ class SMC:
         return {k: v.reshape(C, M) for k, v in space.add_fixed(free).items()}
 
     def diagnostics(self) -> dict:
-        """Post-run schedule and population diagnostics (empty before
-        :meth:`run_smc`).
+        """Schedule and population diagnostics of the last run, empty before
+        :meth:`run_smc`.
 
-          ``betas``       per-chain temperature schedule, ``(stages+1, num_chains)``
-          ``ess``         per-stage per-chain ESS after reweighting
-          ``accept_rate`` per-stage per-chain mean mutation acceptance
-          ``log_evidence``          per-chain log marginal likelihood, ``(num_chains,)``
-          ``log_evidence_estimate`` combined estimate, log-mean of the per-chain values
-          ``log_evidence_se``       between-chain standard error of the estimate
-          ``r_hat``       per free parameter, Gelman-Rubin across populations
-                          (only for num_chains >= 2)
+          betas                  temperature schedule, (stages+1, num_chains)
+          ess                    ESS after reweighting, (stages, num_chains)
+          accept_rate            mean mutation acceptance, (stages, num_chains)
+          log_evidence           per-population log marginal likelihood,
+                                 (num_chains,)
+          log_evidence_estimate  the combined estimate, the log mean of the
+                                 per-population values
+          log_evidence_se        standard error of that estimate across
+                                 populations, zero for a single population
+          r_hat                  Gelman-Rubin across populations, per free
+                                 name, and empty below two populations
         """
         if self._log_evidence is None:
             return {}

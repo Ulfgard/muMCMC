@@ -25,10 +25,26 @@ def _as_parameter(value, free_names, name, dtype, device):
 class NormalSpace(Space):
     """Independent normal priors, chart ``theta = mu + sigma z``.
 
+    The chart is affine, so the metric it induces is the constant diagonal
+    ``sigma⁻²``.
+
     Parameters
     ----------
+    names, fixed
+        As for :class:`Space`.
     mu, sigma : float, dict[str, float] or Tensor
-        Location and scale per free variable, ``sigma`` positive.
+        Location and scale per free variable, ``sigma`` positive. A scalar is
+        shared across the free variables, a dict is read by free name and a
+        tensor is read in :attr:`Space.free_names` order.
+    dtype, device
+        Dtype and device the chart and its draws are built in. None takes the
+        torch defaults.
+
+    Raises
+    ------
+    ValueError
+        If ``mu`` or ``sigma`` is a dict missing a free name, or a tensor that
+        is not of shape ``(d,)``.
     """
 
     def __init__(self, names, mu=0.0, sigma=1.0, *, fixed=None,
@@ -50,15 +66,23 @@ class NormalSpace(Space):
 class UnnormalizedSpace(Space):
     """No prior, so the chart is the identity and ``z`` is ``theta``.
 
-    The target is whatever the model potential defines, with nothing added.
-    Having no normalized density, it has no evidence and no entropy, and
-    :meth:`prior_metric` is None so a scheme needing the prior's metric is not
-    available.
+    The target is the model potential alone, with no prior term added, and it
+    need not be normalizable. This departs from :class:`Space` in three places.
+    :meth:`prior_log_prob_vector` is zero, :meth:`prior_metric` returns None, so
+    a metric-based sampler contributes only the model's own metric, and
+    :meth:`prior_log_prob` and :meth:`sample` raise.
+
+    Parameters
+    ----------
+    names, fixed
+        As for :class:`Space`.
+    dtype, device
+        Dtype and device the chart is built in. None takes the torch defaults.
 
     Raises
     ------
     ValueError
-        From :meth:`prior_log_prob` and :meth:`sample`, which have no meaning
+        From :meth:`prior_log_prob` and :meth:`sample`, which are not defined
         without a prior.
     """
 
@@ -80,10 +104,13 @@ class UnnormalizedSpace(Space):
             "defined. Use a space with a prior if you need one.")
 
     def prior_log_prob_vector(self, theta_free: torch.Tensor) -> torch.Tensor:
+        """Zero of shape ``(...)`` for ``theta_free`` of shape ``(..., d)``, so
+        the potential is the model's alone."""
         return torch.zeros(theta_free.shape[:-1], dtype=theta_free.dtype,
                            device=theta_free.device)
 
     def prior_metric(self, theta_free: torch.Tensor):
+        """None, there being no prior to induce a metric."""
         return None
 
     def sample(self, n_samples: int, *, generator=None) -> dict:

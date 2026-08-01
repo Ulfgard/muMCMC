@@ -57,16 +57,15 @@ from .mixture import GaussianMixture
 def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> float:
     """Solve ``Σ_pooled σ(W + b) = n1`` for ``b`` and return ``log(n1/n0) − b``.
 
-    Pure core over arrays, directly testable.  ``g(b) = n1 − Σ σ(W + b)`` is
-    strictly decreasing in ``b``.  Since ``σ`` is monotone, the pooled sum is
-    squeezed by its extreme samples, ``N σ(W_min + b) ≤ Σ σ ≤ N σ(W_max + b)``
-    with ``N = n1 + n0``, which pins the root in closed form:
+    ``g(b) = n1 − Σ σ(W + b)`` is strictly decreasing in ``b``. Since ``σ`` is
+    monotone, the pooled sum is bounded by its extreme samples,
+    ``N σ(W_min + b) ≤ Σ σ ≤ N σ(W_max + b)`` with ``N = n1 + n0``, which
+    brackets the root in closed form:
 
         b* ∈ [ log(n1/n0) − W_max ,  log(n1/n0) − W_min ]
 
     (equivalently ``log p(x) ∈ [W_min, W_max]``). A small ``pad`` makes the sign
-    change strict and absorbs the degenerate case where every ``W`` is equal. The
-    root is then refined by ``scipy.optimize.brentq``.
+    change strict and covers the degenerate case where every ``W`` is equal.
 
     Parameters
     ----------
@@ -74,6 +73,8 @@ def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> f
         Log-ratio ``W = log f − log q̂`` on the posterior draws.
     W_q : Tensor, shape (n0,)
         The same log-ratio on the ``q̂`` draws.
+    pad : float
+        Widening of the closed-form bracket at each end.
 
     Returns
     -------
@@ -183,9 +184,9 @@ class PosteriorEvaluation:
         Diagonal loading added to the fitted covariances for a stable Cholesky.
     max_iter, tol : int, float
         EM iteration cap and relative log-likelihood stopping tolerance for the
-        ``q̂`` fit. Lower ``max_iter`` or looser ``tol`` bound the fit cost, which
-        matters when ``n_components > 1`` on a non-Gaussian cloud, where EM would
-        otherwise crawl toward the cap. Ignored for ``n_components == 1``.
+        ``q̂`` fit. A lower ``max_iter`` or a looser ``tol`` bounds the fit cost,
+        which matters when ``n_components > 1`` on a non-Gaussian cloud, where
+        EM would otherwise run to the cap. Unused for ``n_components == 1``.
     jackknife : bool
         Report the delete-one-chain jackknife estimate instead of the raw pooled
         one. :attr:`log_evidence` (and everything derived from it) then returns
@@ -196,7 +197,12 @@ class PosteriorEvaluation:
         with ``n_components``. Needs at least two chains and costs a BAR refit per
         chain. Off by default.
     generator : torch.Generator, optional
-        RNG for the ``q̂`` fit and draws, for reproducibility.
+        RNG for the ``q̂`` fit and draws, the global RNG when omitted.
+
+    Raises
+    ------
+    ValueError
+        If ``jackknife`` is set and ``samples`` holds fewer than two chains.
     """
 
     def __init__(
@@ -269,9 +275,11 @@ class PosteriorEvaluation:
 
     @cached_property
     def entropy(self) -> float:
-        """Posterior entropy ``H[p(theta|x)] = logZ − E_post[loglik] −
-        E_post[log_prior]``, a plain Monte Carlo average over the draws (w.r.t.
-        ``dtheta``)."""
+        """Posterior entropy
+
+            H[p(theta|x)] = logZ − E_post[loglik] − E_post[log_prior],
+
+        as a Monte Carlo average over the draws, with respect to ``dtheta``."""
         theta = self._theta.reshape(self._n1, self._d)
         loglik = self._tempered_loglik(theta)
         log_prior = self.space.prior_log_prob_vector(theta)
@@ -289,6 +297,9 @@ class PosteriorEvaluation:
         giving the marginal information gain
         ``log ∫ p(x|theta*_a, theta_b) p(theta_b) dtheta_b − logZ`` by the same
         importance sampler as :meth:`log_posterior`.
+
+        The keyword arguments are :meth:`log_posterior`'s, with the same
+        meaning and the same raises, and are read only when a subset is given.
         """
         excluded = [name for name in self.space.free_names
                     if name not in theta_star]
@@ -307,7 +318,7 @@ class PosteriorEvaluation:
                       generator: Optional[torch.Generator] = None,
                       return_ess: bool = False):
         """``log p(theta|x)`` at points ``theta`` on the variables, a density
-        w.r.t. ``dtheta``.
+        with respect to ``dtheta``.
 
         The free names present in ``theta`` select the marginal. All names gives
         the exact full density ``loglik(theta) + log_prior(theta) − logZ``. A
@@ -333,8 +344,14 @@ class PosteriorEvaluation:
         generator : torch.Generator, optional
             RNG for the marginal draws.
         return_ess : bool
-            If True, also return the per-query-point weight ESS (``None`` for the
-            exact full density).
+            If True, also return the per-query-point weight ESS, which is None
+            for the exact full density.
+
+        Raises
+        ------
+        ValueError
+            If ``prior_weight`` is outside ``[0, 1]``, or if ``theta`` holds
+            none of the free names.
         """
         excluded = [name for name in self.space.free_names if name not in theta]
         if not excluded:
@@ -515,9 +532,9 @@ class PosteriorEvaluation:
         independent per-chain estimate, shape ``(K,)``), and the SE is the spread
         of those replicates over ``sqrt(K)``. Under ``jackknife`` it instead
         carries ``log_evidence_pooled`` (the raw, uncorrected estimate),
-        ``log_evidence_bias`` (the size of the correction, a mixing-quality
-        alarm), and ``jackknife_estimates`` (the delete-one estimates), and the
-        SE is the jackknife standard error.
+        ``log_evidence_bias`` (the size of the correction, which grows with
+        autocorrelation), and ``jackknife_estimates`` (the delete-one
+        estimates), and the SE is the jackknife standard error.
         """
         theta_flat = self._theta.reshape(self._n1, self._d)
         Wp = (self._log_f_post - self._q_pool.log_prob(theta_flat)).double()

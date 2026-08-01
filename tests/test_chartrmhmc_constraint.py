@@ -1,4 +1,4 @@
-"""Constraint / evaluate_model tests for ChartRATTLE.
+"""Constraint / evaluate_model tests for ChartRMHMC.
 
 The geometry and potential rest on the inverse map ψ(q) = φ_q⁻¹(x). evaluate_model
 turns a constraint into the tempered pieces (U a TemperedAffine, G_M a
@@ -11,7 +11,7 @@ TemperedMetric). Here we check, against closed forms, that:
    affine Gaussian, and the β-tempered funnel.
 3b. The prior comes off the space: absent means flat, a supplied one enters U
    and ∇V, and neither touches the metric.
-4. U.lik = ½‖ψ‖² is the temperature-free swap statistic.
+4. U.lik = −log p(x | q) is the temperature-free swap statistic.
 5. The returned pieces are detached (no autograd graph pinned).
 """
 import math
@@ -19,7 +19,7 @@ import math
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import ChartRATTLE, ChartConstraint, LocationScaleChart
+from muMCMC.ChartRMHMC import ChartRMHMC, ChartConstraint, LocationScaleChart
 from muMCMC.spaces import NormalSpace, UnnormalizedSpace
 
 torch.set_default_dtype(torch.float64)
@@ -77,7 +77,7 @@ def _eval(constraint, eta, beta=1.0, grad=True):
     """evaluate_model through a minimal sampler at the given temperature."""
     n = eta.shape[-1]
     names = [f"v{i}" for i in range(n)]
-    s = ChartRATTLE(constraint, NormalSpace(names),
+    s = ChartRMHMC(constraint, NormalSpace(names),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -185,20 +185,29 @@ def test_potential_is_the_exact_affine_gaussian():
                           neg_log_gauss - neg_log_gauss.mean(), atol=1e-9)
 
 
-def test_beta_tempers_the_data_fit_only():
-    # U.value = base + β·½‖ψ‖²: the Mahalanobis is scaled by β, the base (prior +
-    # log|det B|) is not, matching the β-tempered funnel posterior.
+def test_beta_tempers_the_whole_conditional():
+    # U.value = −log p(q) + β·(−log p(x | q)). β scales the conditional entire,
+    # volume term and normalizer included, so β = 0 leaves the prior alone.
     fun, _, x = _funnel_pair(sigma=3.0, m=6, seed=2)
     eta = torch.randn(30, 1)
     U, _, _, _ = _eval(fun, eta, beta=0.4, grad=False)
     e = eta[:, 0]
-    # Both densities are normalized, so the untempered part carries the prior's
-    # ½ log 2π over one coordinate and the likelihood's over m.
-    neg_log_post = 0.5 * e * e + 0.5 * math.log(2 * math.pi) \
-        + 0.5 * x.shape[-1] * math.log(2 * math.pi) \
-        + 0.5 * x.shape[-1] * fun.s * e \
-        + 0.4 * 0.5 * torch.exp(-fun.s * e) * (x * x).sum()
-    assert torch.allclose(U.value, neg_log_post, atol=1e-9)
+    neg_log_prior = 0.5 * e * e + 0.5 * math.log(2 * math.pi)
+    neg_log_cond = (0.5 * x.shape[-1] * math.log(2 * math.pi)
+                    + 0.5 * x.shape[-1] * fun.s * e
+                    + 0.5 * torch.exp(-fun.s * e) * (x * x).sum())
+    assert torch.allclose(U.value, neg_log_prior + 0.4 * neg_log_cond, atol=1e-9)
+
+
+def test_beta_zero_is_the_prior():
+    # The reason the volume term sits in lik: at β = 0 what is left has to be
+    # the prior, not the prior reweighted by 1/|det B|.
+    fun, _, _ = _funnel_pair(sigma=3.0, m=6, seed=2)
+    eta = torch.randn(12, 1)
+    U, _, _, _ = _eval(fun, eta, beta=0.0, grad=False)
+    e = eta[:, 0]
+    assert torch.allclose(U.value, 0.5 * e * e + 0.5 * math.log(2 * math.pi),
+                          atol=1e-10)
 
 
 # ========================================================================== #
@@ -209,7 +218,7 @@ def _prior_eval(constraint, eta, mu, sigma, beta=1.0, grad=True):
     """evaluate_model through a sampler whose space has a Normal(mu, sigma)
     prior, so the chart is theta = mu + sigma q."""
     names = [f"v{i}" for i in range(eta.shape[-1])]
-    s = ChartRATTLE(constraint, NormalSpace(names, mu=mu, sigma=sigma),
+    s = ChartRMHMC(constraint, NormalSpace(names, mu=mu, sigma=sigma),
                     step_size=0.1, adapt_step_size=False)
     s.beta = beta
     return s.evaluate_model(eta, grad=grad)
@@ -217,27 +226,25 @@ def _prior_eval(constraint, eta, mu, sigma, beta=1.0, grad=True):
 
 def _base_of(constraint, eta, mu=0.0, sigma=1.0):
     """U.base at ``eta`` for a space with a Normal(mu, sigma) prior."""
-    s = ChartRATTLE(constraint, NormalSpace(["v0"], mu=mu, sigma=sigma),
+    s = ChartRMHMC(constraint, NormalSpace(["v0"], mu=mu, sigma=sigma),
                     step_size=0.1, adapt_step_size=False)
     return s.evaluate_model(eta, grad=False)[0].base
 
 
 def test_a_space_without_a_prior_is_rejected():
-    # ChartRATTLE reads M off the chart, and a space with no prior has none.
+    # ChartRMHMC reads M off the chart, and a space with no prior has none.
     c, _, _ = _funnel_pair()
     with pytest.raises(ValueError, match="prior"):
-        ChartRATTLE(c, UnnormalizedSpace(["v0"]), step_size=0.1,
+        ChartRMHMC(c, UnnormalizedSpace(["v0"]), step_size=0.1,
                     adapt_step_size=False)
 
 
 def test_standard_normal_prior_is_the_non_centered_latent():
-    # The chart of Normal(0, 1) is the identity, so U.base is 1/2||q||^2 plus
-    # the volume term and the two normalizers.
+    # The chart of Normal(0, 1) is the identity, so U.base is the standard
+    # normal potential and nothing else. Everything conditional sits in lik.
     c, _, x = _funnel_pair()
     eta = torch.randn(7, 1)
-    expected = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
-                + 0.5 * x.shape[-1] * math.log(2 * math.pi)
-                + c.log_abs_det_B(eta))
+    expected = 0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
     assert torch.allclose(_base_of(c, eta), expected, atol=1e-12)
 
 
@@ -252,9 +259,7 @@ def test_space_prior_enters_U_as_its_chart():
 
     U_pri = _prior_eval(c, eta, mu0, s0)[0]
 
-    expected_base = (0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
-                     + 0.5 * x.shape[-1] * math.log(2 * math.pi)
-                     + c.log_abs_det_B(theta))
+    expected_base = 0.5 * (eta * eta).sum(-1) + 0.5 * math.log(2 * math.pi)
     assert torch.allclose(U_pri.base, expected_base, atol=1e-10)
     assert torch.allclose(U_pri.lik, _eval(c, theta)[0].lik, atol=1e-10)
 
@@ -310,12 +315,15 @@ def test_space_prior_is_untempered():
 #  4. U.lik: temperature-free swap statistic                                #
 # ========================================================================== #
 
-def test_u_lik_is_half_psi_squared_and_temperature_free():
-    fun, _, _ = _funnel_pair(sigma=3.0, m=5, seed=6)
+def test_u_lik_is_the_conditional_potential_and_temperature_free():
+    fun, _, x = _funnel_pair(sigma=3.0, m=5, seed=6)
     eta = torch.randn(8, 1)
     U1, _, psi, _ = _eval(fun, eta, beta=1.0, grad=False)
     Ub, _, _, _ = _eval(fun, eta, beta=0.2, grad=False)
-    assert torch.allclose(U1.lik, 0.5 * (psi ** 2).sum(-1), atol=1e-10)
+    expected = (0.5 * (psi ** 2).sum(-1)
+                + 0.5 * x.shape[-1] * math.log(2 * math.pi)
+                + fun.log_abs_det_B(eta))
+    assert torch.allclose(U1.lik, expected, atol=1e-10)
     assert torch.allclose(U1.lik, Ub.lik, atol=1e-10)     # β-free
 
 
