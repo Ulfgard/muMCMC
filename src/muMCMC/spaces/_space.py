@@ -1,7 +1,5 @@
 import torch
 
-from ._transform import NormalTransform
-
 
 # =========================================================================== #
 #  The two identities of the normal chart                                     #
@@ -73,8 +71,8 @@ class Space:
         return self._free_names
 
     @property
-    def as_transform(self) -> NormalTransform:
-        """The map ``theta = T(z)`` over the free variables."""
+    def as_transform(self):
+        """The chart ``theta = T(z)`` over the free variables."""
         raise NotImplementedError
 
     # ---- vector layouts ---------------------------------------------------- #
@@ -212,15 +210,13 @@ class Space:
         return self.as_transform.log_prob(theta_free).sum(-1)
 
     def prior_metric(self, theta_free: torch.Tensor):
-        """The prior's natural metric at ``theta_free``, the diagonal
-        ``(..., d, d)`` matrix
-
-            M_ii = (dz_i/dtheta_i)²,
+        """The prior's natural metric ``M = J⁻ᵀ J⁻¹`` at ``theta_free``, shape
+        ``(..., d, d)``, with ``J = dtheta/dz``.
 
         It is the pullback of the identity along the chart, so it is the metric
         the prior itself induces on the variables, and it varies with position.
         """
-        return torch.diag_embed(self.as_transform.metric(theta_free))
+        return self.as_transform.inverse(theta_free).gram()
 
     def free_block(self, G: torch.Tensor) -> torch.Tensor:
         """The free block of a metric ``G`` of shape ``(..., d_full, d_full)``

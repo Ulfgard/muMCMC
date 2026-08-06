@@ -13,63 +13,88 @@ import math
 import torch
 import pytest
 
-from muMCMC.ChartRATTLE import (ChartRATTLE, ChartRATTLEState, ChartConstraint,
-                                LocationScaleChart)
-from muMCMC.spaces import NormalSpace
+from muMCMC.ChartRATTLE import ChartRATTLE, ChartRATTLEState
+from muMCMC.spaces import ConditionalLayer, LocationScaleLayer, NormalSpace
 from muMCMC.PT import PT
 from muMCMC.validation import PosteriorEvaluation
 
 torch.set_default_dtype(torch.float64)
 
 
-class FunnelChart(ChartConstraint):
-    def __init__(self, sigma, x):
-        super().__init__(x)
+class FunnelLayer(ConditionalLayer):
+    """Neal funnel x = e^{{σ θ / 2}} ε. phi(eps) = e^{{σ θ / 2}} eps, so the latent
+    Jacobian is e^{{σ θ / 2}} I and W = (σ/2) ψ, both in closed form."""
+
+    jvp_needs_grad = False
+
+    def __init__(self, sigma, m):
         self.s = sigma
+        self.m = m
 
-    def psi(self, eta):
-        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+    def _log_scale(self, theta):
+        return (self.s * theta[:, 0] / 2)[:, None].expand(-1, self.m)
 
-    def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
+    def forward(self, theta, eps):
+        return torch.exp(self._log_scale(theta)) * eps
 
-    def psi_with_jvp(self, eta):
-        eps = self.psi(eta)
-        return eps, (self.s / 2.0) * eps.unsqueeze(-1), self.log_abs_det_B(eta)
+    def inverse(self, theta, y):
+        return torch.exp(-self._log_scale(theta)) * y
+
+    def forward_with_jvp(self, theta, eps):
+        log_diag = self._log_scale(theta)
+        y = torch.exp(log_diag) * eps
+        return y, (self.s / 2.0) * y.unsqueeze(-1), torch.diag_embed(torch.exp(log_diag))
+
+    def inverse_with_jvp(self, theta, y):
+        log_diag = self._log_scale(theta)
+        eps = torch.exp(-log_diag) * y
+        return (eps, (self.s / 2.0) * eps.unsqueeze(-1),
+                torch.diag_embed(torch.exp(-log_diag)))
 
 
-class AffineChart(ChartConstraint):
-    def __init__(self, A, B, c, x):
-        super().__init__(x)
-        Binv = torch.linalg.inv(B)
-        self.W_const = Binv @ A
-        self.d = Binv @ (x - c)
-        self.ldB = torch.linalg.slogdet(B).logabsdet
+class AffineLayer(ConditionalLayer):
+    """phi_theta(eps) = c + A theta + B eps with B lower triangular, so
+    ψ(theta) = B⁻¹(x − c) − (B⁻¹A) theta. W = B⁻¹A and the latent Jacobians are
+    constant, and the induced posterior is exactly Gaussian."""
 
-    def psi(self, eta):
-        return self.d - eta @ self.W_const.transpose(-2, -1)
+    jvp_needs_grad = False
 
-    def log_abs_det_B(self, eta):
-        return self.ldB.expand(eta.shape[0])
+    def __init__(self, A, B, c):
+        self.A, self.B, self.c = A, B, c
+        self.Binv = torch.linalg.inv(B)
+        self.W_const = self.Binv @ A
 
-    def psi_with_jvp(self, eta):
-        N = eta.shape[0]
-        return self.psi(eta), self.W_const.expand(N, *self.W_const.shape), self.log_abs_det_B(eta)
+    def forward(self, theta, eps):
+        return self.c + theta @ self.A.mT + eps @ self.B.mT
 
-    def posterior(self):
+    def inverse(self, theta, y):
+        return (y - self.c) @ self.Binv.mT - theta @ self.W_const.mT
+
+    def forward_with_jvp(self, theta, eps):
+        N = theta.shape[0]
+        return (self.forward(theta, eps), self.A.expand(N, *self.A.shape),
+                self.B.expand(N, *self.B.shape))
+
+    def inverse_with_jvp(self, theta, y):
+        N = theta.shape[0]
+        return (self.inverse(theta, y),
+                self.W_const.expand(N, *self.W_const.shape),
+                self.Binv.expand(N, *self.Binv.shape))
+
+    def posterior(self, x):
+        """Mean and covariance of p(theta | x) for this layer at ``x``."""
+        d = self.Binv @ (x - self.c)
         n = self.W_const.shape[-1]
-        G = torch.eye(n) + self.W_const.transpose(-2, -1) @ self.W_const
+        G = torch.eye(n) + self.W_const.mT @ self.W_const
         Sigma = torch.linalg.inv(G)
-        mu = Sigma @ (self.W_const.transpose(-2, -1) @ self.d)
-        return mu, Sigma
-
+        return Sigma @ (self.W_const.mT @ d), Sigma
 
 def _funnel_sampler(sigma=2.0, m=4, seed=0, **kw):
     torch.manual_seed(seed)
-    c = FunnelChart(sigma, torch.randn(m))
+    c, x = FunnelLayer(sigma, m), torch.randn(m)
     kw.setdefault("adapt_step_size", False)
     kw.setdefault("step_size", 0.1)
-    return ChartRATTLE(c, NormalSpace(["v"]), **kw)
+    return ChartRATTLE(c, x, NormalSpace(["v"]), **kw)
 
 
 def _endpoint_state(sampler, eta):
@@ -107,8 +132,8 @@ def test_sample_momentum_covariance_is_the_chart_metric():
     A = torch.randn(4, 2)
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    c, x = AffineLayer(A, B, torch.zeros(4)), torch.randn(4)
+    s = ChartRATTLE(c, x, NormalSpace(["a", "b"]),
                     step_size=0.1, adapt_step_size=False)
     N = 40000
     state = s.sample_momentum(s.init(torch.zeros(N, 2)))
@@ -211,10 +236,10 @@ def test_recovers_affine_gaussian_posterior():
     A = torch.randn(5, 2)
     B = torch.eye(5) + 0.2 * torch.randn(5, 5)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
-    mu, Sigma = c.posterior()
+    c, x = AffineLayer(A, B, torch.zeros(5)), torch.randn(5)
+    mu, Sigma = c.posterior(x)
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    s = ChartRATTLE(c, x, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -233,7 +258,7 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     A = torch.randn(5, 2)
     B = torch.eye(5) + 0.2 * torch.randn(5, 5)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
+    c, x = AffineLayer(A, B, torch.zeros(5)), torch.randn(5)
 
     m0 = torch.tensor([0.8, -0.5])
     s0 = torch.tensor([1.5, 0.6])
@@ -242,13 +267,14 @@ def test_recovers_affine_gaussian_posterior_under_a_space_prior():
     S0_inv = torch.diag(1.0 / s0 ** 2)
     Lam = S0_inv + W.transpose(-2, -1) @ W
     Sigma = torch.linalg.inv(Lam)
-    mu = Sigma @ (S0_inv @ m0 + W.transpose(-2, -1) @ c.d)
+    d = c.inverse(torch.zeros(1, 2), x[None])[0]
+    mu = Sigma @ (S0_inv @ m0 + W.transpose(-2, -1) @ d)
 
     # The prior really does move the target, so the test has teeth.
-    mu_flat, _ = c.posterior()
+    mu_flat, _ = c.posterior(x)
     assert float((mu - mu_flat).abs().max()) > 0.1
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"], mu=m0, sigma=s0),
+    s = ChartRATTLE(c, x, NormalSpace(["a", "b"], mu=m0, sigma=s0),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="anderson", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -266,12 +292,12 @@ def test_metric_is_the_identity_plus_the_gram():
     A = torch.randn(4, 2)
     B = torch.eye(4) + 0.2 * torch.randn(4, 4)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(4), torch.randn(4))
+    c, x = AffineLayer(A, B, torch.zeros(4)), torch.randn(4)
     names = ["a", "b"]
 
     eta = torch.randn(6, 2)
     for sigma in (1.0, 2.5):
-        s = ChartRATTLE(c, NormalSpace(names, sigma=sigma), step_size=0.2,
+        s = ChartRATTLE(c, x, NormalSpace(names, sigma=sigma), step_size=0.2,
                         adapt_step_size=False)
         _, metric, _, W = s.evaluate_model(eta, grad=False)
         gram = W.transpose(-2, -1) @ W
@@ -288,14 +314,14 @@ def test_a_wide_prior_mixes_across_its_own_width():
     A = 1e-3 * torch.randn(m, n)                       # weak coupling q -> x
     B = torch.eye(m) + 0.2 * torch.randn(m, m)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
+    c, x = AffineLayer(A, B, torch.zeros(m)), torch.randn(m)
     names = ["a", "b"]
 
     W = c.W_const
     sd_exact = torch.linalg.inv(
         torch.eye(n) / S + W.transpose(-2, -1) @ W).diagonal().sqrt()
 
-    s = ChartRATTLE(c, NormalSpace(names, sigma=math.sqrt(S)), step_size=0.15,
+    s = ChartRATTLE(c, x, NormalSpace(names, sigma=math.sqrt(S)), step_size=0.15,
                     num_steps=10, adapt_step_size=False, solver="anderson",
                     fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
@@ -312,10 +338,10 @@ def test_newton_recovers_the_affine_gaussian_posterior():
     A = torch.randn(5, 2)
     B = torch.eye(5) + 0.2 * torch.randn(5, 5)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(5), torch.randn(5))
-    mu, Sigma = c.posterior()
+    c, x = AffineLayer(A, B, torch.zeros(5)), torch.randn(5)
+    mu, Sigma = c.posterior(x)
 
-    s = ChartRATTLE(c, NormalSpace(["a", "b"]),
+    s = ChartRATTLE(c, x, NormalSpace(["a", "b"]),
                     step_size=0.4, num_steps=12, adapt_step_size=False,
                     solver="newton", fp_tol=1e-10)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=500, num_warmup_steps=200,
@@ -332,7 +358,7 @@ def test_recovers_funnel_posterior_against_quadrature():
     torch.manual_seed(7)
     eta_true = torch.randn(1)
     xobs = torch.exp(sigma * eta_true / 2) * torch.randn(m)
-    c = FunnelChart(sigma, xobs)
+    c, x = FunnelLayer(sigma, xobs.shape[-1]), xobs
 
     grid = torch.linspace(-8, 8, 8001)
     log_post = -(0.5 * grid * grid + 0.5 * torch.exp(-sigma * grid) * (xobs * xobs).sum()
@@ -341,7 +367,7 @@ def test_recovers_funnel_posterior_against_quadrature():
     mean_q = (w * grid).sum()
     sd_q = (w * (grid - mean_q) ** 2).sum().sqrt()
 
-    s = ChartRATTLE(c, NormalSpace(["v"]),
+    s = ChartRATTLE(c, x, NormalSpace(["v"]),
                     step_size=0.08, num_steps=16,
                     adapt_step_size=False, solver="anderson", fp_tol=1e-9)
     out = s.run_mcmc({n: torch.tensor(0.0) for n in s.space.free_names}, num_samples=400, num_warmup_steps=200,
@@ -370,7 +396,7 @@ def test_pt_runs_swaps_and_recovers_target_mean():
                  + 0.5 * m * sigma * grid)
     mean_q = float((torch.softmax(log_post, 0) * grid).sum())
 
-    kernel = ChartRATTLE(FunnelChart(sigma, xobs),
+    kernel = ChartRATTLE(FunnelLayer(sigma, xobs.shape[-1]), xobs,
                          NormalSpace(["v"]),
                          step_size=0.06, num_steps=12, adapt_step_size=False,
                          solver="anderson", fp_tol=1e-9)
@@ -391,17 +417,16 @@ def test_pt_runs_swaps_and_recovers_target_mean():
 # ========================================================================== #
 
 def _scale_model(m, seed=0, mu=0.7, sigma=1.6):
-    """x | theta ~ N(0, e^theta I_m) as a LocationScaleChart, with the closed
+    """x | theta ~ N(0, e^theta I_m) as a LocationScaleLayer, with the closed
     form of its log-likelihood. The space is Normal(mu, sigma), so the chart
     theta = mu + sigma z is not the identity and the pull-back has work to do."""
     torch.manual_seed(seed)
     x = torch.randn(m)
-    chart = LocationScaleChart(
+    chart = LocationScaleLayer.from_covariance(
         lambda th: torch.zeros(th.shape[0], m, dtype=th.dtype),
-        lambda th: torch.exp(th[:, 0])[:, None, None] * torch.eye(m, dtype=th.dtype),
-        x)
+        lambda th: torch.exp(th[:, 0])[:, None, None] * torch.eye(m, dtype=th.dtype))
     space = NormalSpace(["v"], mu=mu, sigma=sigma)
-    sampler = ChartRATTLE(chart, space, step_size=0.25, num_steps=8,
+    sampler = ChartRATTLE(chart, x, space, step_size=0.25, num_steps=8,
                           adapt_step_size=False, solver="anderson")
 
     def log_lik(theta):                                   # (N, 1) -> (N,)

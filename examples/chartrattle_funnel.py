@@ -8,15 +8,15 @@ Generative model, the hierarchical form ChartRATTLE targets:
 We observe one x and want p(η | x). ChartRATTLE samples the joint (η, ε) on the
 manifold {φ_η(ε) = x} and reports η, the variable θ, off that chain. The
 funnel is a conditionally-Gaussian layer μ(η) = 0, Σ(η) = e^{σ η} I, so it is a
-plain LocationScaleChart: the user supplies μ and Σ, nothing else.
+plain LocationScaleLayer: the user supplies μ and Σ, nothing else.
 
 η is scalar, so the exact posterior is available by 1-D quadrature and we check
 the chain against it. Run:  python examples/chartrattle_funnel.py
 """
 import torch
 
-from muMCMC.ChartRATTLE import ChartRATTLE, LocationScaleChart
-from muMCMC.spaces import NormalSpace
+from muMCMC.ChartRATTLE import ChartRATTLE
+from muMCMC.spaces import LocationScaleLayer, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
@@ -32,7 +32,7 @@ def main():
     # The model as the user writes it: batched μ(η) and Σ(η).
     mean = lambda eta: torch.zeros(eta.shape[0], m, dtype=eta.dtype)
     cov = lambda eta: torch.exp(sigma * eta[:, 0])[:, None, None] * torch.eye(m, dtype=eta.dtype)
-    constraint = LocationScaleChart(mean, cov, x)
+    layer = LocationScaleLayer.from_covariance(mean, cov)
 
     # Exact 1-D posterior by quadrature (η scalar), for reference.
     grid = torch.linspace(-8, 8, 8001)
@@ -45,7 +45,7 @@ def main():
     # Fixed step (adaptation is out of scope here). Anderson solves the n = 1
     # position equation in a few iterations per substep.
     sampler = ChartRATTLE(
-        constraint,
+        layer, x,
         # eta ~ N(0, 1) is the model's own prior, so the space carries it. The
         # chain runs in its normal chart, which is where M = I comes from.
         NormalSpace(["log_scale"], mu=0.0, sigma=1.0),

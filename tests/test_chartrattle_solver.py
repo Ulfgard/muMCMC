@@ -19,53 +19,86 @@ import torch
 import pytest
 
 from muMCMC.ChartRATTLE import (
-    ChartRATTLE, ChartRATTLEState, ChartConstraint, LocationScaleChart)
+    ChartRATTLE, ChartRATTLEState)
 from muMCMC.RMHMC import _hamiltonian
-from muMCMC.spaces import NormalSpace
+from muMCMC.spaces import ConditionalLayer, LocationScaleLayer, NormalSpace
 
 torch.set_default_dtype(torch.float64)
 
 
-class FunnelChart(ChartConstraint):
-    def __init__(self, sigma, x):
-        super().__init__(x)
+class FunnelLayer(ConditionalLayer):
+    """Neal funnel x = e^{{σ θ / 2}} ε. phi(eps) = e^{{σ θ / 2}} eps, so the latent
+    Jacobian is e^{{σ θ / 2}} I and W = (σ/2) ψ, both in closed form."""
+
+    jvp_needs_grad = False
+
+    def __init__(self, sigma, m):
         self.s = sigma
+        self.m = m
 
-    def psi(self, eta):
-        return torch.exp(-self.s * eta[:, 0] / 2)[:, None] * self.x
+    def _log_scale(self, theta):
+        return (self.s * theta[:, 0] / 2)[:, None].expand(-1, self.m)
 
-    def log_abs_det_B(self, eta):
-        return 0.5 * self.x.shape[-1] * self.s * eta[:, 0]
+    def forward(self, theta, eps):
+        return torch.exp(self._log_scale(theta)) * eps
 
-    def psi_with_jvp(self, eta):
-        eps = self.psi(eta)
-        return eps, (self.s / 2.0) * eps.unsqueeze(-1), self.log_abs_det_B(eta)
+    def inverse(self, theta, y):
+        return torch.exp(-self._log_scale(theta)) * y
+
+    def forward_with_jvp(self, theta, eps):
+        log_diag = self._log_scale(theta)
+        y = torch.exp(log_diag) * eps
+        return y, (self.s / 2.0) * y.unsqueeze(-1), torch.diag_embed(torch.exp(log_diag))
+
+    def inverse_with_jvp(self, theta, y):
+        log_diag = self._log_scale(theta)
+        eps = torch.exp(-log_diag) * y
+        return (eps, (self.s / 2.0) * eps.unsqueeze(-1),
+                torch.diag_embed(torch.exp(-log_diag)))
 
 
-class AffineChart(ChartConstraint):
-    def __init__(self, A, B, c, x):
-        super().__init__(x)
-        Binv = torch.linalg.inv(B)
-        self.W_const = Binv @ A
-        self.d = Binv @ (x - c)
-        self.ldB = torch.linalg.slogdet(B).logabsdet
+class AffineLayer(ConditionalLayer):
+    """phi_theta(eps) = c + A theta + B eps with B lower triangular, so
+    ψ(theta) = B⁻¹(x − c) − (B⁻¹A) theta. W = B⁻¹A and the latent Jacobians are
+    constant, and the induced posterior is exactly Gaussian."""
 
-    def psi(self, eta):
-        return self.d - eta @ self.W_const.transpose(-2, -1)
+    jvp_needs_grad = False
 
-    def log_abs_det_B(self, eta):
-        return self.ldB.expand(eta.shape[0])
+    def __init__(self, A, B, c):
+        self.A, self.B, self.c = A, B, c
+        self.Binv = torch.linalg.inv(B)
+        self.W_const = self.Binv @ A
 
-    def psi_with_jvp(self, eta):
-        N = eta.shape[0]
-        return self.psi(eta), self.W_const.expand(N, *self.W_const.shape), self.log_abs_det_B(eta)
+    def forward(self, theta, eps):
+        return self.c + theta @ self.A.mT + eps @ self.B.mT
 
+    def inverse(self, theta, y):
+        return (y - self.c) @ self.Binv.mT - theta @ self.W_const.mT
+
+    def forward_with_jvp(self, theta, eps):
+        N = theta.shape[0]
+        return (self.forward(theta, eps), self.A.expand(N, *self.A.shape),
+                self.B.expand(N, *self.B.shape))
+
+    def inverse_with_jvp(self, theta, y):
+        N = theta.shape[0]
+        return (self.inverse(theta, y),
+                self.W_const.expand(N, *self.W_const.shape),
+                self.Binv.expand(N, *self.Binv.shape))
+
+    def posterior(self, x):
+        """Mean and covariance of p(theta | x) for this layer at ``x``."""
+        d = self.Binv @ (x - self.c)
+        n = self.W_const.shape[-1]
+        G = torch.eye(n) + self.W_const.mT @ self.W_const
+        Sigma = torch.linalg.inv(G)
+        return Sigma @ (self.W_const.mT @ d), Sigma
 
 def _funnel_sampler(sigma=2.0, m=4, seed=0, prior_sd=None, **kw):
     torch.manual_seed(seed)
-    c = FunnelChart(sigma, torch.randn(m))
+    c, x = FunnelLayer(sigma, m), torch.randn(m)
     space = NormalSpace(["v"], sigma=prior_sd or 1.0)
-    return ChartRATTLE(c, space, adapt_step_size=False, **kw)
+    return ChartRATTLE(c, x, space, adapt_step_size=False, **kw)
 
 
 def _affine_sampler(n=2, m=5, seed=0, **kw):
@@ -73,9 +106,9 @@ def _affine_sampler(n=2, m=5, seed=0, **kw):
     A = torch.randn(m, n)
     B = torch.eye(m) + 0.15 * torch.randn(m, m)
     B = B @ B.transpose(-2, -1)
-    c = AffineChart(A, B, torch.zeros(m), torch.randn(m))
+    c, x = AffineLayer(A, B, torch.zeros(m)), torch.randn(m)
     space = NormalSpace([f"v{i}" for i in range(n)])
-    return ChartRATTLE(c, space, adapt_step_size=False, **kw), n
+    return ChartRATTLE(c, x, space, adapt_step_size=False, **kw), n
 
 
 def _seed_state(sampler, eta):
@@ -109,7 +142,7 @@ def test_position_solve_reaches_orthogonality_tolerance():
     st = _seed_state(s, torch.randn(6, 1))
     out = s.integrate(_restart(st, st.q.clone(), st.p.clone()), torch.full((6,), h))
 
-    psi1 = s.constraint.psi(out.q)
+    psi1 = s._chart.psi(out.q)
     corr = (st.W.transpose(-2, -1) @ (psi1 - st.psi).unsqueeze(-1)).squeeze(-1)
     F = (out.q - st.q) - s.beta * corr - h * st.p + 0.5 * h * h * st.grad_V
     assert float(F.abs().max()) < 1e-11
@@ -165,11 +198,12 @@ def test_step_preserves_volume_and_symplectic_form(prior_sd):
     Sigma = B @ B.transpose(-2, -1)
     # Nonlinear in q through both the mean and the scale, so a step that was only
     # accidentally symplectic (e.g. on a constant metric) would show up here.
-    chart = LocationScaleChart(lambda q: torch.tanh(q @ A.transpose(-2, -1)),
-                               lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma,
-                               torch.randn(m))
+    chart = LocationScaleLayer.from_covariance(
+        lambda q: torch.tanh(q @ A.transpose(-2, -1)),
+        lambda q: torch.exp(0.6 * q[:, 0])[:, None, None] * Sigma)
+    x = torch.randn(m)
     space = NormalSpace([f"v{i}" for i in range(n)], sigma=prior_sd or 1.0)
-    s = ChartRATTLE(chart, space, step_size=h, num_steps=1,
+    s = ChartRATTLE(chart, x, space, step_size=h, num_steps=1,
                     adapt_step_size=False, solver="anderson",
                     fp_tol=1e-14, fp_max_iter=500)
     s.init(torch.zeros(1, n))                     # seeds the solver diagnostics

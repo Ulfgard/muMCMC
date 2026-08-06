@@ -1,4 +1,3 @@
-from typing import Callable
 import math
 
 import torch
@@ -116,113 +115,34 @@ from ._solvers import FixedPointSolver
 #  than an absolute one.                                                      #
 # =========================================================================== #
 
-#  ---- Constraint ---------------------------------------------------------- #
-
-class ChartConstraint:
-    """Constraint M = {(q, ε) : φ_q(ε) = x} exposed through the inverse map.
-
-    A subclass supplies the batched, temperature-free inverse ``psi(q)`` =
-    φ_q⁻¹(x) (shape ``(N, n)`` to ``(N, m)``) and ``log_abs_det_B(q)`` =
-    log|det ∂_ε φ|. The sampler derives W = −∂ψ/∂q, the potential, and the
-    metric, and applies the inverse temperature. Override ``psi_with_jvp`` to
-    return (ψ, W, log|det B|) from explicit Jacobians.
-
-    Parameters
-    ----------
-    x : (m,)
-        Conditioning value the manifold is defined by, shared across chains.
-    """
-
-    # Whether psi_with_jvp needs grad mode enabled around it. True for the
-    # default, which differentiates psi. A subclass returning W from explicit or
-    # forward-mode Jacobians should set it False, which spares the graph build
-    # on every call, and that is once per iteration under the newton solver.
-    jvp_needs_grad = True
-
-    def __init__(self, x: torch.Tensor):
-        self.x = x
-
-    def psi(self, q: torch.Tensor) -> torch.Tensor:
-        """The inverse map ψ(q) = φ_q⁻¹(x): the latent that maps to the
-        observation x under the layer φ_q. ``q`` is ``(N, n)``, the result
-        ``(N, m)``. Implemented by a subclass."""
-        raise NotImplementedError
-
-    def log_abs_det_B(self, q: torch.Tensor) -> torch.Tensor:
-        """log|det ∂_ε φ_q|, the log Jacobian of the layer in its latent
-        argument. ``q`` is ``(N, n)``, the result ``(N,)``. Implemented by a
-        subclass."""
-        raise NotImplementedError
-
-    def psi_with_jvp(self, q: torch.Tensor):
-        """(ψ, W, log|det B|) at ``q``, with W = −∂ψ/∂q by one reverse pass per
-        latent. ``q`` must require grad. Override with explicit Jacobians, and
-        set :attr:`jvp_needs_grad` False when the override needs no grad mode."""
-        eps = self.psi(q)
-        m = eps.shape[-1]
-        cols = [torch.autograd.grad(eps[:, i].sum(), q, retain_graph=True,
-                                    create_graph=True)[0]
-                for i in range(m)]
-        W = -torch.stack(cols, dim=1)                      # (N, m, n)
-        return eps, W, self.log_abs_det_B(q)
-
-
-class LocationScaleChart(ChartConstraint):
-    """Conditionally-Gaussian layer x | q ~ N(μ(q), Σ(q)).
-
-    φ_q(ε) = μ(q) + L(q) ε with Σ(q) = L(q) L(q)ᵀ, so ψ(q) = L(q)⁻¹(x − μ(q))
-    and log|det B| = ½ log det Σ. ``mean`` and ``cov`` are batched callables
-    (``q`` shape ``(N, n)`` to ``(N, m)`` and ``(N, m, m)`` SPD), differentiable
-    in ``q``. A ``cov`` that is not numerically SPD raises.
-
-    Parameters
-    ----------
-    mean : callable
-        q -> μ(q).
-    cov : callable
-        q -> Σ(q), SPD.
-    x : (m,)
-        Observation.
-    """
-
-    def __init__(self, mean: Callable, cov: Callable, x: torch.Tensor):
-        super().__init__(x)
-        self.mean = mean
-        self.cov = cov
-
-    def _factor(self, q):
-        return self.mean(q), torch.linalg.cholesky(self.cov(q))
-
-    def psi(self, q):
-        mu, L = self._factor(q)
-        return torch.linalg.solve_triangular(
-            L, (self.x - mu).unsqueeze(-1), upper=False).squeeze(-1)
-
-    def log_abs_det_B(self, q):
-        _, L = self._factor(q)
-        return torch.log(L.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
-
-
 class _ChartInNormal:
-    """A constraint written on θ, read at the chart coordinate q with θ = T(q),
+    """The constraint φ_θ(ε) = x of a layer written on θ, read at the chart
+    coordinate q with θ = T(q),
 
-        W_q = W_θ diag(dθ/dq),
+        ψ(q) = φ_θ⁻¹(x),   W_q = W_θ dθ/dq,
 
-    so the constraint itself never sees the chart.
+    so the layer itself never sees the chart. log|det B| is the layer's log
+    Jacobian diagonal summed, and B⁻¹, which the layer returns with it, is not
+    read here.
     """
 
-    def __init__(self, constraint: "ChartConstraint", transform):
-        self.constraint = constraint
+    def __init__(self, layer, x: torch.Tensor, transform):
+        self.layer = layer
+        self.x = x
         self.transform = transform
-        self.jvp_needs_grad = constraint.jvp_needs_grad
+        self.jvp_needs_grad = layer.jvp_needs_grad
 
     def psi(self, q: torch.Tensor) -> torch.Tensor:
-        return self.constraint.psi(self.transform.forward(q).mapped_point)
+        theta = self.transform.forward(q).mapped_point
+        return self.layer.inverse(theta, self.x)
 
     def psi_with_jvp(self, q: torch.Tensor):
         chart = self.transform.forward(q)
-        psi, W, log_abs_det_B = self.constraint.psi_with_jvp(chart.mapped_point)
-        return psi, W * chart.jacobian_diag[..., None, :], log_abs_det_B
+        psi, W, B_inv = self.layer.inverse_with_jvp(chart.mapped_point, self.x)
+        # log|det B| = -log|det B⁻¹|, and B is triangular.
+        log_abs_det_B = -torch.log(
+            B_inv.diagonal(dim1=-2, dim2=-1).abs()).sum(-1)
+        return psi, chart.pullback(W), log_abs_det_B
 
 
 #  ---- Position solve ------------------------------------------------------ #
@@ -339,12 +259,15 @@ class ChartRATTLE(HamiltonianSampler):
 
     Parameters
     ----------
-    constraint : ChartConstraint
-        The reparameterization inverse ψ(q) = φ_q⁻¹(x) and its geometry.
+    layer : ConditionalLayer
+        The layer φ_θ(ε) whose inverse ψ(q) = φ_θ⁻¹(x) the manifold is defined
+        by. It is evaluated at θ = T(q).
+    x : (m,)
+        Conditioning value the manifold is defined by, shared across chains.
     space
         Space over the θ names. The chain runs in its normal chart, so the prior
         enters U as ½‖q‖² and the prior block M of G_M = M + β WᵀW is the
-        identity. The constraint is evaluated at θ = T(q).
+        identity. The layer is evaluated at θ = T(q).
     step_size : float
         Integration step size. When adapting, start it small: the step is grown
         from here, so a too-large start begins above the solver-convergence cliff
@@ -385,7 +308,8 @@ class ChartRATTLE(HamiltonianSampler):
 
     def __init__(
         self,
-        constraint: ChartConstraint,
+        layer,
+        x: torch.Tensor,
         space,
         *,
         step_size: float,
@@ -407,17 +331,13 @@ class ChartRATTLE(HamiltonianSampler):
         adapter = NoAdaptation(init=log_eps)
         if adapt_step_size:
             adapter = Reinforce(sigma=adaptation_sigma, init=log_eps)
-        if space.prior_metric(space.as_transform.interior_point) is None:
-            raise ValueError(
-                "ChartRATTLE needs a space with a prior, whose chart supplies "
-                "the constant prior block M of G_M = M + beta W^T W. A space "
-                "with no prior has no M.")
         super().__init__(None, space, requires_metric=True, num_steps=num_steps,
                          adapter=adapter, divergence_threshold=divergence_threshold,
                          trajectory_length=num_steps * step_size)
 
-        self.constraint = constraint
-        self._chart = _ChartInNormal(constraint, space.as_transform)
+        self.layer = layer
+        self.x = x
+        self._chart = _ChartInNormal(layer, x, space.as_transform)
         self._fp_tol = fp_tol
 
         self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
