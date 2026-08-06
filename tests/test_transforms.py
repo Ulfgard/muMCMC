@@ -157,6 +157,16 @@ def test_the_metric_is_the_reciprocal_square_of_the_forward_jacobian():
     assert torch.allclose(J.mT @ M @ J, torch.eye(3).expand(6, 3, 3), atol=ATOL)
 
 
+def test_the_point_alone_is_the_map_without_its_jacobian():
+    # Both directions here give their Jacobian from the same pass, so this saves
+    # nothing and is here because a chart is asked for a point either way.
+    T = _affine()
+    z = torch.randn(6, 3)
+    theta = T.forward_point(z)
+    assert torch.allclose(theta, T.forward(z).mapped_point, atol=ATOL)
+    assert torch.allclose(T.inverse_point(theta), z, atol=ATOL)
+
+
 def test_arbitrary_leading_batch_axes():
     m = _affine().forward(torch.randn(2, 5, 3))
     assert m.mapped_point.shape == (2, 5, 3)

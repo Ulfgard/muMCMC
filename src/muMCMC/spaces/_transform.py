@@ -207,6 +207,16 @@ class NormalTransform:
         z, diag = self._inverse_fn(theta)
         return Map(theta, z, diag)
 
+    def forward_point(self, z: torch.Tensor) -> torch.Tensor:
+        """``T(z)`` alone, for a caller with no use for a Jacobian. Both
+        directions here give their own from the same pass, so this drops it
+        rather than saving it."""
+        return self._forward_fn(z)[0]
+
+    def inverse_point(self, theta: torch.Tensor) -> torch.Tensor:
+        """``T⁻¹(theta)`` alone, as in :meth:`forward_point`."""
+        return self._inverse_fn(theta)[0]
+
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
         """Per-coordinate log-density of the prior at ``theta``,
 

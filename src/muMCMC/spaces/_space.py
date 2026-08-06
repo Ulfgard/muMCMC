@@ -233,4 +233,4 @@ class Space:
         T = self.as_transform
         z = torch.randn(n_samples, self.d, dtype=T.dtype, device=T.device,
                         generator=generator)
-        return self.add_fixed(self.from_free_vector(T.forward(z).mapped_point))
+        return self.add_fixed(self.from_free_vector(T.forward_point(z)))

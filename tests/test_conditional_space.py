@@ -147,6 +147,37 @@ def test_the_chart_jacobian_matches_autograd(direction):
     assert m.is_dense
 
 
+@pytest.mark.parametrize("direction", ["forward", "inverse"])
+def test_the_point_alone_is_the_map_without_its_jacobian(direction):
+    # A solve iterating on the map itself reads no Jacobian, and the layer's
+    # costs a pass per coordinate, so the point has a path of its own that never
+    # reaches for one. The layer here refuses to give one, which is what says
+    # the path is taken rather than merely available.
+    class NoJacobian(LocationScaleLayer):
+        def forward_with_jvp(self, a, eps):
+            raise AssertionError("the value path asked for a Jacobian")
+
+        inverse_with_jvp = forward_with_jvp
+
+    s = ConditionalSpace(NormalSpace(["a0", "a1"], mu=0.3, sigma=1.7), ["b0", "b1"],
+                         NoJacobian(_nonlinear_location_scale))
+    x = torch.randn(5, 4)
+    if direction == "inverse":
+        x = s.as_transform.forward_point(x)
+    point = getattr(s.as_transform, f"{direction}_point")(x)
+
+    ref = getattr(_nonlinear_space().as_transform, direction)(x)
+    assert torch.allclose(point, ref.mapped_point, atol=ATOL)
+    assert not point.requires_grad
+
+
+def test_the_point_alone_keeps_the_leading_axes():
+    s = _nonlinear_space()
+    z = torch.randn(2, 3, 4)
+    assert torch.allclose(s.as_transform.forward_point(z),
+                          s.as_transform.forward(z).mapped_point, atol=ATOL)
+
+
 def test_the_interior_point_is_the_image_of_zero():
     s = _nonlinear_space()
     assert torch.allclose(s.as_transform.interior_point,

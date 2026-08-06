@@ -69,6 +69,27 @@ class ConditionalTransform:
         ``(..., d)``, as a matrix for the reason in :meth:`forward`."""
         return self._differentiated(theta, self._inverse_at).reshaped(theta)
 
+    def forward_point(self, z: torch.Tensor) -> torch.Tensor:
+        """``T(z)`` alone, for a caller with no use for a Jacobian.
+
+        The layer is read for its value, which is one pass where its Jacobians
+        are one more per coordinate of the trailing block, so this is the path a
+        solve iterating on the map itself takes.
+        """
+        d_a = self._base.d
+        z, shape = z.reshape(-1, z.shape[-1]), z.shape
+        theta_a = self._base.forward_point(z[..., :d_a])
+        theta_b = self._layer.forward(theta_a, z[..., d_a:])
+        return torch.cat([theta_a, theta_b], dim=-1).reshape(shape)
+
+    def inverse_point(self, theta: torch.Tensor) -> torch.Tensor:
+        """``T⁻¹(theta)`` alone, as in :meth:`forward_point`."""
+        d_a = self._base.d
+        theta, shape = theta.reshape(-1, theta.shape[-1]), theta.shape
+        z_a = self._base.inverse_point(theta[..., :d_a])
+        eps = self._layer.inverse(theta[..., :d_a], theta[..., d_a:])
+        return torch.cat([z_a, eps], dim=-1).reshape(shape)
+
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
         """Per-coordinate log-density of the prior at ``theta``, shape
         ``(..., d)``, the chain rule of ``p(theta_A) p(theta_B | theta_A)`` along
