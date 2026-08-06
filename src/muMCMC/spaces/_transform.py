@@ -195,15 +195,24 @@ class NormalTransform:
     def device(self) -> torch.device:
         return self._reference.device
 
-    def forward(self, z: torch.Tensor) -> Map:
-        """``theta = T(z)`` with ``dtheta/dz``, for ``z`` of shape ``(..., d)``,
-        the map being elementwise and so carrying its diagonal."""
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """``theta = T(z)`` for ``z`` of shape ``(..., d)``. Both directions here
+        give their Jacobian from the same pass, so this drops it rather than
+        saving it."""
+        return self._forward_fn(z)[0]
+
+    def inverse(self, theta: torch.Tensor) -> torch.Tensor:
+        """``z = T⁻¹(theta)`` for ``theta`` of shape ``(..., d)``."""
+        return self._inverse_fn(theta)[0]
+
+    def forward_with_jvp(self, z: torch.Tensor) -> Map:
+        """``theta = T(z)`` with ``dtheta/dz``, the map being elementwise and so
+        carrying its diagonal."""
         theta, diag = self._forward_fn(z)
         return Map(z, theta, diag)
 
-    def inverse(self, theta: torch.Tensor) -> Map:
-        """``z = T⁻¹(theta)`` with ``dz/dtheta``, for ``theta`` of shape
-        ``(..., d)``."""
+    def inverse_with_jvp(self, theta: torch.Tensor) -> Map:
+        """``z = T⁻¹(theta)`` with ``dz/dtheta``."""
         z, diag = self._inverse_fn(theta)
         return Map(theta, z, diag)
 
@@ -214,4 +223,4 @@ class NormalTransform:
 
         shape ``(..., d)``. The inverse map already carries both terms, so this
         is one call of it."""
-        return log_prob_coordinates(self.inverse(theta))
+        return log_prob_coordinates(self.inverse_with_jvp(theta))

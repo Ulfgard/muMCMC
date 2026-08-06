@@ -133,11 +133,11 @@ class _ChartInNormal:
         self.jvp_needs_grad = layer.jvp_needs_grad
 
     def psi(self, q: torch.Tensor) -> torch.Tensor:
-        theta = self.transform.forward(q).mapped_point
+        theta = self.transform.forward(q)
         return self.layer.inverse(theta, self.x)
 
     def psi_with_jvp(self, q: torch.Tensor):
-        chart = self.transform.forward(q)
+        chart = self.transform.forward_with_jvp(q)
         psi, W, B_inv = self.layer.inverse_with_jvp(chart.mapped_point, self.x)
         # log|det B| = -log|det B⁻¹|, and B is triangular.
         log_abs_det_B = -torch.log(
@@ -440,7 +440,7 @@ class ChartRATTLE(HamiltonianSampler):
         ``x | theta`` are the same log|det B|, so no measure factor is left
         over.
         """
-        chart = self.space.as_transform.inverse(theta_free)
+        chart = self.space.as_transform.inverse_with_jvp(theta_free)
         return (self.evaluate_model(chart.mapped_point, beta)[0].value
                 - chart.jacobian_log_det)
 
@@ -448,12 +448,12 @@ class ChartRATTLE(HamiltonianSampler):
         """The chart coordinate q at the variables theta, so q = T⁻¹(theta).
         The chain runs in the chart, where the prior block M of G_M is constant,
         which is the one thing the step needs and the variables cannot give."""
-        return self.space.as_transform.inverse(theta_free).mapped_point
+        return self.space.as_transform.inverse(theta_free)
 
     def to_variables(self, q_free):
         """The variables theta = T(q) at the chart coordinate q, which is what a
         run reports."""
-        return self.space.as_transform.forward(q_free).mapped_point
+        return self.space.as_transform.forward(q_free)
 
     # ---- integrator hooks -------------------------------------------------- #
 

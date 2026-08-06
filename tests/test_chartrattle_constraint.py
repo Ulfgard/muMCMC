@@ -342,7 +342,7 @@ def test_a_conditional_space_carries_its_coupling_into_W_and_U():
 
     # W = -d psi(T(q))/dq, the constraint's own W pulled back along the chart.
     qg = q.clone().requires_grad_(True)
-    theta = space.as_transform.forward(qg).mapped_point
+    theta = space.as_transform.forward_with_jvp(qg).mapped_point
     psi_of = lambda th: layer.inverse(th, x.expand(th.shape[0], -1))
     rows = [torch.autograd.grad(psi_of(theta)[:, i].sum(), qg, retain_graph=True)[0]
             for i in range(3)]

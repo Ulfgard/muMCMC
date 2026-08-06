@@ -53,7 +53,7 @@ def test_fixed_names_must_appear_in_names():
 
 def test_scalar_parameter_is_shared_across_the_free_variables():
     s = NormalSpace(NAMES, mu=2.0, sigma=0.5)
-    theta = s.as_transform.forward(torch.zeros(1, 3)).mapped_point
+    theta = s.as_transform.forward_with_jvp(torch.zeros(1, 3)).mapped_point
     assert torch.allclose(theta, torch.full((1, 3), 2.0), atol=ATOL)
 
 
@@ -62,7 +62,7 @@ def test_dict_parameter_is_read_by_name_not_by_position():
     # prior from being transposed onto the wrong variable.
     s = NormalSpace(NAMES, mu={"a": 10.0, "c": -10.0}, sigma=1.0,
                     fixed={"b": 0.0})
-    theta = s.as_transform.forward(torch.zeros(1, 2)).mapped_point
+    theta = s.as_transform.forward_with_jvp(torch.zeros(1, 2)).mapped_point
     assert torch.allclose(theta, torch.tensor([[10.0, -10.0]]), atol=ATOL)
 
 
@@ -233,7 +233,7 @@ def test_prior_metric_is_the_pullback_of_the_identity(build):
     # running in the chart reads.
     s = build()
     z = torch.randn(5, 3)
-    m = s.as_transform.forward(z)
+    m = s.as_transform.forward_with_jvp(z)
     M = s.prior_metric(m.mapped_point)
     assert M.shape == (5, 3, 3)
     diag = M.diagonal(dim1=-2, dim2=-1)
@@ -327,7 +327,7 @@ def test_unnormalized_keeps_the_fixed_machinery():
 def test_protocol_accepts_arbitrary_leading_axes(build):
     s = build()
     z = torch.randn(2, 5, 3)
-    m = s.as_transform.forward(z)
+    m = s.as_transform.forward_with_jvp(z)
     assert m.mapped_point.shape == (2, 5, 3)
     assert s.prior_log_prob_vector(m.mapped_point).shape == (2, 5)
     assert s.prior_metric(m.mapped_point).shape == (2, 5, 3, 3)

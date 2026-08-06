@@ -128,8 +128,8 @@ def _autograd_jacobian(fn, x):
 def test_the_chart_round_trips():
     s = _nonlinear_space()
     z = torch.randn(5, 4)
-    theta = s.as_transform.forward(z).mapped_point
-    assert torch.allclose(s.as_transform.inverse(theta).mapped_point, z, atol=1e-9)
+    theta = s.as_transform.forward_with_jvp(z).mapped_point
+    assert torch.allclose(s.as_transform.inverse_with_jvp(theta).mapped_point, z, atol=1e-9)
 
 
 @pytest.mark.parametrize("direction", ["forward", "inverse"])
@@ -137,8 +137,8 @@ def test_the_chart_jacobian_matches_autograd(direction):
     s = _nonlinear_space()
     x = torch.randn(5, 4)
     if direction == "inverse":
-        x = s.as_transform.forward(x).mapped_point
-    fn = getattr(s.as_transform, direction)
+        x = s.as_transform.forward_with_jvp(x).mapped_point
+    fn = getattr(s.as_transform, f"{direction}_with_jvp")
     m = fn(x)
     J = _autograd_jacobian(lambda v: fn(v).mapped_point, x)
     assert torch.allclose(m.dense_jacobian(), J, atol=1e-9)
@@ -147,10 +147,41 @@ def test_the_chart_jacobian_matches_autograd(direction):
     assert m.is_dense
 
 
+@pytest.mark.parametrize("direction", ["forward", "inverse"])
+def test_the_plain_directions_give_the_point_alone(direction):
+    # A solve iterating on the map itself reads no Jacobian, and the layer's
+    # costs a pass per coordinate, so the point has a path of its own that never
+    # reaches for one. The layer here refuses to give one, which is what says
+    # the path is taken rather than merely available.
+    class NoJacobian(LocationScaleLayer):
+        def forward_with_jvp(self, a, eps):
+            raise AssertionError("the value path asked for a Jacobian")
+
+        inverse_with_jvp = forward_with_jvp
+
+    s = ConditionalSpace(NormalSpace(["a0", "a1"], mu=0.3, sigma=1.7), ["b0", "b1"],
+                         NoJacobian(_nonlinear_location_scale))
+    x = torch.randn(5, 4)
+    if direction == "inverse":
+        x = s.as_transform.forward(x)
+    point = getattr(s.as_transform, direction)(x)
+
+    ref = getattr(_nonlinear_space().as_transform, f"{direction}_with_jvp")(x)
+    assert torch.allclose(point, ref.mapped_point, atol=ATOL)
+    assert not point.requires_grad
+
+
+def test_the_plain_directions_keep_the_leading_axes():
+    s = _nonlinear_space()
+    z = torch.randn(2, 3, 4)
+    assert torch.allclose(s.as_transform.forward(z),
+                          s.as_transform.forward_with_jvp(z).mapped_point, atol=ATOL)
+
+
 def test_the_interior_point_is_the_image_of_zero():
     s = _nonlinear_space()
     assert torch.allclose(s.as_transform.interior_point,
-                          s.as_transform.forward(torch.zeros(1, 4)).mapped_point[0],
+                          s.as_transform.forward_with_jvp(torch.zeros(1, 4)).mapped_point[0],
                           atol=ATOL)
 
 
@@ -159,7 +190,7 @@ def test_the_prior_metric_is_the_pullback_of_the_identity():
     # the identity, which is what a chain running there reads.
     s = _nonlinear_space()
     z = torch.randn(5, 4)
-    m = s.as_transform.forward(z)
+    m = s.as_transform.forward_with_jvp(z)
     M = s.prior_metric(m.mapped_point)
     assert M.shape == (5, 4, 4)
     J = m.dense_jacobian()
@@ -172,7 +203,7 @@ def test_the_chart_is_differentiable_through_the_coupling():
     s = _nonlinear_space()
     z = torch.randn(4, 4, requires_grad=True)
     (g,) = torch.autograd.grad(
-        s.as_transform.forward(z).dense_jacobian().sum(), z)
+        s.as_transform.forward_with_jvp(z).dense_jacobian().sum(), z)
     assert torch.isfinite(g).all() and float(g.abs().max()) > 0.0
 
 
@@ -182,7 +213,7 @@ def test_the_chart_is_differentiable_through_the_coupling():
 
 def test_the_joint_prior_is_the_leading_prior_times_the_conditional():
     s = _nonlinear_space()
-    theta = s.as_transform.forward(torch.randn(6, 4)).mapped_point
+    theta = s.as_transform.forward_with_jvp(torch.randn(6, 4)).mapped_point
     mu, L = _nonlinear_location_scale(theta[:, :2])
     ref = (Normal(0.3, 1.7).log_prob(theta[:, :2]).sum(-1)
            + MVN(mu, scale_tril=L).log_prob(theta[:, 2:]))
@@ -267,8 +298,8 @@ def test_a_space_composes_as_the_base_of_another():
     assert s.names == ["a0", "a1", "b0", "b1", "c"]
     assert s.d == 5
     z = torch.randn(4, 5)
-    theta = s.as_transform.forward(z).mapped_point
-    assert torch.allclose(s.as_transform.inverse(theta).mapped_point, z, atol=1e-9)
+    theta = s.as_transform.forward_with_jvp(z).mapped_point
+    assert torch.allclose(s.as_transform.inverse_with_jvp(theta).mapped_point, z, atol=1e-9)
 
 
 @pytest.mark.parametrize("direction", ["forward", "inverse"])
@@ -279,8 +310,8 @@ def test_the_nested_chart_jacobian_matches_autograd(direction):
     s = _nested_space()
     x = torch.randn(4, 5)
     if direction == "inverse":
-        x = s.as_transform.forward(x).mapped_point
-    fn = getattr(s.as_transform, direction)
+        x = s.as_transform.forward_with_jvp(x).mapped_point
+    fn = getattr(s.as_transform, f"{direction}_with_jvp")
     J = _autograd_jacobian(lambda v: fn(v).mapped_point, x)
     assert torch.allclose(fn(x).dense_jacobian(), J, atol=1e-9)
     assert torch.allclose(fn(x).jacobian_log_det,
@@ -289,7 +320,7 @@ def test_the_nested_chart_jacobian_matches_autograd(direction):
 
 def test_the_nested_prior_is_the_chain_of_its_three_blocks():
     s = _nested_space()
-    theta = s.as_transform.forward(torch.randn(6, 5)).mapped_point
+    theta = s.as_transform.forward_with_jvp(torch.randn(6, 5)).mapped_point
     mu_b, L_b = _nonlinear_location_scale(theta[:, :2])
     mu_c, L_c = _third_block(theta[:, :4])
     ref = (Normal(0.3, 1.7).log_prob(theta[:, :2]).sum(-1)
@@ -300,7 +331,7 @@ def test_the_nested_prior_is_the_chain_of_its_three_blocks():
 
 def test_the_nested_prior_metric_is_the_pullback_of_the_identity():
     s = _nested_space()
-    m = s.as_transform.forward(torch.randn(4, 5))
+    m = s.as_transform.forward_with_jvp(torch.randn(4, 5))
     M = s.prior_metric(m.mapped_point)
     J = m.dense_jacobian()
     assert torch.allclose(J.mT @ M @ J, torch.eye(5).expand(4, 5, 5), atol=1e-7)
