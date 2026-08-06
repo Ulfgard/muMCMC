@@ -114,7 +114,7 @@ def test_an_elementwise_chart_carries_its_diagonal():
     # The map is elementwise, so the diagonal is the Jacobian rather than a
     # cheaper reading of it, and a caller wanting a matrix is handed one.
     T = _affine()
-    m = T.forward(torch.randn(6, 3))
+    m = T.forward_with_jvp(torch.randn(6, 3))
     assert not m.is_dense
     assert torch.allclose(m.dense_jacobian(), torch.diag_embed(SIGMA.expand(6, 3)),
                           atol=ATOL)
@@ -127,22 +127,22 @@ def test_an_elementwise_chart_carries_its_diagonal():
 def test_forward_and_inverse_round_trip():
     T = _affine()
     z = torch.randn(7, 3)
-    assert torch.allclose(T.inverse(T.forward(z).mapped_point).mapped_point, z,
+    assert torch.allclose(T.inverse_with_jvp(T.forward_with_jvp(z).mapped_point).mapped_point, z,
                           atol=ATOL)
 
 
 def test_the_two_jacobians_are_reciprocal():
     T = _affine()
-    m = T.forward(torch.randn(7, 3))
-    back = T.inverse(m.mapped_point)
+    m = T.forward_with_jvp(torch.randn(7, 3))
+    back = T.inverse_with_jvp(m.mapped_point)
     assert torch.allclose(back.jacobian_diag, 1.0 / m.jacobian_diag, atol=ATOL)
 
 
 def test_forward_jacobian_matches_autograd():
     T = _affine()
     z = torch.randn(7, 3, requires_grad=True)
-    (g,) = torch.autograd.grad(T.forward(z).mapped_point.sum(), z)
-    assert torch.allclose(T.forward(z.detach()).jacobian_diag, g, atol=ATOL)
+    (g,) = torch.autograd.grad(T.forward_with_jvp(z).mapped_point.sum(), z)
+    assert torch.allclose(T.forward_with_jvp(z.detach()).jacobian_diag, g, atol=ATOL)
 
 
 def test_the_metric_is_the_reciprocal_square_of_the_forward_jacobian():
@@ -150,25 +150,25 @@ def test_the_metric_is_the_reciprocal_square_of_the_forward_jacobian():
     # the identity, which is what every sampler reads as the prior's metric in
     # the chart.
     T = _affine()
-    m = T.forward(torch.randn(6, 3))
-    M = T.inverse(m.mapped_point).gram()
+    m = T.forward_with_jvp(torch.randn(6, 3))
+    M = T.inverse_with_jvp(m.mapped_point).gram()
     assert M.shape == (6, 3, 3)
     J = torch.diag_embed(m.jacobian_diag)
     assert torch.allclose(J.mT @ M @ J, torch.eye(3).expand(6, 3, 3), atol=ATOL)
 
 
-def test_the_point_alone_is_the_map_without_its_jacobian():
+def test_the_plain_directions_give_the_point_alone():
     # Both directions here give their Jacobian from the same pass, so this saves
     # nothing and is here because a chart is asked for a point either way.
     T = _affine()
     z = torch.randn(6, 3)
-    theta = T.forward_point(z)
-    assert torch.allclose(theta, T.forward(z).mapped_point, atol=ATOL)
-    assert torch.allclose(T.inverse_point(theta), z, atol=ATOL)
+    theta = T.forward(z)
+    assert torch.allclose(theta, T.forward_with_jvp(z).mapped_point, atol=ATOL)
+    assert torch.allclose(T.inverse(theta), z, atol=ATOL)
 
 
 def test_arbitrary_leading_batch_axes():
-    m = _affine().forward(torch.randn(2, 5, 3))
+    m = _affine().forward_with_jvp(torch.randn(2, 5, 3))
     assert m.mapped_point.shape == (2, 5, 3)
     assert m.jacobian_log_det.shape == (2, 5)
 
@@ -220,7 +220,7 @@ def test_the_forward_map_is_differentiable_to_second_order():
                         lambda th: (torch.log(th), 1.0 / th),
                         reference=torch.zeros(3))
     z = torch.randn(4, 3, requires_grad=True)
-    (g,) = torch.autograd.grad(T.forward(z).mapped_point.sum(), z,
+    (g,) = torch.autograd.grad(T.forward_with_jvp(z).mapped_point.sum(), z,
                                create_graph=True)
     (gg,) = torch.autograd.grad(g.sum(), z)
     assert torch.allclose(g, torch.exp(z).detach(), atol=ATOL)

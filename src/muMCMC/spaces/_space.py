@@ -216,7 +216,7 @@ class Space:
         It is the pullback of the identity along the chart, so it is the metric
         the prior itself induces on the variables, and it varies with position.
         """
-        return self.as_transform.inverse(theta_free).gram()
+        return self.as_transform.inverse_with_jvp(theta_free).gram()
 
     def free_block(self, G: torch.Tensor) -> torch.Tensor:
         """The free block of a metric ``G`` of shape ``(..., d_full, d_full)``
@@ -233,4 +233,4 @@ class Space:
         T = self.as_transform
         z = torch.randn(n_samples, self.d, dtype=T.dtype, device=T.device,
                         generator=generator)
-        return self.add_fixed(self.from_free_vector(T.forward_point(z)))
+        return self.add_fixed(self.from_free_vector(T.forward(z)))

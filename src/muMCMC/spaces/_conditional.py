@@ -56,21 +56,8 @@ class ConditionalTransform:
     def device(self) -> torch.device:
         return self._base.device
 
-    def forward(self, z: torch.Tensor) -> Map:
-        """``theta = T(z)`` with ``dtheta/dz``, for ``z`` of shape ``(..., d)``.
-
-        The Jacobian is triangular rather than diagonal, so the map carries it
-        as a matrix and the layer is read for both of its own Jacobians.
-        """
-        return self._differentiated(z, self._forward_at).reshaped(z)
-
-    def inverse(self, theta: torch.Tensor) -> Map:
-        """``z = T⁻¹(theta)`` with ``dz/dtheta``, for ``theta`` of shape
-        ``(..., d)``, as a matrix for the reason in :meth:`forward`."""
-        return self._differentiated(theta, self._inverse_at).reshaped(theta)
-
-    def forward_point(self, z: torch.Tensor) -> torch.Tensor:
-        """``T(z)`` alone, for a caller with no use for a Jacobian.
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """``theta = T(z)`` for ``z`` of shape ``(..., d)``.
 
         The layer is read for its value, which is one pass where its Jacobians
         are one more per coordinate of the trailing block, so this is the path a
@@ -78,23 +65,37 @@ class ConditionalTransform:
         """
         d_a = self._base.d
         z, shape = z.reshape(-1, z.shape[-1]), z.shape
-        theta_a = self._base.forward_point(z[..., :d_a])
+        theta_a = self._base.forward(z[..., :d_a])
         theta_b = self._layer.forward(theta_a, z[..., d_a:])
         return torch.cat([theta_a, theta_b], dim=-1).reshape(shape)
 
-    def inverse_point(self, theta: torch.Tensor) -> torch.Tensor:
-        """``T⁻¹(theta)`` alone, as in :meth:`forward_point`."""
+    def inverse(self, theta: torch.Tensor) -> torch.Tensor:
+        """``z = T⁻¹(theta)`` for ``theta`` of shape ``(..., d)``, as in
+        :meth:`forward`."""
         d_a = self._base.d
         theta, shape = theta.reshape(-1, theta.shape[-1]), theta.shape
-        z_a = self._base.inverse_point(theta[..., :d_a])
+        z_a = self._base.inverse(theta[..., :d_a])
         eps = self._layer.inverse(theta[..., :d_a], theta[..., d_a:])
         return torch.cat([z_a, eps], dim=-1).reshape(shape)
+
+    def forward_with_jvp(self, z: torch.Tensor) -> Map:
+        """``theta = T(z)`` with ``dtheta/dz``.
+
+        The Jacobian is triangular rather than diagonal, so the map carries it
+        as a matrix and the layer is read for both of its own Jacobians.
+        """
+        return self._differentiated(z, self._forward_at).reshaped(z)
+
+    def inverse_with_jvp(self, theta: torch.Tensor) -> Map:
+        """``z = T⁻¹(theta)`` with ``dz/dtheta``, as a matrix for the reason in
+        :meth:`forward_with_jvp`."""
+        return self._differentiated(theta, self._inverse_at).reshaped(theta)
 
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
         """Per-coordinate log-density of the prior at ``theta``, shape
         ``(..., d)``, the chain rule of ``p(theta_A) p(theta_B | theta_A)`` along
         the coordinate order. The factors sum to the joint."""
-        return log_prob_coordinates(self.inverse(theta))
+        return log_prob_coordinates(self.inverse_with_jvp(theta))
 
     # ---- the blocks --------------------------------------------------------- #
 
@@ -106,7 +107,7 @@ class ConditionalTransform:
         own Jacobian, whatever that is.
         """
         d_a = self._base.d
-        m_a = self._base.forward(z[..., :d_a])
+        m_a = self._base.forward_with_jvp(z[..., :d_a])
         theta_b, A, B = self._layer.forward_with_jvp(m_a.mapped_point,
                                                      z[..., d_a:])
         return Map(z, torch.cat([m_a.mapped_point, theta_b], dim=-1),
@@ -119,7 +120,7 @@ class ConditionalTransform:
         chart, so its coupling is the layer's own.
         """
         d_a = self._base.d
-        m_a = self._base.inverse(theta[..., :d_a])
+        m_a = self._base.inverse_with_jvp(theta[..., :d_a])
         eps, W, B_inv = self._layer.inverse_with_jvp(theta[..., :d_a],
                                                      theta[..., d_a:])
         return Map(theta, torch.cat([m_a.mapped_point, eps], dim=-1),
