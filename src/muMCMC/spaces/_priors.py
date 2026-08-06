@@ -36,10 +36,10 @@ class NormalSpace(Space):
         super().__init__(names, fixed=fixed)
         mu = _as_parameter(mu, self._free_names, "mu", dtype, device)
         sigma = _as_parameter(sigma, self._free_names, "sigma", dtype, device)
-        log_sigma = torch.log(sigma)
+        inv_sigma = 1.0 / sigma
         self._transform = NormalTransform(
-            lambda z: (mu + sigma * z, log_sigma.expand_as(z)),
-            lambda theta: ((theta - mu) / sigma, (-log_sigma).expand_as(theta)),
+            lambda z: (mu + sigma * z, sigma.expand_as(z)),
+            lambda theta: ((theta - mu) / sigma, inv_sigma.expand_as(theta)),
             reference=mu)
 
     @property
@@ -48,31 +48,27 @@ class NormalSpace(Space):
 
 
 class UnnormalizedSpace(Space):
-    """No prior, so the chart is the identity and ``z`` is ``theta``.
+    """No prior, so no chart either. The target is whatever the model potential
+    defines, with nothing added.
 
-    The target is whatever the model potential defines, with nothing added.
+    A chart is the map a prior is standard normal in, so a space without one has
+    none to hand out, and a scheme that runs in the chart is not available here.
     Having no normalized density, it has no evidence and no entropy, and
     :meth:`prior_metric` is None so a scheme needing the prior's metric is not
-    available.
+    available either.
 
     Raises
     ------
     ValueError
-        From :meth:`prior_log_prob` and :meth:`sample`, which have no meaning
-        without a prior.
+        From :meth:`as_transform`, :meth:`prior_log_prob` and :meth:`sample`,
+        which have no meaning without a prior.
     """
-
-    def __init__(self, names, *, fixed=None, dtype=None, device=None):
-        super().__init__(names, fixed=fixed)
-        zero = torch.zeros(self.d, dtype=dtype, device=device)
-        self._transform = NormalTransform(
-            lambda z: (z, torch.zeros_like(z)),
-            lambda theta: (theta, torch.zeros_like(theta)),
-            reference=zero)
 
     @property
     def as_transform(self):
-        return self._transform
+        raise ValueError(
+            "UnnormalizedSpace carries no prior, so it has no chart. A scheme "
+            "reading the prior in its chart needs a space with one.")
 
     def prior_log_prob(self, theta: dict) -> torch.Tensor:
         raise ValueError(

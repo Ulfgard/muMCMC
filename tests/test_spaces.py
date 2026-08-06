@@ -290,12 +290,11 @@ def test_sample_recovers_the_prior_moments():
 #  UnnormalizedSpace                                                          #
 # --------------------------------------------------------------------------- #
 
-def test_unnormalized_chart_is_the_identity():
-    s = UnnormalizedSpace(NAMES)
-    z = torch.randn(4, 3)
-    m = s.as_transform.forward(z)
-    assert torch.allclose(m.mapped_point, z, atol=ATOL)
-    assert torch.allclose(m.jacobian_log_det, torch.zeros(4), atol=ATOL)
+def test_unnormalized_has_no_chart():
+    # A chart is the map a prior is standard normal in, so a space without one
+    # has none to hand out, and a scheme reading it is told so.
+    with pytest.raises(ValueError, match="no chart"):
+        UnnormalizedSpace(NAMES).as_transform
 
 
 def test_unnormalized_contributes_no_potential_and_no_metric():

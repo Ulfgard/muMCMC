@@ -18,7 +18,7 @@ import pytest
 from pyro.distributions import Normal
 
 from muMCMC.MCMCSampler import MCMCSampler
-from muMCMC.spaces import NormalSpace
+from muMCMC.spaces import ConditionalSpace, LocationScaleLayer, NormalSpace
 from muMCMC.validation.evaluation import PosteriorEvaluation, _bar_root, _bar_evidence
 
 torch.set_default_dtype(torch.float64)
@@ -84,6 +84,59 @@ def _linear_gaussian_model(x_obs, sigma):
     Sigma_post = torch.linalg.inv(torch.eye(2) + torch.outer(a, a) / sigma ** 2)
     mu_post = Sigma_post @ (a * x_obs / sigma ** 2)
     return sampler, names, mu_post, Sigma_post
+
+
+#  ---- A prior in two blocks, the second conditional on the first ---------- #
+
+_C = torch.tensor([[0.8, -0.3], [0.2, 0.5]])
+_S = torch.tensor([[0.5, 0.0], [0.25, 0.4]])
+_X_OBS, _SIGMA = 1.5, 0.4
+
+
+def _conditional_model():
+    """``theta_A ~ N(0, I)``, ``theta_B = C theta_A + S eps``, and a Gaussian
+    likelihood on ``sum(theta)``.
+
+    The prior is Gaussian jointly and does not factorize over the blocks, so the
+    space serves the joint and no marginal of it. Everything is closed form
+    here: the joint prior covariance is [[I, Cᵀ], [C, C Cᵀ + S Sᵀ]] and a
+    Gaussian likelihood keeps the posterior Gaussian, so any marginal is a block
+    of it. Returns (sampler, names, mu_post, Sigma_post, Sigma_prior).
+    """
+    names = ["a0", "a1", "b0", "b1"]
+    space = ConditionalSpace(
+        NormalSpace(names[:2]), names[2:],
+        LocationScaleLayer(lambda a: (a @ _C.mT, _S.expand(a.shape[0], 2, 2))))
+
+    const = 0.5 * math.log(2 * math.pi * _SIGMA ** 2)
+
+    def potential_fn(theta):        # U_lik = -log N(x_obs; sum(theta), sigma^2)
+        return 0.5 * (_X_OBS - theta.sum(-1)) ** 2 / _SIGMA ** 2 + const
+
+    Sbb = _C @ _C.mT + _S @ _S.mT
+    Sigma_prior = torch.cat([torch.cat([torch.eye(2), _C.mT], dim=1),
+                             torch.cat([_C, Sbb], dim=1)], dim=0)
+    h = torch.ones(4)
+    Sigma_post = torch.linalg.inv(
+        torch.linalg.inv(Sigma_prior) + torch.outer(h, h) / _SIGMA ** 2)
+    mu_post = Sigma_post @ (h * _X_OBS / _SIGMA ** 2)
+    return _Sampler(space, potential_fn), names, mu_post, Sigma_post, Sigma_prior
+
+
+def _conditional_evaluation(sampler, names, mu_post, Sigma_post, *, seed):
+    """PosteriorEvaluation on exact draws from the Gaussian posterior."""
+    g = torch.Generator().manual_seed(seed)
+    L = torch.linalg.cholesky(Sigma_post)
+    z = mu_post + torch.randn(4, 3000, 4, generator=g) @ L.T
+    return PosteriorEvaluation(sampler, {n: z[..., i] for i, n in enumerate(names)},
+                               generator=torch.Generator().manual_seed(seed + 1))
+
+
+def _marginal(mu, Sigma, idx):
+    """The Gaussian marginal over the coordinates ``idx``."""
+    i = torch.tensor(idx)
+    return torch.distributions.MultivariateNormal(
+        mu[i], covariance_matrix=Sigma[i[:, None], i])
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +318,57 @@ def test_log_posterior_marginal_correlated_predictive_block():
 
     assert torch.max(torch.abs(lp - lp_true)) < 0.1
     assert float(ess.min()) > 0.3 * 8000
+
+
+def test_log_posterior_marginal_on_a_prior_that_does_not_factorize():
+    # The block kept and the block integrated out each straddle the two halves
+    # of the prior, so neither the marginal the estimate divides by nor the one
+    # the proposal would need exists. Both are read off the joint instead.
+    sampler, names, mu_post, Sigma_post, _ = _conditional_model()
+    ev = _conditional_evaluation(sampler, names, mu_post, Sigma_post, seed=60)
+
+    keep = [0, 2]                                  # a0 and b0, one from each half
+    sd = Sigma_post.diagonal().sqrt()
+    q = {names[i]: mu_post[i] + torch.linspace(-1.2, 1.2, 6) * sd[i] for i in keep}
+    lp, ess = ev.log_posterior(q, max_marginal=4000, return_ess=True,
+                               generator=torch.Generator().manual_seed(61))
+
+    lp_true = _marginal(mu_post, Sigma_post, keep).log_prob(
+        torch.stack([q[names[i]] for i in keep], dim=-1))
+    assert torch.max(torch.abs(lp - lp_true)) < 0.05
+    assert float(ess.min()) > 0.3 * 4000
+
+
+def test_marginal_information_gain_on_a_prior_that_does_not_factorize():
+    # The marginal prior the ratio divides by is estimated from the same draws
+    # as the marginal posterior, so it is the joint prior that is read and the
+    # two errors cancel where they are shared.
+    sampler, names, mu_post, Sigma_post, Sigma_prior = _conditional_model()
+    ev = _conditional_evaluation(sampler, names, mu_post, Sigma_post, seed=62)
+
+    keep = [1, 3]                                  # a1 and b1, the other split
+    sd = Sigma_post.diagonal().sqrt()
+    q = {names[i]: mu_post[i] + torch.linspace(-1.0, 1.0, 6) * sd[i] for i in keep}
+    theta_a = torch.stack([q[names[i]] for i in keep], dim=-1)
+    ig = ev.information_gain(q, max_marginal=4000,
+                             generator=torch.Generator().manual_seed(63))
+
+    ig_true = (_marginal(mu_post, Sigma_post, keep).log_prob(theta_a)
+               - _marginal(torch.zeros(4), Sigma_prior, keep).log_prob(theta_a))
+    assert torch.max(torch.abs(ig - ig_true)) < 0.05
+
+
+def test_log_posterior_full_vector_on_a_prior_that_does_not_factorize():
+    # Every free name present takes the exact path, which reads the joint prior
+    # and needs no marginal at all.
+    sampler, names, mu_post, Sigma_post, _ = _conditional_model()
+    ev = _conditional_evaluation(sampler, names, mu_post, Sigma_post, seed=64)
+
+    theta = mu_post + 0.3 * torch.randn(5, 4, generator=torch.Generator().manual_seed(65))
+    lp = ev.log_posterior({name: theta[:, i] for i, name in enumerate(names)})
+    lp_true = torch.distributions.MultivariateNormal(
+        mu_post, covariance_matrix=Sigma_post).log_prob(theta)
+    assert torch.max(torch.abs(lp - lp_true)) < 0.05
 
 
 def test_log_posterior_marginal_requires_a_name():

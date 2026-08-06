@@ -1,28 +1,21 @@
-"""Contract tests for ``NormalTransform`` and ``ElementwiseMap``.
+"""Contract tests for ``NormalTransform`` and ``Map``.
 
 The transform is the chart every space leans on: it exposes both directions,
-each with its own diagonal Jacobian and log-determinant, and ChartRATTLE trusts
-those to match the analytic Jacobian. These tests pin that contract down.
+each with its own Jacobian and log-determinant, and ChartRATTLE trusts those to
+match the analytic Jacobian. These tests pin that contract down, for a map
+holding its Jacobian diagonal and for one holding the Jacobian in full.
 
 The transform is built from callables rather than by subclassing, so these
 construct one directly instead of going through a space.
 """
-import math
-
 import torch
 import pytest
 
-from muMCMC.spaces import ElementwiseMap, NormalTransform
-from muMCMC.spaces._transform import _LOG_SQRT_2PI
+from muMCMC.spaces import Map, NormalTransform
 
 torch.set_default_dtype(torch.float64)
 
 ATOL = 1e-10
-
-
-def _normal_log_pdf(z):
-    return -0.5 * z * z - _LOG_SQRT_2PI
-
 
 MU = torch.tensor([0.5, -1.0, 2.0])
 SIGMA = torch.tensor([1.0, 2.0, 0.3])
@@ -30,42 +23,101 @@ SIGMA = torch.tensor([1.0, 2.0, 0.3])
 
 def _affine():
     """``theta = mu + sigma z``."""
-    log_sigma = torch.log(SIGMA)
     return NormalTransform(
-        lambda z: (MU + SIGMA * z, log_sigma.expand_as(z)),
-        lambda th: ((th - MU) / SIGMA, (-log_sigma).expand_as(th)),
+        lambda z: (MU + SIGMA * z, SIGMA.expand_as(z)),
+        lambda th: ((th - MU) / SIGMA, (1.0 / SIGMA).expand_as(th)),
         reference=MU)
 
 
 # --------------------------------------------------------------------------- #
-#  ElementwiseMap                                                             #
+#  Map carrying its Jacobian diagonal                                         #
 # --------------------------------------------------------------------------- #
 
-def test_jacobian_diag_is_the_exponential_of_the_stored_log():
-    log_j = torch.tensor([[0.0, -2.0, 1.5]])
-    m = ElementwiseMap(torch.zeros(1, 3), torch.ones(1, 3), log_j)
-    assert torch.allclose(m.jacobian_diag, torch.exp(log_j), atol=ATOL)
-    assert torch.allclose(m.jacobian_log_det, log_j.sum(-1), atol=ATOL)
+def test_the_diagonal_gives_the_determinant():
+    diag = torch.tensor([[1.0, 0.25, 4.5]])
+    m = Map(torch.zeros(1, 3), torch.ones(1, 3), diag)
+    assert torch.allclose(m.jacobian_diag, diag, atol=ATOL)
+    assert torch.allclose(m.jacobian_log_det, torch.log(diag).sum(-1), atol=ATOL)
 
 
 def test_log_det_sums_over_the_coordinate_axis_only():
-    log_j = torch.randn(2, 4, 3)
-    m = ElementwiseMap(torch.zeros(2, 4, 3), torch.zeros(2, 4, 3), log_j)
+    diag = torch.rand(2, 4, 3) + 0.5
+    m = Map(torch.zeros(2, 4, 3), torch.zeros(2, 4, 3), diag)
     assert m.jacobian_log_det.shape == (2, 4)
 
 
-def test_inv_swaps_the_endpoints_and_negates_the_log_jacobian():
-    point, image, log_j = torch.randn(5, 3), torch.randn(5, 3), torch.randn(5, 3)
-    m = ElementwiseMap(point, image, log_j).inv
+def test_inv_swaps_the_endpoints_and_inverts_the_diagonal():
+    point, image = torch.randn(5, 3), torch.randn(5, 3)
+    diag = torch.rand(5, 3) + 0.5
+    m = Map(point, image, diag).inv
     assert torch.allclose(m.point, image, atol=ATOL)
     assert torch.allclose(m.mapped_point, point, atol=ATOL)
-    assert torch.allclose(m.jacobian_log_diag, -log_j, atol=ATOL)
+    assert torch.allclose(m.jacobian_diag, 1.0 / diag, atol=ATOL)
 
 
-def test_jvp_scales_elementwise():
-    log_j, v = torch.randn(4, 3), torch.randn(4, 3)
-    m = ElementwiseMap(torch.zeros(4, 3), torch.zeros(4, 3), log_j)
-    assert torch.allclose(m.jvp(v), torch.exp(log_j) * v, atol=ATOL)
+def test_a_map_on_its_diagonal_applies_itself():
+    # The diagonal is the whole Jacobian, so it answers what a matrix answers,
+    # each operation reading it in the form it is in.
+    diag = torch.rand(4, 3) + 0.5
+    m = Map(torch.zeros(4, 3), torch.zeros(4, 3), diag)
+    J = torch.diag_embed(diag)
+    v, W = torch.randn(4, 3), torch.randn(4, 2, 3)
+    assert not m.is_dense
+    assert torch.allclose(m.dense_jacobian(), J, atol=ATOL)
+    assert torch.allclose(m.jvp(v), (J @ v[..., None])[..., 0], atol=ATOL)
+    assert torch.allclose(m.pullback(W), W @ J, atol=ATOL)
+    assert torch.allclose(m.gram(), J.mT @ J, atol=ATOL)
+
+
+# --------------------------------------------------------------------------- #
+#  Map carrying the Jacobian in full                                          #
+# --------------------------------------------------------------------------- #
+
+def _dense(n=4, d=5):
+    """A map whose Jacobian is lower triangular and not diagonal."""
+    J = torch.tril(torch.randn(n, d, d)) + 2.0 * torch.eye(d)
+    return Map(torch.randn(n, d), torch.randn(n, d), J), J
+
+
+def test_log_det_reads_the_diagonal_and_not_the_rest():
+    # A triangular Jacobian has the determinant of its diagonal, which is why a
+    # density costs the same whether or not the map is diagonal.
+    m, J = _dense()
+    assert torch.allclose(m.jacobian_log_det, torch.linalg.slogdet(J)[1], atol=1e-9)
+
+
+def test_jvp_pullback_and_gram_take_the_dense_route():
+    m, J = _dense()
+    v, W = torch.randn(4, 5), torch.randn(4, 2, 5)
+    assert torch.allclose(m.jvp(v), (J @ v[..., None])[..., 0], atol=ATOL)
+    assert torch.allclose(m.pullback(W), W @ J, atol=ATOL)
+    assert torch.allclose(m.gram(), J.mT @ J, atol=ATOL)
+
+
+def test_inv_inverts_the_jacobian_it_holds():
+    m, J = _dense()
+    inv = m.inv
+    assert torch.allclose(inv.point, m.mapped_point, atol=ATOL)
+    assert torch.allclose(inv.dense_jacobian(), torch.linalg.inv(J), atol=1e-9)
+    assert torch.allclose(inv.jacobian_log_det, -m.jacobian_log_det, atol=1e-9)
+
+
+def test_the_diagonal_is_read_off_the_full_form():
+    m, J = _dense()
+    assert m.is_dense
+    diag = J.diagonal(dim1=-2, dim2=-1)
+    assert torch.allclose(m.jacobian_diag, diag, atol=ATOL)
+    assert torch.allclose(m.jacobian_log_diag, torch.log(diag.abs()), atol=ATOL)
+
+
+def test_an_elementwise_chart_carries_its_diagonal():
+    # The map is elementwise, so the diagonal is the Jacobian rather than a
+    # cheaper reading of it, and a caller wanting a matrix is handed one.
+    T = _affine()
+    m = T.forward(torch.randn(6, 3))
+    assert not m.is_dense
+    assert torch.allclose(m.dense_jacobian(), torch.diag_embed(SIGMA.expand(6, 3)),
+                          atol=ATOL)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,13 +145,16 @@ def test_forward_jacobian_matches_autograd():
     assert torch.allclose(T.forward(z.detach()).jacobian_diag, g, atol=ATOL)
 
 
-def test_metric_is_the_reciprocal_square_of_the_forward_jacobian():
-    # M = J^-T J^-1, so its pushforward J^T M J is the identity, which is what
-    # every sampler reads as the prior's metric in the chart.
+def test_the_metric_is_the_reciprocal_square_of_the_forward_jacobian():
+    # M = J^-T J^-1 is the gram of the inverse map, so its pushforward J^T M J is
+    # the identity, which is what every sampler reads as the prior's metric in
+    # the chart.
     T = _affine()
     m = T.forward(torch.randn(6, 3))
-    M = T.metric(m.mapped_point)
-    assert torch.allclose(M * m.jacobian_diag ** 2, torch.ones_like(M), atol=ATOL)
+    M = T.inverse(m.mapped_point).gram()
+    assert M.shape == (6, 3, 3)
+    J = torch.diag_embed(m.jacobian_diag)
+    assert torch.allclose(J.mT @ M @ J, torch.eye(3).expand(6, 3, 3), atol=ATOL)
 
 
 def test_arbitrary_leading_batch_axes():
@@ -131,18 +186,18 @@ def test_log_prob_is_the_density_of_the_pushed_forward_normal():
 #  Everything is supplied                                                     #
 # --------------------------------------------------------------------------- #
 
-def test_a_missing_log_jacobian_is_rejected():
+def test_a_missing_jacobian_is_rejected():
     # Nothing is differentiated numerically, so a caller who leaves a Jacobian
     # out is told at construction rather than served an approximation.
-    with pytest.raises(ValueError, match="both log"):
+    with pytest.raises(ValueError, match="both Jacobians"):
         NormalTransform(lambda z: (MU + SIGMA * z, None),
-                        lambda th: ((th - MU) / SIGMA, torch.zeros_like(th)),
+                        lambda th: ((th - MU) / SIGMA, torch.ones_like(th)),
                         reference=MU)
 
 
-def test_a_missing_inverse_log_jacobian_is_rejected():
-    with pytest.raises(ValueError, match="both log"):
-        NormalTransform(lambda z: (MU + SIGMA * z, torch.zeros_like(z)),
+def test_a_missing_inverse_jacobian_is_rejected():
+    with pytest.raises(ValueError, match="both Jacobians"):
+        NormalTransform(lambda z: (MU + SIGMA * z, torch.ones_like(z)),
                         lambda th: ((th - MU) / SIGMA, None),
                         reference=MU)
 
@@ -151,8 +206,8 @@ def test_the_forward_map_is_differentiable_to_second_order():
     # Both directions are closed forms, so the graph reaches the input. The
     # force ChartRATTLE integrates differentiates the chart Jacobian, so it is
     # the second derivative that has to survive, on a chart that has one.
-    T = NormalTransform(lambda z: (torch.exp(z), z),
-                        lambda th: (torch.log(th), -torch.log(th)),
+    T = NormalTransform(lambda z: (torch.exp(z), torch.exp(z)),
+                        lambda th: (torch.log(th), 1.0 / th),
                         reference=torch.zeros(3))
     z = torch.randn(4, 3, requires_grad=True)
     (g,) = torch.autograd.grad(T.forward(z).mapped_point.sum(), z,
@@ -160,18 +215,3 @@ def test_the_forward_map_is_differentiable_to_second_order():
     (gg,) = torch.autograd.grad(g.sum(), z)
     assert torch.allclose(g, torch.exp(z).detach(), atol=ATOL)
     assert torch.allclose(gg, torch.exp(z).detach(), atol=ATOL)
-
-
-def test_saturating_chart_keeps_the_log_jacobian_finite():
-    # The log is the stored form precisely so that a saturating value, whose
-    # Jacobian underflows, still reports a usable derivative.
-    normal_cdf = lambda z: 0.5 * (1.0 + torch.erf(z * (0.5 ** 0.5)))
-    T = NormalTransform(
-        lambda z: (normal_cdf(z), _normal_log_pdf(z)),
-        lambda th: (torch.zeros_like(th), torch.zeros_like(th)),
-        reference=torch.zeros(2))
-    m = T.forward(torch.full((1, 2), 40.0))
-    assert torch.all(m.mapped_point == 1.0)
-    assert torch.all(torch.isfinite(m.jacobian_log_diag))
-    assert float(m.jacobian_log_diag.max()) < -700.0
-    assert math.isclose(float(m.jacobian_diag.max()), 0.0, abs_tol=1e-300)
