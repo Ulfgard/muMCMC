@@ -54,6 +54,12 @@ from scipy.special import expit
 from .mixture import GaussianMixture
 
 
+def _ess(log_w: torch.Tensor) -> torch.Tensor:
+    """Kish effective sample size of log-weights ``(M, n)``, over the draw axis,
+    shape ``(M,)``."""
+    return torch.exp(2 * torch.logsumexp(log_w, 1) - torch.logsumexp(2 * log_w, 1))
+
+
 def _bar_root(W_post: torch.Tensor, W_q: torch.Tensor, *, pad: float = 1.0) -> float:
     """Solve ``Σ_pooled σ(W + b) = n1`` for ``b`` and return ``log(n1/n0) − b``.
 
@@ -268,6 +274,27 @@ class PosteriorEvaluation:
         return self._jackknife_result["corrected"] if self._jackknife else self._log_evidence
 
     @cached_property
+    def _prior_pool(self) -> GaussianMixture:
+        """A mixture fitted to prior draws, the proposal the marginal path reads
+        the prior's own shape from.
+
+        A marginal integrates the excluded block out against the conditional
+        prior, which is normally wider than the posterior the draws cover, so a
+        proposal fitted to the draws alone leaves that integral's tails
+        unsampled. The prior can be drawn from exactly; what it cannot always
+        give is the density of a block of it, which a mixture component needs.
+        So the shape is fitted rather than used directly, and being a proposal
+        the fit costs variance and never bias.
+
+        Fitted on first use, since only the marginal path reads it.
+        """
+        draws = self.space.to_free_vector(
+            self.space.sample(self._n1, generator=self._generator))
+        return GaussianMixture.fit(
+            draws.to(self._theta.dtype), self._n_components, jitter=self._jitter,
+            generator=self._generator, max_iter=self._max_iter, tol=self._tol)
+
+    @cached_property
     def entropy(self) -> float:
         """Posterior entropy ``H[p(theta|x)] = logZ − E_post[loglik] −
         E_post[log_prior]``, a plain Monte Carlo average over the draws (w.r.t.
@@ -287,8 +314,13 @@ class PosteriorEvaluation:
         With every free name present this is ``loglik(theta*) − logZ`` (the
         prior cancels). With a subset present the rest is marginalized out,
         giving the marginal information gain
-        ``log ∫ p(x|theta*_a, theta_b) p(theta_b) dtheta_b − logZ`` by the same
-        importance sampler as :meth:`log_posterior`.
+
+            log E_{p(theta_b | theta*_a)}[ p(x | theta*_a, theta_b) ] − logZ,
+
+        the expected likelihood under the conditional prior. Both the marginal
+        posterior and the marginal prior are read off the same draws, so the
+        ratio is self-normalized and their errors cancel to the extent they are
+        shared.
         """
         excluded = [name for name in self.space.free_names
                     if name not in theta_star]
@@ -297,9 +329,9 @@ class PosteriorEvaluation:
                 self.space.to_free_vector(theta_star)) - self.log_evidence
             return (ig, None) if return_ess else ig
 
-        log_post, ess = self._log_marginal_posterior(
+        log_post, log_prior_a, ess = self._log_marginal_posterior(
             theta_star, excluded, target_ess, max_marginal, prior_weight, generator)
-        ig = log_post - self.space.prior_log_prob(theta_star)
+        ig = log_post - log_prior_a
         return (ig, ess) if return_ess else ig
 
     def log_posterior(self, theta: dict, *, target_ess: Optional[float] = None,
@@ -311,11 +343,18 @@ class PosteriorEvaluation:
 
         The free names present in ``theta`` select the marginal. All names gives
         the exact full density ``loglik(theta) + log_prior(theta) − logZ``. A
-        subset gives the marginal over those names, integrating the rest out by
-        importance sampling from a mixture of the prior and the joint ``q̂``
-        conditioned on ``theta_a`` (``prior_weight`` is the mixture weight on
-        the prior). Draws are added until every query point reaches
-        ``target_ess`` or ``max_marginal`` draws are spent.
+        subset gives the marginal over those names,
+
+            p(theta_a | x) = (1/Z) ∫ p(x | theta_a, theta_b) p(theta_a, theta_b)
+                             dtheta_b,
+
+        integrating the rest out by importance sampling from a mixture of two
+        conditional proposals, one fitted to prior draws and one to the
+        posterior draws (``prior_weight`` is the mixture weight on the prior
+        one). The integrand is the joint prior times the likelihood, so no
+        marginal prior is needed, and a space whose prior does not factorize
+        over the split is served like any other. Draws are added until every
+        query point reaches ``target_ess`` or ``max_marginal`` draws are spent.
 
         Parameters
         ----------
@@ -328,8 +367,8 @@ class PosteriorEvaluation:
         max_marginal : int, optional
             Cap on importance draws. Default is the posterior draw count.
         prior_weight : float
-            Mixture weight on the prior component, in ``[0, 1]``. ``0`` is the pure
-            conditional proposal, ``1`` plain prior sampling.
+            Mixture weight on the prior-fitted component, in ``[0, 1]``. ``0`` is
+            the pure posterior-fitted proposal, ``1`` the pure prior-fitted one.
         generator : torch.Generator, optional
             RNG for the marginal draws.
         return_ess : bool
@@ -343,7 +382,7 @@ class PosteriorEvaluation:
             log_post = -value - self.log_evidence
             return (log_post, None) if return_ess else log_post
 
-        log_post, ess = self._log_marginal_posterior(
+        log_post, _, ess = self._log_marginal_posterior(
             theta, excluded, target_ess, max_marginal, prior_weight, generator)
         return (log_post, ess) if return_ess else log_post
 
@@ -351,8 +390,18 @@ class PosteriorEvaluation:
                                 target_ess: Optional[float], max_marginal: Optional[int],
                                 alpha: float, generator: Optional[torch.Generator]):
         """Marginal ``log p(theta_a|x)`` with the ``excluded`` block integrated
-        out by mixture importance sampling, drawn adaptively. Returns
-        ``(log_post, ess)``."""
+        out by mixture importance sampling, drawn adaptively.
+
+        The weights carry the joint prior at the full point rather than a
+        marginal of it, so the same draws give both
+
+            log p(theta_a | x) = logsumexp(loglik + w) − log n − logZ,
+            log p(theta_a)     = logsumexp(w)          − log n,
+
+        and a prior that does not factorize over the split costs nothing extra.
+        Returns ``(log_post, log_prior_a, ess)``, the ESS being the smaller of
+        the two the weights give.
+        """
         if not 0.0 <= alpha <= 1.0:
             raise ValueError(f"prior_weight must be in [0, 1], got {alpha}")
         free_names = self.space.free_names
@@ -363,7 +412,7 @@ class PosteriorEvaluation:
                 "log_posterior needs at least one free name in theta")
         a_names = [free_names[i] for i in a_idx]
         b_names = [free_names[i] for i in b_idx]
-        na, nb = len(a_idx), len(b_idx)
+        na = len(a_idx)
 
         M = theta[a_names[0]].shape[0]
         d = self._d
@@ -380,47 +429,46 @@ class PosteriorEvaluation:
             full[name] = theta0[name].expand(M)
         theta_a = self.space.to_free_vector(full)[:, a_t]                 # (M, |a|)
 
-        # Conditional q(theta_b | theta_a) from the pooled joint fit (itself a
-        # mixture).
+        # The two proposal components, both conditioned on theta_a: one fitted to
+        # posterior draws, which is shaped like the integrand, and one fitted to
+        # prior draws, which is shaped like the conditional prior the marginal
+        # divides by and is normally the wider of the two.
+        p_b = self._prior_pool.conditional(a_idx, b_idx, theta_a, jitter=self._jitter)
         q_b = self._q_pool.conditional(a_idx, b_idx, theta_a, jitter=self._jitter)
 
         def draw(n_prior, n_cond):
-            """One mixture batch -> (loglik, log_prior, log_qcond), each (M, n)."""
+            """One mixture batch -> (loglik, log_prior, log_p, log_q), each
+            (M, n), the prior read on the joint point."""
             blocks = []
             if n_cond > 0:
                 blocks.append(q_b.sample(n_cond, generator=generator))
             if n_prior > 0:
-                prior = self.space.sample(n_prior, generator=generator)  # shared over query points
-                full_p = {name: theta0[name].expand(n_prior) for name in a_names}
-                for name in b_names:
-                    full_p[name] = prior[name]
-                theta_bp = self.space.to_free_vector(full_p)[:, b_t]
-                blocks.append(theta_bp[None].expand(M, n_prior, nb))
+                blocks.append(p_b.sample(n_prior, generator=generator))
             theta_b = torch.cat(blocks, dim=1)                           # (M, n, |b|)
             n = theta_b.shape[1]
             theta_full = torch.empty(M, n, d, dtype=dtype, device=device)
             theta_full[..., a_t] = theta_a[:, None, :].expand(M, n, na)
             theta_full[..., b_t] = theta_b
             theta_flat = theta_full.reshape(M * n, d)
-            prior_b = self.space.prior_log_prob(
-                {name: theta_flat[:, i] for name, i in zip(b_names, b_idx)}).reshape(M, n)
+            log_prior = self.space.prior_log_prob_vector(theta_flat).reshape(M, n)
             loglik = self._tempered_loglik(theta_flat).reshape(M, n)
-            return loglik, prior_b, q_b.log_prob(theta_b)
+            return loglik, log_prior, p_b.log_prob(theta_b), q_b.log_prob(theta_b)
 
         # Accumulate mixture draws until every point reaches target_ess or the
         # cap is spent. log_qmix uses the running sampling fractions, so weights
         # stay comparable as draws pool across rounds.
         budget = self._n1 if max_marginal is None else int(max_marginal)
         target = float("inf") if target_ess is None else float(target_ess)
-        loglik = log_pi = log_qc = None
+        loglik = log_pi = log_pc = log_qc = None
         n_prior_tot = n_cond_tot = drawn = 0
         step = budget if math.isinf(target) else min(budget, 8192)
         while drawn < budget:
             n = min(step, budget - drawn)
             n_prior = int(round(alpha * n))
-            ll, lp, lq = draw(n_prior, n - n_prior)
+            ll, lpi, lp, lq = draw(n_prior, n - n_prior)
             loglik = ll if loglik is None else torch.cat([loglik, ll], 1)
-            log_pi = lp if log_pi is None else torch.cat([log_pi, lp], 1)
+            log_pi = lpi if log_pi is None else torch.cat([log_pi, lpi], 1)
+            log_pc = lp if log_pc is None else torch.cat([log_pc, lp], 1)
             log_qc = lq if log_qc is None else torch.cat([log_qc, lq], 1)
             n_prior_tot += n_prior
             n_cond_tot += n - n_prior
@@ -428,20 +476,22 @@ class PosteriorEvaluation:
 
             terms = []
             if n_prior_tot > 0:
-                terms.append(math.log(n_prior_tot / drawn) + log_pi)
+                terms.append(math.log(n_prior_tot / drawn) + log_pc)
             if n_cond_tot > 0:
                 terms.append(math.log(n_cond_tot / drawn) + log_qc)
             log_qmix = terms[0] if len(terms) == 1 else torch.logaddexp(terms[0], terms[1])
-            log_w = loglik + log_pi - log_qmix
-            ess = torch.exp(2 * torch.logsumexp(log_w, 1) - torch.logsumexp(2 * log_w, 1))
+            log_w = log_pi - log_qmix
+            # The draws serve the marginal posterior and the marginal prior, so
+            # the stopping rule follows whichever of the two is worse off.
+            ess = torch.minimum(_ess(log_w + loglik), _ess(log_w))
             if float(ess.min()) >= target:
                 break
             step *= 2
 
-        log_integral = torch.logsumexp(log_w, 1) - math.log(drawn)
-        log_post = (self.space.prior_log_prob(theta) + log_integral
+        log_prior_a = torch.logsumexp(log_w, 1) - math.log(drawn)
+        log_post = (torch.logsumexp(log_w + loglik, 1) - math.log(drawn)
                     - self.log_evidence)
-        return log_post, ess
+        return log_post, log_prior_a, ess
 
     def _tempered_loglik(self, theta: torch.Tensor) -> torch.Tensor:
         """``beta·loglik(theta) = −U(theta) − log p(theta)``, the tempered
