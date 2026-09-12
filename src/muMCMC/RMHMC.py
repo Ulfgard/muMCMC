@@ -12,12 +12,24 @@ from ._solvers import FixedPointSolver
 #                                                                             #
 #  RMHMC helpers  (implicit midpoint integrator)                              #
 #                                                                             #
-#  The unknown of the step is the whole endpoint (q_k, p_k), with the         #
-#  midpoint derived from it, so a substep is one root find in 2d rather than  #
-#  a staggered pair of solves.  Only the values F_q, F_p enter it and no      #
-#  Jacobian, so the sole gradient is the first-order dH/dq at the midpoint.   #
-#  That is also what rules the newton rule out here: DF would need the        #
-#  second derivative of H, which the model interface does not expose.         #
+#  The implicit midpoint rule on H = U + ½ pᵀG⁻¹p + ½ log det G reads, with   #
+#  qb = ½(q0 + q1), pb = ½(p0 + p1) and h the step,                           #
+#                                                                             #
+#      q1 = q0 + h G(qb)⁻¹ pb,      p1 = p0 − h ∂H/∂q(qb, pb).                #
+#                                                                             #
+#  The first equation gives pb = G(qb) dq / h with dq = q1 − q0, and at that  #
+#  pb the kinetic gradient is −Γ(qb, dq)/h² with Γ(q, v) = ∇_q ½ vᵀG(q)v, so  #
+#  p drops out and the step is one root find in d unknowns,                   #
+#                                                                             #
+#      F(q1) = G(qb) dq − ½ Γ(qb, dq) + (h²/2) ∇V(qb) − h p0 = 0,             #
+#      p1    = [G(qb) dq + ½ Γ(qb, dq)] / h − (h/2) ∇V(qb),                   #
+#                                                                             #
+#  with V = U + ½ log det G. DF = G(q0) + O(h²) + O(dq), so preconditioning   #
+#  Picard by G(q0)⁻¹ makes it a frozen-Jacobian Newton, and the residual is   #
+#  read in the G(q0)⁻¹ norm, the implied position error in the metric of the  #
+#  substep's start. The exact DF carries ∂Γ/∂q, second derivatives of the     #
+#  metric the model interface does not expose, which rules the newton rule    #
+#  out here.                                                                  #
 #                                                                             #
 #  Picard and Anderson drive the same F, so the endpoint is solver- and       #
 #  damping-independent. Only the iteration count and the stability differ.    #
@@ -51,59 +63,53 @@ def _hamiltonian(
     return U + kinetic + 0.5 * metric.log_det_metric()
 
 
-#  ---- Midpoint map -------------------------------------------------------- #
+#  ---- Midpoint terms ------------------------------------------------------ #
 
-def _midpoint_map(
-    q: torch.Tensor,
-    p: torch.Tensor,
-    q_k: torch.Tensor,
-    p_k: torch.Tensor,
-    eps,
+def _midpoint_terms(
+    q0: torch.Tensor,
+    q1: torch.Tensor,
+    eps: torch.Tensor,
     evaluate_model: Callable,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fixed-point map F(z_k) = (F_q, F_p):
+    """The two terms of the eliminated midpoint equation at qb = ½(q0 + q1),
+    dq = q1 − q0: ``G(qb) dq`` and the gradient
 
-        q_mid = ½(q + q_k)
-        p_mid = ½(p + p_k)
-        F_q   = q + (ε/2) G⁻¹(q_mid) (p + p_k)
-        F_p   = p − ε ∂H/∂q|_{q_mid, p_mid}
+        ∇S(qb),   S(qb) = (ε²/2) V(qb) − ¼ dqᵀ G(qb) dq,
+
+    which is (ε²/2) ∇V − ½ Γ(qb, dq), so the residual is ``G dq + ∇S − ε p0``
+    and the endpoint momentum ``(G dq − ∇S) / ε``. One model evaluation and
+    one backward pass, dq held fixed.
 
     Parameters
     ----------
-    q, p : torch.Tensor
-        Start-of-step position and momentum.
-    q_k, p_k : torch.Tensor
-        Current endpoint iterate.
-    eps : torch.Tensor
-        Per-chain step size, shape (N,).
+    q0, q1 : (N, d)
+        Start and endpoint iterate.
+    eps : (N,)
+        Per-chain step size.
     evaluate_model : Callable
         Maps q to (potential, metric).
     """
-    q_mid = (0.5 * (q + q_k)).detach().requires_grad_(True)   # fresh leaf
-    p_mid = 0.5 * (p + p_k)
-
+    dq = (q1 - q0).detach()
+    qb = (0.5 * (q0 + q1)).detach().requires_grad_(True)     # fresh leaf
     with torch.enable_grad():
-        potential, metric = evaluate_model(q_mid)
-        H = _hamiltonian(q_mid, p_mid, potential.value, metric)
-        # H has shape (N,) with no cross-chain coupling, so grad of the sum
+        potential, metric = evaluate_model(qb)
+        G_dq = (metric.value @ dq.unsqueeze(-1)).squeeze(-1)
+        V = potential.value + 0.5 * metric.log_det_metric()
+        S = 0.5 * eps * eps * V - 0.25 * (dq * G_dq).sum(-1)
+        # S has shape (N,) with no cross-chain coupling, so grad of the sum
         # is the per-chain gradient.
-        (dHdq,) = torch.autograd.grad(H.sum(), q_mid)
-
-    # eps is the per-chain step size (N,). Trailing axis broadcasts against
-    # the (N, d) updates.
-    e = eps.unsqueeze(-1)
-    with torch.no_grad():
-        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
-        F_p = p - e * dHdq
-    return F_q, F_p
+        (grad_S,) = torch.autograd.grad(S.sum(), qb)
+    return G_dq.detach(), grad_S
 
 
 #  ---- Implicit midpoint step ---------------------------------------------  #
 
-def _implicit_midpoint_step(q, p, eps, evaluate_model, solver, z_init=None):
-    """Solve RMHMC's implicit-midpoint equation z = F(z) for the step endpoint
-    z = (q_out, p_out), with F the midpoint map in :func:`_midpoint_map`.
+def _implicit_midpoint_step(q, p, eps, evaluate_model, solver, metric=None,
+                            q_init=None):
+    """Solve the implicit-midpoint equation for the step endpoint q1, then
+    read p1 off it (see the module header). The Picard iteration is
+    preconditioned by G(q)⁻¹, DF at dq = 0, and the residual is measured in
+    the G(q)⁻¹ norm ``max|L⁻¹ F|`` with L the Cholesky factor of G(q).
 
     Parameters
     ----------
@@ -115,25 +121,40 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, solver, z_init=None):
         Maps q to (potential, metric).
     solver : FixedPointSolver
         Owns the update rule, the tolerance and the fallback ladder.
-    z_init : (N, 2d) or None
-        Warm start. None starts from ``(q, p)``, which is also where the fallback
+    metric : TemperedMetric or None
+        The metric at ``q``. None evaluates it.
+    q_init : (N, d) or None
+        Warm start. None starts from ``q``, which is also where the fallback
         ladder restarts.
 
     Returns
     -------
     tuple
-        ``(q_out, p_out, iters, residual)``, the last two per chain.
+        ``(q_out, p_out, iters, residual)``, the last two per chain, the
+        residual in the G(q)⁻¹ norm.
     """
-    d = q.shape[-1]
+    if metric is None:
+        with torch.no_grad():
+            _, metric = evaluate_model(q)
+    L = metric.L.detach()
+    e = eps.unsqueeze(-1)
 
-    def residual_fn(z):
-        F_q, F_p = _midpoint_map(q, p, z[..., :d], z[..., d:], eps, evaluate_model)
-        return z - torch.cat([F_q, F_p], dim=-1)
+    def residual_fn(q1):
+        G_dq, grad_S = _midpoint_terms(q, q1, eps, evaluate_model)
+        return G_dq + grad_S - e * p
 
-    trivial = torch.cat([q, p], dim=-1)
-    z, iters, residual = solver.solve(
-        residual_fn, trivial if z_init is None else z_init, cold_start=trivial)
-    return z[..., :d], z[..., d:], iters, residual
+    def precond(F):                                       # G(q)⁻¹ F
+        return torch.cholesky_solve(F.unsqueeze(-1), L).squeeze(-1)
+
+    def norm_fn(F):                                       # max|L⁻¹ F|
+        return torch.linalg.solve_triangular(
+            L, F.unsqueeze(-1), upper=False).squeeze(-1).abs().amax(-1)
+
+    q1, iters, residual = solver.solve(
+        residual_fn, q if q_init is None else q_init, precond=precond,
+        cold_start=q, norm_fn=norm_fn)
+    G_dq, grad_S = _midpoint_terms(q, q1, eps, evaluate_model)
+    return q1, (G_dq - grad_S) / e, iters, residual
 
 
 # =========================================================================== #
@@ -143,8 +164,8 @@ def _implicit_midpoint_step(q, p, eps, evaluate_model, solver, z_init=None):
 #  ``U`` and ``metric`` are configuration-bound objects that carry their      #
 #  own temperature and retemper themselves under ``reorder``, so the          #
 #  state stays agnostic to tempering.  ``max_residual`` and ``fp_iters``      #
-#  are integrator diagnostics bound to the slot. The trajectory               #
-#  accumulators are reset by ``init`` and ``accept`` and carried forward      #
+#  are integrator diagnostics bound to the slot. The warm-start               #
+#  displacements are reset by ``init`` and ``accept`` and carried forward     #
 #  by ``step``.                                                               #
 #                                                                             #
 # =========================================================================== #
@@ -162,21 +183,23 @@ class RMHMCState:
         Position and momentum.
     U : TemperedAffine or None
         Potential at ``q`` (``U.value`` is the ``(N,)`` energy). Set at
-        ``init`` / ``accept``, ``None`` after ``step``.
+        ``init`` / ``accept`` and by ``integrate`` at its endpoint.
     metric : TemperedMetric or None
-        Metric at ``q``. Set at ``init`` / ``accept``, ``None`` after ``step``.
+        Metric at ``q``. Set with ``U``; ``integrate`` preconditions the next
+        substep's solve by it.
+    dq, dq_prev : (N, d) or None
+        Last two converged position displacements, which warm-start the next
+        substep's solve by quadratic extrapolation when the sampler's
+        ``warm_start`` is on. None at a trajectory start (dropped by accept).
     """
 
-    def __init__(self, q, p=None, U=None, metric=None, dz=None, dz_prev=None):
+    def __init__(self, q, p=None, U=None, metric=None, dq=None, dq_prev=None):
         self.q = q
         self.p = p
         self.U = U
         self.metric = metric
-        # Last two converged endpoint displacements (N, 2d), used to warm-start
-        # the next substep's solve by quadratic extrapolation. None at a
-        # trajectory start (dropped by accept).
-        self.dz = dz
-        self.dz_prev = dz_prev
+        self.dq = dq
+        self.dq_prev = dq_prev
 
     def reorder(self, perm):
         """Permute the batch elements by ``perm`` (an ``(N,)`` long index
@@ -187,8 +210,8 @@ class RMHMCState:
             p       = None if self.p is None else self.p[perm],
             U       = None if self.U is None else self.U.reorder(perm),
             metric  = None if self.metric is None else self.metric.reorder(perm),
-            dz      = None if self.dz is None else self.dz[perm],
-            dz_prev = None if self.dz_prev is None else self.dz_prev[perm],
+            dq      = None if self.dq is None else self.dq[perm],
+            dq_prev = None if self.dq_prev is None else self.dq_prev[perm],
         )
 
     def select_accepted(self, accepted, other):
@@ -244,15 +267,22 @@ class RMHMC(HamiltonianSampler):
     fp_max_iter : int
         Maximum fixed-point iterations per substep. Default 100.
     fp_tol : float
-        Convergence tolerance for fixed-point iteration (max norm).
+        Convergence tolerance for the position solve, on the G(q0)⁻¹ norm of
+        the residual, which is the position error in the metric of the
+        substep's start. Default 1e-8.
     solver : str
-        Fixed-point solver: ``"picard"`` (default) or ``"anderson"``. Newton is
-        rejected, since the midpoint residual's Jacobian is not available here.
+        Fixed-point solver: ``"picard"`` (default) or ``"anderson"``, both
+        preconditioned by G(q0)⁻¹. Newton is rejected, since the residual's
+        Jacobian carries second derivatives of the metric, which are not
+        available here.
+    warm_start : bool
+        Start each substep's solve by extrapolating the endpoint from the
+        last two displacements rather than from ``q0``. Changes the iteration
+        count only, not the fixed point. Default False.
     anderson_history : int or None
         History length ``m`` for the Anderson solver (ignored for Picard).
-        ``None`` (default) resolves per-solve to the dimension of the solve,
-        which here is ``2 dim(q)`` since the unknown is the endpoint ``(q, p)``.
-        Must be at least 1 if given.
+        ``None`` (default) resolves per-solve to ``dim(q)``, the dimension of
+        the solve. Must be at least 1 if given.
     damping : float
         Under-relaxation factor β ∈ (0, 1] shared by both solvers.
         Default 1.0 (undamped).
@@ -302,6 +332,7 @@ class RMHMC(HamiltonianSampler):
         fp_max_iter: int = 100,
         fp_tol: float = 1e-8,
         solver: str = "picard",
+        warm_start: bool = False,
         anderson_history: int = None,
         damping: float = 1.0,
         fallback_damping: Tuple[float, ...] = (0.5, 0.25),
@@ -318,7 +349,7 @@ class RMHMC(HamiltonianSampler):
             raise ValueError(
                 f"solver {solver!r} needs the Jacobian of the midpoint residual, "
                 f"which carries second derivatives of the metric and is not "
-                f"available cheaply here. Use 'picard' or 'anderson'.")
+                f"available here. Use 'picard' or 'anderson'.")
 
         # The adapters work on the log step size, so step_size is its exponential.
         log_eps = math.log(step_size)
@@ -332,13 +363,16 @@ class RMHMC(HamiltonianSampler):
                          step_normalization=step_normalization)
 
         self._fp_tol = fp_tol
+        self.warm_start = warm_start
 
-        # Solver diagnostics. Each transition contributes its worst substep;
-        # the means are then over transitions.
+        # Solver diagnostics. ``residual`` and ``fp_iters`` take each transition's
+        # worst substep, ``fp_iters_total`` the transition's substeps summed; the
+        # means are then over transitions.
         self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
         self.register_diagnostic("residual_max",  lambda: self._residual_max)
         self.register_diagnostic("fp_iters_mean", lambda: self._fp_iters_sum / max(self._step, 1))
         self.register_diagnostic("fp_iters_max",  lambda: self._fp_iters_max)
+        self.register_diagnostic("fp_iters_total", lambda: self._fp_iters_total / max(self._step, 1))
         self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
     def build_initial_state(self, q):
@@ -348,6 +382,7 @@ class RMHMC(HamiltonianSampler):
         zeros = torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
         self._step_residual = zeros.clone()
         self._step_iters    = zeros.clone()
+        self._step_iters_total = zeros.clone()
         with torch.no_grad():
             U, metric = self.evaluate_model(q)
         return RMHMCState(q, U=U, metric=metric)
@@ -360,44 +395,53 @@ class RMHMC(HamiltonianSampler):
         zeros = torch.zeros(N, dtype=state.q.dtype, device=state.q.device)
         self._step_residual = zeros.clone()
         self._step_iters    = zeros.clone()
+        self._step_iters_total = zeros.clone()
         state.p = state.metric.sample_momentum()
         return state
 
     def integrate(self, state, step_size):
         """One implicit-midpoint substep at ``step_size``, tracking the worst
         fixed-point residual and iteration count over the transition's substeps
-        (read by :meth:`acceptance_delta` and :meth:`adapt`).
+        and their total (read by :meth:`acceptance_delta` and :meth:`adapt`).
 
-        The solve is warm-started by extrapolating the endpoint from the last
-        two converged displacements. The extrapolation is quadratic in general,
-        linear on the second substep and trivial on the first. The guess only
-        changes the iteration count and not the fixed point, so neither the map
-        nor detailed balance is affected.
-        The displacements reset per trajectory (``accept`` builds a fresh state
-        without them)."""
-        z_start = torch.cat([state.q, state.p], dim=-1)
-        if state.dz is None:
-            z_init = None                                       # first substep
-        elif state.dz_prev is None:
-            z_init = z_start + state.dz                         # linear
-        else:
-            z_init = z_start + 2.0 * state.dz - state.dz_prev   # quadratic
+        The solve is preconditioned by the metric at the start, ``state.metric``
+        (evaluated if absent). The endpoint's potential and metric are evaluated
+        on the way out, so the next substep has its preconditioner and
+        :meth:`acceptance_delta` its energy.
+
+        With ``warm_start`` the solve starts by extrapolating the endpoint from
+        the last two converged displacements: quadratic in general, linear on
+        the second substep and trivial on the first. The guess only changes the
+        iteration count and not the fixed point, so neither the map nor
+        detailed balance is affected. The displacements reset per trajectory
+        (``accept`` builds a fresh state without them)."""
+        q_init = None                                           # from q
+        if self.warm_start and state.dq is not None:
+            if state.dq_prev is None:
+                q_init = state.q + state.dq                         # linear
+            else:
+                q_init = state.q + 2.0 * state.dq - state.dq_prev   # quadratic
         q, p, fp_it, residual = _implicit_midpoint_step(
             state.q, state.p, step_size, self.evaluate_model, self._solver,
-            z_init=z_init)
+            metric=state.metric, q_init=q_init)
         it = fp_it.to(step_size.dtype)
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters    = torch.maximum(self._step_iters, it)
-        dz = torch.cat([q, p], dim=-1) - z_start
-        return RMHMCState(q, p, dz=dz, dz_prev=state.dz)
+        self._step_iters_total = self._step_iters_total + it
+        with torch.no_grad():
+            U, metric = self.evaluate_model(q)
+        return RMHMCState(q, p, U=U, metric=metric,
+                          dq=q - state.q, dq_prev=state.dq)
 
     def acceptance_delta(self, new, old):
         """``delta_H = H(new) - H(old)``, forced to +inf where the trajectory's
         fixed-point solve did not converge (max residual over ``fp_tol``): a
         non-converged step is not a valid proposal and must be rejected even if
-        its energy change is small. Evaluates the endpoint potential/metric."""
-        with torch.no_grad():
-            new.U, new.metric = self.evaluate_model(new.q)
+        its energy change is small. Evaluates the endpoint potential/metric
+        where :meth:`integrate` has not already."""
+        if new.U is None or new.metric is None:
+            with torch.no_grad():
+                new.U, new.metric = self.evaluate_model(new.q)
         H_new = _hamiltonian(new.q, new.p, new.U.value, new.metric)   # (N,)
         H_old = _hamiltonian(old.q, old.p, old.U.value, old.metric)   # (N,)
         delta = H_new - H_old
@@ -406,6 +450,7 @@ class RMHMC(HamiltonianSampler):
         self._residual_max = torch.maximum(self._residual_max, self._step_residual)
         self._fp_iters_sum = self._fp_iters_sum + self._step_iters
         self._fp_iters_max = torch.maximum(self._fp_iters_max, self._step_iters)
+        self._fp_iters_total = self._fp_iters_total + self._step_iters_total
         solve_failed = self._step_residual > self._fp_tol
         return torch.where(solve_failed, delta.new_full((), float("inf")), delta)
 
@@ -437,4 +482,5 @@ class RMHMC(HamiltonianSampler):
         self._residual_max = zeros.clone()
         self._fp_iters_sum = zeros.clone()
         self._fp_iters_max = zeros.clone()
+        self._fp_iters_total = zeros.clone()
 

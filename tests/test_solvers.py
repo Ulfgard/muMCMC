@@ -255,6 +255,44 @@ def test_preconditioner_leaves_the_root_alone():
     assert torch.all(pre.iters == 1) and int(bare.iters.max()) > 1
 
 
+def test_norm_fn_sets_the_convergence_test_and_the_reported_residual():
+    # The tolerance is checked against norm_fn, so scaling the norm moves the
+    # stopping point and the returned residual reads in that norm. The root is
+    # untouched.
+    torch.manual_seed(3)
+    d = 3
+    M = torch.eye(d) + 0.25 * torch.randn(d, d)
+    b = torch.randn(2, d)
+    plain, _ = _linear_system(M, b)
+    s = FixedPointSolver("picard", max_iter=400, tol=1e-6)
+
+    bare = s.solve(plain, torch.zeros(2, d))
+    loose = s.solve(plain, torch.zeros(2, d),
+                    norm_fn=lambda r: 1e-3 * r.abs().amax(-1))
+    tight = s.solve(plain, torch.zeros(2, d),
+                    norm_fn=lambda r: 1e3 * r.abs().amax(-1))
+
+    exact = torch.linalg.solve(M, b.transpose(-2, -1)).transpose(-2, -1)
+    assert torch.all(loose.iters < bare.iters) and torch.all(bare.iters < tight.iters)
+    assert torch.all(loose.residual < 1e-6) and torch.all(tight.residual < 1e-6)
+    assert torch.allclose(loose.residual, 1e-3 * (plain(loose.z)).abs().amax(-1))
+    assert torch.allclose(tight.z, exact, atol=1e-8)
+
+
+def test_norm_fn_reaches_the_fallback_ladder():
+    # Rows that fail under the base damping are retried, and the retry is held
+    # to the same norm as the first pass.
+    r = _rotation_system(1.5, torch.tensor([[0.5, -0.2]]))
+    z0 = torch.zeros(1, 2)
+    scaled = lambda res: 10.0 * res.abs().amax(-1)
+    out = FixedPointSolver("picard", max_iter=80, tol=1e-10,
+                           fallback_damping=(0.3,), fallback_iter_scale=6
+                           ).solve(r, z0, norm_fn=scaled)
+    assert torch.all(out.residual < 1e-10)
+    assert torch.allclose(out.residual, scaled(r(out.z)))
+    assert int(out.iters.max()) > 80                 # paid for both passes
+
+
 @pytest.mark.parametrize("kwargs, match", [
     ({"kind": "secant"}, "unknown solver"),
     ({"damping": 0.0}, "damping"),

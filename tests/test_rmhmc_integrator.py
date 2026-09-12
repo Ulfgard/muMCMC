@@ -4,28 +4,32 @@ Built from the lowest level upward so each layer rests on a verified one:
 
 1. ``_hamiltonian``  -- the value H = U + 1/2 p^T G^-1 p + 1/2 log det G, checked
    against dense linear algebra.
-2. ``_midpoint_map`` -- the fixed-point map F(z_k).  Its only gradient is
-   dH/dq at the midpoint; we verify both the position update formula and that
-   gradient against an *independent* finite difference of H.  The test model has
-   genuine q-dependence in BOTH the likelihood and the metric, so the gradient
-   exercises the metric's log-det and kinetic q-terms (a metric that were
-   silently detached would fail the finite-difference check).
-3. ``_implicit_midpoint_step`` -- the Picard solve: the returned endpoint must
-   satisfy the implicit-midpoint equations, per-chain convergence is
-   independent, the step is time-reversible, and it preserves phase-space volume
-   and the symplectic form (finite-difference Jacobian).
+2. The oracle ``_midpoint_map`` -- the implicit-midpoint equations on (q, p),
+   written here independently of the integrator, which solves them with p
+   eliminated. Its only gradient is dH/dq at the midpoint; we verify both the
+   position update formula and that gradient against a finite difference of H.
+   The test model has genuine q-dependence in BOTH the likelihood and the
+   metric, so the gradient exercises the metric's log-det and kinetic q-terms.
+   ``_midpoint_terms`` -- the integrator's own gradient, (eps^2/2) grad V minus
+   half the metric's quadratic term, checked against a finite difference too.
+3. ``_implicit_midpoint_step`` -- the preconditioned Picard solve: the returned
+   endpoint must satisfy the (q, p) implicit-midpoint equations, per-chain
+   convergence is independent, the step is time-reversible, and it preserves
+   phase-space volume and the symplectic form (finite-difference Jacobian).
 4. The integrator property that motivates the whole scheme: on a quadratic
    Hamiltonian (Gaussian target, *constant* metric) the implicit midpoint rule
    conserves H *exactly* -- to the fixed-point tolerance, independent of the step
    size -- because it preserves quadratic invariants.
 """
+import math
+
 import torch
 import pytest
 
 from muMCMC.RMHMC import (
     RMHMC,
     _hamiltonian,
-    _midpoint_map,
+    _midpoint_terms,
     _implicit_midpoint_step,
 )
 from muMCMC._solvers import FixedPointSolver
@@ -75,6 +79,36 @@ def model_gauss_const(theta):
     return U, B_CONST.expand(*theta.shape[:-1], n, n)
 
 
+def _midpoint_map(q, p, q_k, p_k, eps, evaluate_model):
+    """Oracle: the implicit-midpoint fixed-point map F(z_k) = (F_q, F_p) on the
+    endpoint z_k = (q_k, p_k),
+
+        q_mid = (q + q_k)/2,  p_mid = (p + p_k)/2
+        F_q   = q + (eps/2) G(q_mid)^-1 (p + p_k)
+        F_p   = p - eps dH/dq|_(q_mid, p_mid),
+
+    whose fixed point is the step endpoint. Independent of the integrator, which
+    eliminates p from these equations before solving."""
+    q_mid = (0.5 * (q + q_k)).detach().requires_grad_(True)
+    p_mid = 0.5 * (p + p_k)
+    with torch.enable_grad():
+        potential, metric = evaluate_model(q_mid)
+        H = _hamiltonian(q_mid, p_mid, potential.value, metric)
+        (dHdq,) = torch.autograd.grad(H.sum(), q_mid)
+    e = eps.unsqueeze(-1)
+    with torch.no_grad():
+        F_q = q + (e / 2.0) * metric.inv_metric_times_vec(p + p_k)
+        F_p = p - e * dHdq
+    return F_q, F_p
+
+
+def _assert_fixed_point(q, p, q1, p1, eps, ev, atol=1e-8):
+    """The endpoint satisfies the (q, p) implicit-midpoint equations."""
+    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
+    assert torch.allclose(q1, F_q, atol=atol)
+    assert torch.allclose(p1, F_p, atol=atol)
+
+
 # ========================================================================== #
 #  1. _hamiltonian                                                           #
 # ========================================================================== #
@@ -106,7 +140,7 @@ def test_hamiltonian_ignores_position_argument():
 
 
 # ========================================================================== #
-#  2. _midpoint_map                                                          #
+#  2. The oracle, and the integrator's midpoint terms                       #
 # ========================================================================== #
 
 def _random_phase(N, seed):
@@ -154,6 +188,50 @@ def test_midpoint_map_momentum_gradient_matches_finite_difference():
     assert torch.allclose(dHdq_used, dHdq_fd, atol=1e-6)
 
 
+def test_midpoint_terms_match_finite_difference():
+    # G(qb) dq is a plain matvec; the gradient term is the derivative of
+    # S(qb) = (eps^2/2) V(qb) - (1/4) dq^T G(qb) dq at fixed dq, with
+    # V = U + (1/2) log det G, which is where the metric's q-dependence and the
+    # 1/2 in front of Gamma enter. Both against an independent evaluation.
+    ev = make_eval(model_qdep)
+    q0, q1, _, _ = _random_phase(2, seed=8)
+    eps = torch.tensor([0.2, 0.5])
+    G_dq, grad_S = _midpoint_terms(q0, q1, eps, ev)
+
+    dq, qb = q1 - q0, 0.5 * (q0 + q1)
+    G = model_qdep(qb)[1]
+    assert torch.allclose(G_dq, (G @ dq.unsqueeze(-1)).squeeze(-1), atol=1e-12)
+
+    def S_of(x):
+        potential, m = ev(x)
+        Gx = model_qdep(x)[1]
+        V = potential.value + 0.5 * torch.logdet(Gx)
+        return 0.5 * eps * eps * V - 0.25 * torch.einsum("ni,nij,nj->n", dq, Gx, dq)
+
+    h = 1e-5
+    fd = torch.zeros(2, D)
+    for j in range(D):
+        xp = qb.clone(); xp[:, j] += h
+        xm = qb.clone(); xm[:, j] -= h
+        fd[:, j] = (S_of(xp) - S_of(xm)) / (2 * h)
+    assert torch.allclose(grad_S, fd, atol=1e-6)
+
+
+def test_midpoint_terms_are_the_eliminated_midpoint_equations():
+    # Eliminating p: any q1 is the endpoint from the start momentum
+    # p0 = (G dq + grad S)/eps, the root of the residual, and the momentum the
+    # integrator reads off it is p1 = (G dq - grad S)/eps. The oracle must
+    # then hold (q1, p1) fixed from (q0, p0).
+    ev = make_eval(model_qdep)
+    q0, _, q1, _ = _random_phase(3, seed=9)
+    eps = torch.full((3,), 0.3)
+    e = eps.unsqueeze(-1)
+    G_dq, grad_S = _midpoint_terms(q0, q1, eps, ev)
+    p0 = (G_dq + grad_S) / e
+    p1 = (G_dq - grad_S) / e
+    _assert_fixed_point(q0, p0, q1, p1, eps, ev, atol=1e-10)
+
+
 # ========================================================================== #
 #  3. _implicit_midpoint_step                                               #
 # ========================================================================== #
@@ -163,12 +241,57 @@ def test_step_endpoint_satisfies_implicit_midpoint_equations():
     q, p, _, _ = _random_phase(3, seed=4)
     eps = torch.full((3,), 0.2)
     q1, p1, iters, residual = _implicit_midpoint_step(q, p, eps, ev, _fp("picard", max_iter=200, tol=1e-12))
-    # the converged endpoint is a fixed point of the midpoint map
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
-    assert torch.allclose(q1, F_q, atol=1e-8)
-    assert torch.allclose(p1, F_p, atol=1e-8)
+    # the converged endpoint is a fixed point of the (q, p) midpoint map
+    _assert_fixed_point(q, p, q1, p1, eps, ev)
     assert torch.all(residual < 1e-8)
     assert iters.shape == (3,) and residual.shape == (3,)
+
+
+def test_step_takes_the_start_metric_as_its_preconditioner():
+    # Passing the metric at q reproduces the step that evaluates it itself, and
+    # a warm start lands on the same endpoint, changing only the iteration
+    # count.
+    ev = make_eval(model_qdep)
+    q, p, _, _ = _random_phase(3, seed=4)
+    eps = torch.full((3,), 0.2)
+    _, metric = ev(q)
+    solver = _fp("picard", max_iter=200, tol=1e-12)
+    cold = _implicit_midpoint_step(q, p, eps, ev, solver)
+    given = _implicit_midpoint_step(q, p, eps, ev, solver, metric=metric)
+    assert torch.equal(cold[0], given[0]) and torch.equal(cold[1], given[1])
+    assert torch.equal(cold[2], given[2])
+
+    warm = _implicit_midpoint_step(q, p, eps, ev, solver, q_init=cold[0])
+    assert torch.allclose(warm[0], cold[0], atol=1e-10)
+    assert torch.allclose(warm[1], cold[1], atol=1e-10)
+    assert torch.all(warm[2] < cold[2])
+
+
+def test_preconditioned_picard_converges_at_second_order_in_the_step():
+    # Preconditioned by G(q0), the iteration is a frozen-Jacobian Newton whose
+    # contraction is O(eps^2): on the constant-metric quadratic model it is
+    # exactly (eps^2/4) B^-1 A, so the iteration count at eps grows only
+    # slowly, and a halved step converges in a fraction of the iterations that
+    # an O(eps) contraction would need.
+    ev = make_eval(model_gauss_const)
+    torch.manual_seed(16)
+    q = torch.randn(1, D)
+    _, metric = ev(q)
+    p = metric.sample_momentum()
+    solver = _fp("picard", max_iter=200, tol=1e-10)
+    rho = float(torch.linalg.eigvals(torch.linalg.solve(B_CONST, A_QUAD)).real.max())
+
+    def iters_at(eps_val):
+        _, _, it, r = _implicit_midpoint_step(q, p, torch.full((1,), eps_val), ev, solver)
+        assert float(r) < 1e-10
+        return int(it)
+
+    for eps_val in (0.4, 0.8):
+        contraction = 0.25 * eps_val * eps_val * rho
+        assert contraction < 1.0
+        # a linear contraction c reaches tol from O(1) in ~ log(tol)/log(c)
+        expected = math.log(1e-10) / math.log(contraction)
+        assert iters_at(eps_val) <= expected + 3
 
 
 def test_step_per_chain_convergence_is_independent():
@@ -299,9 +422,7 @@ def test_anderson_endpoint_satisfies_implicit_midpoint_equations():
     q, p, _, _ = _random_phase(3, seed=12)
     eps = torch.full((3,), 0.25)
     q1, p1, _, residual = _implicit_midpoint_step(q, p, eps, ev, _fp("anderson", max_iter=200, tol=1e-12))
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
-    assert torch.allclose(q1, F_q, atol=1e-8)
-    assert torch.allclose(p1, F_p, atol=1e-8)
+    _assert_fixed_point(q, p, q1, p1, eps, ev)
     assert torch.all(residual < 1e-8)
 
 
@@ -336,9 +457,9 @@ def test_anderson_solves_linear_map_faster_than_picard():
 
 
 def test_anderson_default_history_is_the_solve_dimension():
-    # A None history resolves to the row dimension, which here is 2 dim(q) since
-    # the unknown is the endpoint (q, p). Checked behaviourally: an explicit
-    # 2 dim(q) has to reproduce the default exactly.
+    # A None history resolves to the row dimension, which here is dim(q) since
+    # the unknown is the endpoint position. Checked behaviourally: an explicit
+    # dim(q) has to reproduce the default exactly.
     ev = make_eval(model_qdep)
     q, p, _, _ = _random_phase(2, seed=15)
     eps = torch.full((2,), 0.3)
@@ -347,7 +468,7 @@ def test_anderson_default_history_is_the_solve_dimension():
                            anderson_history=None))
     named = _implicit_midpoint_step(
         q, p, eps, ev, _fp("anderson", max_iter=200, tol=1e-12,
-                           anderson_history=2 * D))
+                           anderson_history=D))
     assert torch.equal(auto[2], named[2])              # same iteration counts
     assert torch.allclose(auto[0], named[0], atol=1e-12)
     assert torch.all(auto[3] < 1e-10)
@@ -363,15 +484,15 @@ def _damped(kind, beta, **kw):
 
 
 def test_damping_rescues_a_step_size_where_undamped_diverges():
-    # Constant metric + quadratic potential => the iteration Jacobian is (to
-    # leading order) block off-diagonal with purely imaginary eigenvalues
-    # ±i(eps/2)sqrt(eig(G^-1 H)).  Here lambda_max(B_CONST^-1 A_QUAD) ~ 1.58, so
-    # the undamped (beta=1) iteration has spectral radius > 1 for eps=1.8 and
-    # cannot converge, while under-relaxation (beta=0.5) pulls it back inside
-    # the unit circle.  Same eps, same solver, only beta differs.
+    # Constant metric + quadratic potential => the preconditioned iteration
+    # matrix is -(eps^2/4) B^-1 A, with real negative eigenvalues. Here
+    # lambda_max(B_CONST^-1 A_QUAD) ~ 1.58, so the undamped (beta=1) iteration
+    # has spectral radius ~1.28 for eps=1.8 and cannot converge, while
+    # under-relaxation (beta=0.5) maps the spectrum to 1 - 0.5(1 + mu), inside
+    # the unit circle. Same eps, same solver, only beta differs.
     #
     # Picard only. A constant metric with a quadratic potential makes the
-    # midpoint map affine in z, so Anderson at the default history of dim(z)
+    # residual affine in q, so Anderson at the default history of dim(q)
     # solves it directly and damping cannot change the outcome.
     solver = "picard"
     ev = make_eval(model_gauss_const)
@@ -387,9 +508,7 @@ def test_damping_rescues_a_step_size_where_undamped_diverges():
     assert float(res_undamped) > 1e-9                 # beta=1: does not converge
     assert float(res_damped) < 1e-9                   # beta<1: converges
     # ...and to a genuine fixed point of the (beta-independent) midpoint map.
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
-    assert torch.allclose(q1, F_q, atol=1e-8)
-    assert torch.allclose(p1, F_p, atol=1e-8)
+    _assert_fixed_point(q, p, q1, p1, eps, ev)
 
 
 @pytest.mark.parametrize("solver", ["picard", "anderson"])
@@ -427,9 +546,7 @@ def test_fallback_ladder_rescues_a_step_where_the_base_solver_diverges():
 
     assert float(r_base) > 1e-9                        # base alone: does not converge
     assert float(r_lad) < 1e-9                         # ladder: rescued
-    F_q, F_p = _midpoint_map(q, p, q1, p1, eps, ev)
-    assert torch.allclose(q1, F_q, atol=1e-8)
-    assert torch.allclose(p1, F_p, atol=1e-8)
+    _assert_fixed_point(q, p, q1, p1, eps, ev)
 
 
 def test_fallback_only_touches_unconverged_chains():

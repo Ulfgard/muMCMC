@@ -155,7 +155,10 @@ def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
 
     preconditioned by G_M(q0) = A_prior + beta W0^T W0, whose Cholesky factor is
     ``chol_G``. ``q, psi, W`` are the q0 quantities and ``rhs`` is
-    ``h p0 - (h^2/2) grad V(q0)``. Returns a SolveResult.
+    ``h p0 - (h^2/2) grad V(q0)``. Returns a SolveResult whose residual is the
+    G_M(q0)^-1 norm of F, ``max|L^-1 F|``: as DF ~ G_M(q0), that is the implied
+    position error measured in the metric of the substep's start, so one
+    ``fp_tol`` means the same accuracy whatever the scale of the chart.
 
     The solver's ``needs_jacobian`` picks which residual it gets: the value alone,
     or the value with DF(q1) = A_prior + beta W0^T W(q1), which costs a tangent
@@ -190,9 +193,15 @@ def _solve_rattle_step(constraint, q, psi, W, A_prior, beta_col, beta_mat,
     def precond(F):                                       # G_M(q0)⁻¹ F
         return torch.cholesky_solve(F.unsqueeze(-1), chol_G).squeeze(-1)
 
+    chol = chol_G.detach()
+
+    def norm_fn(F):                                       # max|L⁻¹ F|
+        return torch.linalg.solve_triangular(
+            chol, F.unsqueeze(-1), upper=False).squeeze(-1).abs().amax(-1)
+
     if solver.needs_jacobian:
-        return solver.solve(residual_and_jacobian, q_init)
-    return solver.solve(residual_fn, q_init, precond=precond)
+        return solver.solve(residual_and_jacobian, q_init, norm_fn=norm_fn)
+    return solver.solve(residual_fn, q_init, precond=precond, norm_fn=norm_fn)
 
 
 #  ---- Chain state --------------------------------------------------------- #
@@ -220,7 +229,8 @@ class ChartRATTLEState:
     grad_V : (N, n) or None
         Force ∇V(q).
     dq : (N, n) or None
-        Last displacement, warm-starts the next solve.
+        Last displacement, warm-starts the next solve when the sampler's
+        ``warm_start`` is on.
     """
 
     def __init__(self, q, p=None, U=None, metric=None, psi=None, W=None,
@@ -281,9 +291,15 @@ class ChartRATTLE(HamiltonianSampler):
     fp_max_iter : int
         Maximum position-solve iterations per substep. Default 100.
     fp_tol : float
-        Convergence tolerance for the position solve (max norm of F). Default 1e-8.
+        Convergence tolerance for the position solve, on the G_M(q0)⁻¹ norm of
+        F, which is the position error in the metric of the substep's start.
+        Default 1e-8.
     solver : str
         Position solver: ``"picard"`` (default), ``"anderson"`` or ``"newton"``.
+    warm_start : bool
+        Start each substep's position solve from the previous substep's
+        displacement rather than from the substep's own start. Changes the
+        iteration count only, not the root. Default False.
     anderson_history : int or None
         History length for the Anderson solver, ignored by the others. None
         resolves per-solve to n.
@@ -319,6 +335,7 @@ class ChartRATTLE(HamiltonianSampler):
         fp_max_iter: int = 100,
         fp_tol: float = 1e-8,
         solver: str = "picard",
+        warm_start: bool = False,
         anderson_history: int = None,
         damping: float = 1.0,
         divergence_threshold: float = 100.0,
@@ -339,11 +356,16 @@ class ChartRATTLE(HamiltonianSampler):
         self.x = x
         self._chart = _ChartInNormal(layer, x, space.as_transform)
         self._fp_tol = fp_tol
+        self.warm_start = warm_start
 
+        # Solver diagnostics. ``residual`` and ``fp_iters`` take each transition's
+        # worst substep, ``fp_iters_total`` the transition's substeps summed; the
+        # means are then over transitions.
         self.register_diagnostic("residual_mean", lambda: self._residual_sum / max(self._step, 1))
         self.register_diagnostic("residual_max", lambda: self._residual_max)
         self.register_diagnostic("fp_iters_mean", lambda: self._fp_iters_sum / max(self._step, 1))
         self.register_diagnostic("fp_iters_max", lambda: self._fp_iters_max)
+        self.register_diagnostic("fp_iters_total", lambda: self._fp_iters_total / max(self._step, 1))
         self.register_logging("|r|", lambda: "{:.2e}".format(float(self._step_residual.max())))
 
     # ---- model evaluation (the extension point) ---------------------------- #
@@ -473,6 +495,7 @@ class ChartRATTLE(HamiltonianSampler):
         zeros = torch.zeros(state.q.shape[0], dtype=state.q.dtype, device=state.q.device)
         self._step_residual = zeros.clone()
         self._step_iters = zeros.clone()
+        self._step_iters_total = zeros.clone()
         (state.U, state.metric, state.psi, state.W,
          state.grad_V) = self.evaluate_model(state.q, grad=True)
         state.p = state.metric.sample_momentum()
@@ -489,9 +512,10 @@ class ChartRATTLE(HamiltonianSampler):
             p1 = (1/h)[M(q1 − q0) − β W1ᵀ(ψ1 − ψ0)] − (h/2) ∇V(q1),
 
         with V = U + ½ log det G_M and M the prior metric. Tracks the worst
-        position-solve residual and iteration count over the batch. The solve is
-        warm-started by the previous displacement, which changes only the
-        iteration count, not the fixed point."""
+        position-solve residual and iteration count over the transition's
+        substeps, and their total. With ``warm_start`` the solve starts from
+        the previous displacement, which changes only the iteration count, not
+        the fixed point."""
         h = step_size.unsqueeze(-1)                        # (N, 1)
         beta_col = broadcast_beta(self.beta, 1)
         beta_mat = broadcast_beta(self.beta, 2)
@@ -499,7 +523,7 @@ class ChartRATTLE(HamiltonianSampler):
 
         rhs = h * state.p - 0.5 * h * h * state.grad_V
         q_init = state.q
-        if state.dq is not None:
+        if self.warm_start and state.dq is not None:
             q_init = state.q + state.dq
         q, iters, residual = _solve_rattle_step(
             self._chart, state.q, state.psi, state.W, A_prior, beta_col,
@@ -513,6 +537,7 @@ class ChartRATTLE(HamiltonianSampler):
 
         self._step_residual = torch.maximum(self._step_residual, residual)
         self._step_iters = torch.maximum(self._step_iters, iters.to(h.dtype))
+        self._step_iters_total = self._step_iters_total + iters.to(h.dtype)
         return ChartRATTLEState(q, p, U, metric, psi, W, grad_V,
                                 dq=(q - state.q))
 
@@ -528,6 +553,7 @@ class ChartRATTLE(HamiltonianSampler):
         self._residual_max = torch.maximum(self._residual_max, self._step_residual)
         self._fp_iters_sum = self._fp_iters_sum + self._step_iters
         self._fp_iters_max = torch.maximum(self._fp_iters_max, self._step_iters)
+        self._fp_iters_total = self._fp_iters_total + self._step_iters_total
 
         solve_failed = self._step_residual > self._fp_tol
         return torch.where(solve_failed, delta.new_full((), float("inf")), delta)
@@ -555,5 +581,7 @@ class ChartRATTLE(HamiltonianSampler):
         self._residual_max = zeros.clone()
         self._fp_iters_sum = zeros.clone()
         self._fp_iters_max = zeros.clone()
+        self._fp_iters_total = zeros.clone()
         self._step_residual = zeros.clone()
         self._step_iters = zeros.clone()
+        self._step_iters_total = zeros.clone()
