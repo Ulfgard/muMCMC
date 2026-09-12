@@ -330,19 +330,19 @@ def test_warm_start_is_off_by_default_and_ignores_the_displacements():
     state = s.sample_momentum(s.init(torch.zeros(4, D)))
     bare = RMHMCState(state.q.clone(), state.p.clone())
     carried = RMHMCState(state.q.clone(), state.p.clone(),
-                         dz=torch.full((4, 2 * D), 0.3),
-                         dz_prev=torch.full((4, 2 * D), -0.1))
+                         dq=torch.full((4, D), 0.3),
+                         dq_prev=torch.full((4, D), -0.1))
     a, b = s.integrate(bare, s.step_size), s.integrate(carried, s.step_size)
     assert torch.equal(a.q, b.q) and torch.equal(a.p, b.p)
 
 
 def test_warm_start_resets_each_trajectory():
     # A fresh trajectory must start from the trivial guess: accept() rebuilds the
-    # state without dz, so the first substep sees dz=None.
+    # state without dq, so the first substep sees dq=None.
     s = make_sampler(model_qdep, adapt=False, num_steps=4, solver="anderson",
                      warm_start=True)
     state = s.step(s.init(torch.zeros(4, D)))
-    assert state.dz is None
+    assert state.dq is None
 
 
 def test_fp_iters_total_sums_the_substeps_where_max_takes_the_worst():
