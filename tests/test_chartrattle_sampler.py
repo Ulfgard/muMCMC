@@ -192,6 +192,58 @@ def test_step_runs_exactly_num_steps_substeps():
     assert calls["n"] == 4
 
 
+def test_fp_iters_total_sums_the_substeps_where_max_takes_the_worst():
+    # Over one transition, fp_iters_max is the worst substep and fp_iters_total
+    # the sum over the substeps, both per chain.
+    s = _funnel_sampler(num_steps=5, step_size=0.2)
+    state = s.init(torch.zeros(3, 1))
+    seen = []
+    original = s.integrate
+
+    def recording(x, step_size):
+        before = s._step_iters_total.clone()
+        out = original(x, step_size)
+        seen.append(s._step_iters_total - before)
+        return out
+
+    s.integrate = recording
+    s.step(state)
+    per_substep = torch.stack(seen)                    # (num_steps, N)
+    assert torch.all(per_substep >= 1)
+    diag = s.diagnostics()
+    assert torch.equal(diag["fp_iters_total"], per_substep.sum(0))
+    assert torch.equal(diag["fp_iters_max"], per_substep.amax(0))
+    assert torch.all(diag["fp_iters_total"] > diag["fp_iters_max"])
+
+
+def test_warm_start_is_off_by_default_and_leaves_the_endpoint_alone():
+    # Off by default, the second substep ignores the displacement the state
+    # carries; on, it starts from it and lands on the same root.
+    def run_traj(warm):
+        s = _funnel_sampler(num_steps=6, step_size=0.2, warm_start=warm)
+        state = s.sample_momentum(s.init(torch.zeros(3, 1)))
+        prop = _restart(state, state.q.clone(), state.p.clone())
+        for _ in range(s.num_steps):
+            prop = s.integrate(prop, s.step_size)
+        return s, prop
+
+    s_warm, warm = run_traj(True)
+    s_cold, cold = run_traj(False)
+    assert s_cold.warm_start is False
+    assert torch.allclose(warm.q, cold.q, atol=1e-6)
+    assert torch.allclose(warm.p, cold.p, atol=1e-6)
+
+    # Off, the displacement is inert: a state carrying one solves exactly as a
+    # state without.
+    state = s_cold.sample_momentum(s_cold.init(torch.zeros(3, 1)))
+    bare = _restart(state, state.q.clone(), state.p.clone())
+    carried = _restart(state, state.q.clone(), state.p.clone())
+    carried.dq = torch.full((3, 1), 0.3)
+    a = s_cold.integrate(bare, s_cold.step_size)
+    b = s_cold.integrate(carried, s_cold.step_size)
+    assert torch.equal(a.q, b.q) and torch.equal(a.p, b.p)
+
+
 def test_step_keeps_only_the_fields_that_outlive_a_transition():
     # q and p carry the chain and U.lik is the PT swap statistic, so those three
     # survive. The metric, geometry and force are trajectory scratch rebuilt by

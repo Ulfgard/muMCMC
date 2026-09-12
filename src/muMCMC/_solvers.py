@@ -78,16 +78,20 @@ def _anderson(beta, precond, history):
 _BUILD = {"picard": _picard, "anderson": _anderson, "newton": _newton}
 
 
-def _iterate(residual_fn, z_init, step, wants_jac, max_iter, tol):
-    """Drive ``step`` from ``z_init`` until every row is below ``tol`` or has
-    diverged. Returns a :class:`SolveResult`."""
+def _max_norm(r):
+    return r.abs().amax(-1)
+
+
+def _iterate(residual_fn, z_init, step, wants_jac, max_iter, tol, norm_fn):
+    """Drive ``step`` from ``z_init`` until every row's ``norm_fn(residual)`` is
+    below ``tol`` or has diverged. Returns a :class:`SolveResult`."""
     def evaluate(z):
         out = residual_fn(z)
         return out if wants_jac else (out, None)
 
     z = z_init
     residual, jac = evaluate(z)
-    r0 = residual.abs().amax(-1)
+    r0 = norm_fn(residual)
     done = torch.zeros_like(r0, dtype=torch.bool)
     iters = torch.full(r0.shape, max_iter, dtype=torch.long, device=z.device)
     norm = r0.clone()
@@ -95,7 +99,7 @@ def _iterate(residual_fn, z_init, step, wants_jac, max_iter, tol):
     for i in range(1, max_iter + 1):
         z_next = step(z, residual, jac)
         residual_next, jac_next = evaluate(z_next)
-        r = residual_next.abs().amax(-1)
+        r = norm_fn(residual_next)
 
         keep = done[..., None]
         z = torch.where(keep, z, z_next)
@@ -139,7 +143,7 @@ class FixedPointSolver:
     max_iter : int
         Iteration cap per solve.
     tol : float
-        Convergence tolerance on the residual max-norm, per row.
+        Convergence tolerance on the residual norm, per row.
     fallback_damping : tuple of float
         On non-convergence, re-solve the failed rows with β scaled by each factor
         in turn, each in (0, 1). Empty disables the ladder.
@@ -185,7 +189,8 @@ class FixedPointSolver:
     def needs_jacobian(self):
         return self.kind == "newton"
 
-    def solve(self, residual_fn, z_init, *, precond=None, cold_start=None):
+    def solve(self, residual_fn, z_init, *, precond=None, cold_start=None,
+              norm_fn=None):
         """Drive ``residual_fn`` to zero from ``z_init``.
 
         Parameters
@@ -202,12 +207,17 @@ class FixedPointSolver:
             by ``"newton"``, whose Jacobian solve is already exact.
         cold_start : (N, d) or None
             Iterate the fallback ladder restarts from. Defaults to ``z_init``.
+        norm_fn : callable or None
+            Residual norm the tolerance is checked against, ``(N, d) -> (N,)``.
+            None is the max-norm, which reads in whatever coordinates the
+            residual lives in; a metric norm holds different solves to one
+            accuracy.
 
         Returns
         -------
         SolveResult
             ``z`` the root, detached, with the per-row iteration count and final
-            residual max-norm. A row whose ``residual`` exceeds :attr:`tol` did
+            residual norm. A row whose ``residual`` exceeds :attr:`tol` did
             not converge and its ``z`` is not a root. A row is abandoned when its
             residual goes non-finite, which is also what a singular J produces,
             so one bad row does not raise for the others.
@@ -215,10 +225,11 @@ class FixedPointSolver:
         d = z_init.shape[-1]
         history = d if self.history is None else self.history
         build = _BUILD[self.kind]
+        norm = _max_norm if norm_fn is None else norm_fn
 
         def run(beta, start, cap):
             return _iterate(residual_fn, start, build(beta, precond, history),
-                            self.needs_jacobian, cap, self.tol)
+                            self.needs_jacobian, cap, self.tol, norm)
 
         z, iters, residual = run(self.damping, z_init, self.max_iter)
         restart = z_init if cold_start is None else cold_start

@@ -218,6 +218,7 @@ def test_end_warmup_freezes_to_adapter_average_and_resets():
     assert torch.equal(s._delta_H_abs_sum, z) and torch.equal(s._delta_H_abs_max, z)
     assert torch.equal(s._residual_sum, z) and torch.equal(s._residual_max, z)
     assert torch.equal(s._fp_iters_sum, z) and torch.equal(s._fp_iters_max, z)
+    assert torch.equal(s._fp_iters_total, z)
 
 
 def test_end_warmup_without_adaptation_keeps_step_size():
@@ -309,13 +310,11 @@ def test_warm_start_matches_trivial_start_endpoint():
     def run_traj(warm):
         torch.manual_seed(0)
         s = make_sampler(model_qdep, adapt=False, num_steps=8,
-                         solver="anderson", step_size=0.05)
+                         solver="anderson", step_size=0.05, warm_start=warm)
         state = s.sample_momentum(s.init(torch.zeros(4, D)))
         prop = RMHMCState(state.q.clone(), state.p.clone())
         for _ in range(s.num_steps):
             prop = s.integrate(prop, s.step_size)
-            if not warm:
-                prop.dz = None          # force the trivial start every substep
         return prop
 
     warm, cold = run_traj(True), run_traj(False)
@@ -323,12 +322,52 @@ def test_warm_start_matches_trivial_start_endpoint():
     assert torch.allclose(warm.p, cold.p, atol=1e-6)
 
 
+def test_warm_start_is_off_by_default_and_ignores_the_displacements():
+    # Off, a substep starts from (q, p) whatever displacements the state
+    # carries, so it reproduces the substep solved from a bare state exactly.
+    s = make_sampler(model_qdep, adapt=False, num_steps=1, step_size=0.05)
+    assert s.warm_start is False
+    state = s.sample_momentum(s.init(torch.zeros(4, D)))
+    bare = RMHMCState(state.q.clone(), state.p.clone())
+    carried = RMHMCState(state.q.clone(), state.p.clone(),
+                         dz=torch.full((4, 2 * D), 0.3),
+                         dz_prev=torch.full((4, 2 * D), -0.1))
+    a, b = s.integrate(bare, s.step_size), s.integrate(carried, s.step_size)
+    assert torch.equal(a.q, b.q) and torch.equal(a.p, b.p)
+
+
 def test_warm_start_resets_each_trajectory():
     # A fresh trajectory must start from the trivial guess: accept() rebuilds the
     # state without dz, so the first substep sees dz=None.
-    s = make_sampler(model_qdep, adapt=False, num_steps=4, solver="anderson")
+    s = make_sampler(model_qdep, adapt=False, num_steps=4, solver="anderson",
+                     warm_start=True)
     state = s.step(s.init(torch.zeros(4, D)))
     assert state.dz is None
+
+
+def test_fp_iters_total_sums_the_substeps_where_max_takes_the_worst():
+    # Over one transition, fp_iters_max is the worst substep and fp_iters_total
+    # the sum over the substeps, both per chain.
+    torch.manual_seed(0)
+    s = make_sampler(model_qdep, adapt=False, num_steps=5, step_size=0.05)
+    state = s.init(torch.zeros(3, D))
+    seen = []
+    original = s.integrate
+
+    def recording(x, step_size):
+        before = s._step_iters_total.clone()
+        out = original(x, step_size)
+        seen.append(s._step_iters_total - before)
+        return out
+
+    s.integrate = recording
+    s.step(state)
+    per_substep = torch.stack(seen)                    # (num_steps, N)
+    assert torch.all(per_substep >= 1)
+    diag = s.diagnostics()
+    assert torch.equal(diag["fp_iters_total"], per_substep.sum(0))
+    assert torch.equal(diag["fp_iters_max"], per_substep.amax(0))
+    assert torch.all(diag["fp_iters_total"] > diag["fp_iters_max"])
 
 
 def test_step_normalization_fixed_caps_step_size():
@@ -414,8 +453,9 @@ def test_diagnostics_footprint_is_constant_over_steps():
     unbounded and fragmented the heap)."""
     N, num_steps = 3, 4
     summaries = ["_delta_H_last", "_delta_H_abs_sum", "_delta_H_abs_max",
-                 "_step_residual", "_step_iters", "_residual_sum", "_residual_max",
-                 "_fp_iters_sum", "_fp_iters_max"]
+                 "_step_residual", "_step_iters", "_step_iters_total",
+                 "_residual_sum", "_residual_max", "_fp_iters_sum",
+                 "_fp_iters_max", "_fp_iters_total"]
 
     def footprint(sampler):
         # every accumulator is a fixed (N,) tensor -- no lists, no per-step
@@ -439,5 +479,6 @@ def test_diagnostics_footprint_is_constant_over_steps():
     # documented keys (no per-step history).
     diag = s.diagnostics()
     for key in ("delta_H_abs_mean", "delta_H_abs_max", "residual_mean",
-                "residual_max", "fp_iters_mean", "fp_iters_max"):
+                "residual_max", "fp_iters_mean", "fp_iters_max",
+                "fp_iters_total"):
         assert diag[key].shape == (N,)
